@@ -1,0 +1,8 @@
+f.DS_Store
+Vertical FX List Resources/plugin_select_counts.txt
+
+fx_favorites.txt
+
+# OAuth configuration (contains sensitive credentials)
+oauth_config.lua
+oauth_callback_code.txt

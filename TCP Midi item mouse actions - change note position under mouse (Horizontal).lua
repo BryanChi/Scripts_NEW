@@ -1,0 +1,312 @@
+-- TCP MIDI note position adjuster by horizontal mousewheel
+-- Moves the MIDI note(s) under the mouse by ±1 pixel per horizontal wheel tick while hovering TCP/arrange
+-- Bind this script specifically to your Horizontal Mousewheel shortcut
+-- Requirements: SWS extension (BR_* API)
+
+local function require_sws()
+	if reaper and reaper.BR_PositionAtMouseCursor and reaper.BR_TrackAtMouseCursor then
+		return true
+	end
+	reaper.MB("This script requires the SWS/S&M extension.\nPlease install SWS and try again.", "Missing dependency", 0)
+	return false
+end
+
+local function get_mouse_context()
+	-- Returns track under mouse and project time at mouse (no snapping)
+	local track = nil
+	if reaper.BR_TrackAtMouseCursor then
+		track = select(1, reaper.BR_TrackAtMouseCursor())
+	end
+	local pos = nil
+	if reaper.BR_PositionAtMouseCursor then
+		pos = reaper.BR_PositionAtMouseCursor(false)
+	end
+	return track, pos
+end
+
+local function get_hwheel_direction()
+	-- Determine horizontal wheel direction via action context; positive = right, negative = left
+	local _, _, _, _, _, _, val = reaper.get_action_context()
+	if type(val) == "number" and val ~= 0 then
+		return (val > 0) and 1 or -1
+	end
+	-- Fallback if context provides no value
+	return 1
+end
+
+local function find_midi_item_take_at_time(track, proj_time)
+	if not track then return nil, nil, nil end
+	local item_count = reaper.CountTrackMediaItems(track)
+	for i = 0, item_count - 1 do
+		local item = reaper.GetTrackMediaItem(track, i)
+		local it_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+		local it_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+		if proj_time >= it_pos and proj_time < (it_pos + it_len) then
+			local take = reaper.GetActiveTake(item)
+			if take and reaper.TakeIsMIDI(take) then
+				return item, take, it_pos, it_len
+			end
+		end
+	end
+	return nil, nil, nil
+end
+
+local function collect_spanning_notes(take, mouse_ppq)
+	local _, note_count, _, _ = reaper.MIDI_CountEvts(take)
+	local notes = {}
+	for i = 0, note_count - 1 do
+		local ok, _, _, startppq, endppq, _, pitch, _ = reaper.MIDI_GetNote(take, i)
+		if ok and startppq <= mouse_ppq and mouse_ppq < endppq then
+			notes[#notes+1] = { idx = i, startppq = startppq, endppq = endppq, pitch = pitch }
+		end
+	end
+	return notes
+end
+
+local function select_note_time_then_pitch(take, mouse_ppq, target_pitch)
+	local spanning = collect_spanning_notes(take, mouse_ppq)
+	if #spanning == 0 then return nil end
+
+	local min_abs = nil
+	for _, n in ipairs(spanning) do
+		local d = math.abs(mouse_ppq - n.startppq)
+		if not min_abs or d < min_abs then min_abs = d end
+	end
+	local candidates = {}
+	for _, n in ipairs(spanning) do
+		if math.abs(mouse_ppq - n.startppq) == min_abs then candidates[#candidates+1] = n end
+	end
+	local chosen = nil
+	if target_pitch ~= nil and #candidates > 1 then
+		local best_diff = nil
+		for _, n in ipairs(candidates) do
+			local diff = math.abs(n.pitch - target_pitch)
+			if not best_diff or diff < best_diff or (diff == best_diff and n.startppq > (chosen and chosen.startppq or -math.huge)) then
+				best_diff = diff
+				chosen = n
+			end
+		end
+	else
+		for _, n in ipairs(candidates) do
+			if (not chosen) or (n.startppq > chosen.startppq) then chosen = n end
+		end
+	end
+	return chosen and chosen.idx, chosen and chosen.startppq, chosen and chosen.endppq
+end
+
+local function get_mouse_midi_context()
+	if not (reaper.BR_GetMouseCursorContext and reaper.BR_GetMouseCursorContext_MIDI) then return nil, nil end
+	local _w, _s, _d = reaper.BR_GetMouseCursorContext()
+	local mtake, _item, note_row, _cc_lane, _cc_val, _text = reaper.BR_GetMouseCursorContext_MIDI()
+	if mtake and type(note_row) == "number" then
+		return mtake, note_row
+	end
+	return nil, nil
+end
+
+local function get_item_pos_len_from_take(take)
+	if not take then return nil, nil end
+	local item = reaper.GetMediaItemTake_Item(take)
+	if not item then return nil, nil end
+	local it_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+	local it_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+	return it_pos, it_len
+end
+
+local function get_item_under_mouse()
+	local mx, my = reaper.GetMousePosition()
+	local item = reaper.GetItemFromPoint(mx, my, true)
+	return item, mx, my
+end
+
+local function compute_min_max_pitch(take)
+	local _, note_count, _, _ = reaper.MIDI_CountEvts(take)
+	local min_p, max_p = nil, nil
+	for i = 0, note_count - 1 do
+		local ok, _, _, _s, _e, _sel, pitch, _vel = reaper.MIDI_GetNote(take, i)
+		if ok then
+			if not min_p or pitch < min_p then min_p = pitch end
+			if not max_p or pitch > max_p then max_p = pitch end
+		end
+	end
+	return min_p, max_p
+end
+
+local function js_get_arrange_client_xy(screen_x, screen_y)
+	if not (reaper.JS_Window_FindChildByID and reaper.JS_Window_ScreenToClient and reaper.GetMainHwnd) then
+		return nil, nil
+	end
+	local arrange = reaper.JS_Window_FindChildByID(reaper.GetMainHwnd(), 1000)
+	if arrange then
+		local cx, cy = reaper.JS_Window_ScreenToClient(arrange, screen_x, screen_y)
+		return cx, cy
+	end
+	return nil, nil
+end
+
+local function estimate_pitch_from_mouse_on_item(item, take)
+	if not item or not take then return nil end
+	if not (reaper.JS_Window_FindChildByID and reaper.JS_Window_ScreenToClient and reaper.GetMainHwnd) then return nil end
+
+	local item_y = reaper.GetMediaItemInfo_Value(item, "I_LASTY")
+	local item_h = reaper.GetMediaItemInfo_Value(item, "I_LASTH")
+	if not item_y or not item_h or item_h <= 0 then return nil end
+
+	local _item_under_mouse, mx, my_screen = get_item_under_mouse()
+	local _cx, my_client = js_get_arrange_client_xy(mx, my_screen)
+	if not my_client then return nil end
+
+	local rel = (my_client - item_y) / item_h
+	if rel < 0 then rel = 0 elseif rel > 1 then rel = 1 end
+
+	local min_p, max_p = compute_min_max_pitch(take)
+	if min_p and max_p then
+		if min_p == max_p then return min_p end
+		local pitchf = max_p - rel * (max_p - min_p)
+		local pitch = math.floor(pitchf + 0.5)
+		if pitch < 0 then pitch = 0 elseif pitch > 127 then pitch = 127 end
+		return pitch
+	end
+
+	local pitchf = 127 - (rel * 127)
+	local pitch = math.floor(pitchf + 0.5)
+	if pitch < 0 then pitch = 0 elseif pitch > 127 then pitch = 127 end
+	return pitch
+end
+
+local function move_note_by_one_pixel(take, note_idx, startppq, endppq, dir, item_pos, item_len)
+	local hzoom = reaper.GetHZoomLevel()
+	if not hzoom or hzoom <= 0 then return false end
+	local seconds_per_pixel = 1.0 / hzoom
+	local start_time = reaper.MIDI_GetProjTimeFromPPQPos(take, startppq)
+	local new_start_time = start_time + (dir * seconds_per_pixel)
+	local new_start_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, new_start_time)
+	local delta_ppq = new_start_ppq - startppq
+	local new_end_ppq = endppq + delta_ppq
+
+	local item_start_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, item_pos)
+	local item_end_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, item_pos + item_len)
+
+	local note_len_ppq = endppq - startppq
+	if new_start_ppq < item_start_ppq then
+		new_start_ppq = item_start_ppq
+		new_end_ppq = new_start_ppq + note_len_ppq
+	elseif new_end_ppq > item_end_ppq then
+		new_end_ppq = item_end_ppq
+		new_start_ppq = new_end_ppq - note_len_ppq
+	end
+
+	reaper.MIDI_DisableSort(take)
+	local ok = reaper.MIDI_SetNote(take, note_idx, nil, nil, new_start_ppq, new_end_ppq, nil, nil, nil, true)
+	reaper.MIDI_Sort(take)
+	return ok
+end
+
+local function move_selected_notes_by_one_pixel(take, dir, item_pos, item_len)
+	local hzoom = reaper.GetHZoomLevel()
+	if not hzoom or hzoom <= 0 then return false end
+	local seconds_delta = (1.0 / hzoom) * dir
+
+	local item_start_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, item_pos)
+	local item_end_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, item_pos + item_len)
+
+	local _, note_count, _, _ = reaper.MIDI_CountEvts(take)
+	local moved = 0
+	reaper.MIDI_DisableSort(take)
+	for i = 0, note_count - 1 do
+		local ok, selected, _, startppq, endppq, _, _, _ = reaper.MIDI_GetNote(take, i)
+		if ok and selected then
+			local start_time = reaper.MIDI_GetProjTimeFromPPQPos(take, startppq)
+			local new_start_time = start_time + seconds_delta
+			local new_start_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, new_start_time)
+			local note_len_ppq = endppq - startppq
+			local new_end_ppq = new_start_ppq + note_len_ppq
+
+			if new_start_ppq < item_start_ppq then
+				new_start_ppq = item_start_ppq
+				new_end_ppq = new_start_ppq + note_len_ppq
+			elseif new_end_ppq > item_end_ppq then
+				new_end_ppq = item_end_ppq
+				new_start_ppq = new_end_ppq - note_len_ppq
+			end
+
+			if reaper.MIDI_SetNote(take, i, nil, nil, new_start_ppq, new_end_ppq, nil, nil, nil, true) then
+				moved = moved + 1
+			end
+		end
+	end
+	reaper.MIDI_Sort(take)
+	return moved > 0
+end
+
+local function main()
+	if not require_sws() then return end
+	local track, mouse_time = get_mouse_context()
+	if not track or not mouse_time then return end
+
+	local mtake, note_row = get_mouse_midi_context()
+	local window, segment, details = nil, nil, nil
+	if reaper.BR_GetMouseCursorContext then
+		window, segment, details = reaper.BR_GetMouseCursorContext()
+	end
+
+
+	local item, take, item_pos, item_len
+	if mtake and reaper.TakeIsMIDI(mtake) then
+		take = mtake
+		item_pos, item_len = get_item_pos_len_from_take(take)
+		if not item_pos then return end
+	else
+		item, take, item_pos, item_len = find_midi_item_take_at_time(track, mouse_time)
+		if not take then return end
+	end
+
+	local is_inline = reaper.BR_IsMidiOpenInInlineEditor and reaper.BR_IsMidiOpenInInlineEditor(take) or false
+
+	local dir = get_hwheel_direction()
+
+	-- If inline editor for this take and there are selected notes, ignore mouse position and move selected notes
+	if is_inline then
+		local has_sel = false
+		local _, ncnt = reaper.MIDI_CountEvts(take)
+		local sel_count = 0
+		for i = 0, ncnt - 1 do
+			local _ok, sel = reaper.MIDI_GetNote(take, i)
+			if _ok and sel then sel_count = sel_count + 1 has_sel = true end
+		end
+		if has_sel then
+			reaper.Undo_BeginBlock()
+			reaper.PreventUIRefresh(1)
+			local ok = move_selected_notes_by_one_pixel(take, dir, item_pos, item_len)
+			reaper.PreventUIRefresh(-1)
+			reaper.Undo_EndBlock(ok and "Nudge selected MIDI notes by one pixel (HWHEEL)" or "Nudge selected MIDI notes by one pixel (HWHEEL) (failed)", -1)
+			if ok then reaper.UpdateArrange() end
+			return
+		end
+	end
+
+	-- Otherwise compute mouse-based target and nudge a single note
+	local mouse_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, mouse_time)
+	local target_pitch = note_row
+	if not target_pitch then
+		local item_for_take = reaper.GetMediaItemTake_Item(take)
+		local item_under_mouse = select(1, get_item_under_mouse())
+		if item_under_mouse and item_for_take and item_under_mouse == item_for_take then
+			target_pitch = estimate_pitch_from_mouse_on_item(item_under_mouse, take)
+		end
+	end
+	local note_idx, startppq, endppq = select_note_time_then_pitch(take, mouse_ppq, target_pitch)
+	if not note_idx then return end
+
+
+	reaper.Undo_BeginBlock()
+	reaper.PreventUIRefresh(1)
+	local ok = move_note_by_one_pixel(take, note_idx, startppq, endppq, dir, item_pos, item_len)
+	reaper.PreventUIRefresh(-1)
+	reaper.Undo_EndBlock(ok and "Nudge MIDI note by one pixel (HWHEEL)" or "Nudge MIDI note by one pixel (HWHEEL) (failed)", -1)
+	if ok then reaper.UpdateArrange() end
+end
+
+main()
+
+
