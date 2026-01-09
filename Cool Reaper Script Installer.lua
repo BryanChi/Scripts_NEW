@@ -108,7 +108,7 @@ local FILES_TO_INSTALL = {
     },
     {
         url_path = "Vertical FX List Resources/Functions/FX Parser.lua",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/FX Parser.lua",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/FX Parser.lua",
     },
 
     
