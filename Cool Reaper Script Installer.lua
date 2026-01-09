@@ -78,14 +78,14 @@ local FILES_TO_INSTALL = {
     -- Main script
     {
         url_path = "FXD_Vertical FX list.lua",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/FXD_Vertical FX list.lua",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/FXD_Vertical FX list.lua",
         script_type = "lua",
     },
     
     -- Configuration files
     {
         url_path = "style_presets_FACTORY.lua",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/style_presets_FACTORY.lua",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/style_presets_FACTORY.lua",
         script_type = "lua",
     },
 
@@ -93,99 +93,99 @@ local FILES_TO_INSTALL = {
     -- Function files
     {
         url_path = "Vertical FX List Resources/Functions/General Functions.Lua",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/Functions/General Functions.Lua",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/General Functions.Lua",
         script_type = "lua",
     },
     {
         url_path = "Vertical FX List Resources/Functions/FX Buttons.lua",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/Functions/FX Buttons.lua",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/FX Buttons.lua",
         script_type = "lua",
     },
     {
         url_path = "Vertical FX List Resources/Functions/Sends.lua",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/Functions/Sends.lua",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/Sends.lua",
         script_type = "lua",
     },
     {
         url_path = "Vertical FX List Resources/Functions/FX Parser.lua",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/FX Parser.lua,
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/FX Parser.lua",
     },
 
     
     -- Image assets (required)
     {
         url_path = "Vertical FX List Resources/star.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/star.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/star.png",
     },
     {
         url_path = "Vertical FX List Resources/starHollow.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/starHollow.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/starHollow.png",
     },
     {
         url_path = "Vertical FX List Resources/send.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/send.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/send.png",
     },
     {
         url_path = "Vertical FX List Resources/receive.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/receive.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/receive.png",
     },
     {
         url_path = "Vertical FX List Resources/show.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/show.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/show.png",
     },
     {
         url_path = "Vertical FX List Resources/hide.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/hide.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/hide.png",
     },
     {
         url_path = "Vertical FX List Resources/link.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/link.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/link.png",
     },
     {
         url_path = "Vertical FX List Resources/snapshot.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/snapshot.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/snapshot.png",
     },
     {
         url_path = "Vertical FX List Resources/camera.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/camera.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/camera.png",
     },
     {
         url_path = "Vertical FX List Resources/folder.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/folder.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/folder.png",
     },
     {
         url_path = "Vertical FX List Resources/folder_open.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/folder_open.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/folder_open.png",
     },
     {
         url_path = "Vertical FX List Resources/settings.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/settings.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/settings.png",
     },
     
     -- Image assets (optional - script has fallbacks)
     {
         url_path = "Vertical FX List Resources/copy.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/copy.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/copy.png",
     },
     {
         url_path = "Vertical FX List Resources/search.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/search.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/search.png",
     },
     {
         url_path = "Vertical FX List Resources/trash.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/trash.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/trash.png",
     },
     {
         url_path = "Vertical FX List Resources/volume.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/volume.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/volume.png",
     },
     {
         url_path = "Vertical FX List Resources/graph.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/graph.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/graph.png",
     },
     {
         url_path = "Vertical FX List Resources/undo.png",
-        target_path = "Scripts/CoolReaperSctipts/Vertical FX List/Vertical FX List Resources/undo.png",
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/undo.png",
     },
     
 }
@@ -527,14 +527,14 @@ local function InstallFile(file_info, progress_callback)
     local final_download_path
     
     if is_vertical_fx_list then
-        -- Download directly to CoolReaperSctipts/Vertical FX List folder with different name
-        local bryan_scripts_folder = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperSctipts" .. sep .. "Vertical FX List"
+        -- Download directly to CoolReaperScripts/Vertical FX List folder with different name
+        local bryan_scripts_folder = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperScripts" .. sep .. "Vertical FX List"
         EnsureDirectoryExists(bryan_scripts_folder)
         final_download_path = bryan_scripts_folder .. sep .. "CRS_vertical fx list.lua"
         download_path = final_download_path -- Use same path for download
     else
         -- Download to DOWNLOAD folder first (normal behavior)
-        local download_folder = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperSctipts" .. sep .. "Vertical FX List" .. sep .. "DOWNLOAD"
+        local download_folder = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperScripts" .. sep .. "Vertical FX List" .. sep .. "DOWNLOAD"
         EnsureDirectoryExists(download_folder)
         download_path = download_folder .. sep .. filename
         final_download_path = download_path
@@ -553,14 +553,14 @@ local function InstallFile(file_info, progress_callback)
     
     if progress_callback then
         if is_vertical_fx_list then
-            progress_callback("Downloaded to CoolReaperSctipts/Vertical FX List folder as CRS_vertical fx list.lua")
+            progress_callback("Downloaded to CoolReaperScripts/Vertical FX List folder as CRS_vertical fx list.lua")
         else
             progress_callback("Downloaded to DOWNLOAD folder")
         end
     end
     
     -- Build final target path
-    local full_target = resource_path .. sep .. target_path
+    local full_target = resource_path .. sep .. NormalizePath(target_path)
     
     -- For Vertical FX List, skip copying (already in final location with different name)
     -- For other files, copy from DOWNLOAD folder to final location
@@ -591,13 +591,13 @@ local function InstallFile(file_info, progress_callback)
     if script_type == "lua" or script_type == "eel" or script_type == "py" then
         if progress_callback then
             if is_vertical_fx_list then
-                progress_callback("Registering CRS_vertical fx list.lua from CoolReaperSctipts/Vertical FX List folder")
+                progress_callback("Registering CRS_vertical fx list.lua from CoolReaperScripts/Vertical FX List folder")
             else
                 progress_callback("Registering: " .. target_path)
             end
         end
         
-        -- For Vertical FX List, register from CoolReaperSctipts/Vertical FX List folder with CRS_ name
+        -- For Vertical FX List, register from CoolReaperScripts/Vertical FX List folder with CRS_ name
         -- For other scripts, register from final location
         local script_path_to_register = is_vertical_fx_list and final_download_path or full_target
         
