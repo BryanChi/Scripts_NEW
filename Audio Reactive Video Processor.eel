@@ -1,0 +1,126 @@
+// Audio Reactive Video Processor
+// Reads analyzer data from JSFX via gmem.
+// In Video Processor, paste this code into the editor.
+
+//@gmem=audioReactiveVideoBus
+//@param 1:InputSel 'Input (1=detector 2=env 3=low 4=mid 5=high 6=transient)' 2 1 6 1 1
+//@param 2:InputGain 'Input gain' 8 0 16 1 0.01
+//@param 3:InputBias 'Input bias' 0.02 0 1 0.5 0.01
+//@param 4:Smooth 'Smoothing' 0.05 0 0.99 0.5 0.01
+//@param 5:Target 'Target (1=zoom 2=glow 3=brightness 4=combo)' 4 1 4 1 1
+//@param 6:ZoomAmt 'Zoom amount' 0.45 0 1.5 0.5 0.01
+//@param 7:GlowAmt 'Glow amount' 0.8 0 1.5 0.5 0.01
+//@param 8:BrightAmt 'Brightness amount' 0.45 0 1.5 0.5 0.01
+//@param 9:TestPulse 'Self test pulse (ignore audio 0/1)' 0 0 1 0.5 1
+//@param 10:DebugOverlay 'Debug overlay (0/1)' 0 0 1 0.5 1
+//@param 11:UseMultiAttr 'Use multi-attribute toggles (0/1)' 1 0 1 0.5 1
+//@param 12:EnableZoom 'Enable zoom (0/1)' 1 0 1 0.5 1
+//@param 13:EnableGlow 'Enable glow (0/1)' 1 0 1 0.5 1
+//@param 14:EnableBright 'Enable brightness (0/1)' 1 0 1 0.5 1
+
+function clamp(v, lo, hi)
+(
+  v < lo ? lo : v > hi ? hi : v;
+);
+
+ready = gmem[0];
+raw = 0;
+
+ready >= 1 ? (
+  InputSel == 1 ? raw = gmem[1];
+  InputSel == 2 ? raw = gmem[2];
+  InputSel == 3 ? raw = gmem[3];
+  InputSel == 4 ? raw = gmem[4];
+  InputSel == 5 ? raw = gmem[5];
+  InputSel == 6 ? raw = gmem[6];
+);
+
+drive = clamp((raw * InputGain) - InputBias, 0, 1);
+sm = sm + (1 - Smooth) * (drive - sm);
+lvl = clamp(sm, 0, 1);
+lvl = pow(lvl, 0.6);
+
+TestPulse >= 0.5 ? (
+  lvl = 0.5 + 0.5*sin(project_time*6.28318530718*1.4);
+);
+
+zoom_mix = 0; glow_mix = 0; bright_mix = 0;
+UseMultiAttr >= 0.5 ? (
+  zoom_mix = EnableZoom >= 0.5;
+  glow_mix = EnableGlow >= 0.5;
+  bright_mix = EnableBright >= 0.5;
+) : (
+  Target == 1 ? zoom_mix = 1;
+  Target == 2 ? glow_mix = 1;
+  Target == 3 ? bright_mix = 1;
+  Target == 4 ? (zoom_mix = 1; glow_mix = 1; bright_mix = 1;);
+);
+
+z = 1 + (lvl * ZoomAmt * zoom_mix);
+srcw = project_w / max(z, 0.001);
+srch = project_h / max(z, 0.001);
+srcx = (project_w - srcw) * 0.5;
+srcy = (project_h - srch) * 0.5;
+
+ok = 0;
+src_input = 0;
+
+ok = gfx_blit(0, 1, 0, 0, project_w, project_h, srcx, srcy, srcw, srch);
+ok >= 1 ? src_input = 0;
+
+ok < 1 ? (
+  ok = gfx_blit(1, 1, 0, 0, project_w, project_h, srcx, srcy, srcw, srch);
+  ok >= 1 ? src_input = 1;
+);
+
+ok < 1 ? (
+  t = input_track_exact(0);
+  t >= 0 ? (
+    ok = gfx_blit(t, 1, 0, 0, project_w, project_h, srcx, srcy, srcw, srch);
+    ok >= 1 ? src_input = t;
+  );
+);
+
+ok < 1 ? (
+  t = input_track(0);
+  t >= 0 ? (
+    ok = gfx_blit(t, 1, 0, 0, project_w, project_h, srcx, srcy, srcw, srch);
+    ok >= 1 ? src_input = t;
+  );
+);
+
+glow_alpha = lvl * GlowAmt * glow_mix;
+(ok >= 1) && (glow_alpha > 0.0001) ? (
+  grow = project_w * 0.02 * glow_alpha;
+  gfx_set(1,1,1,glow_alpha,1|0x100);
+  gfx_blit(src_input, 1, -grow, -grow, project_w + grow*2, project_h + grow*2, srcx, srcy, srcw, srch);
+);
+
+bright_alpha = lvl * BrightAmt * bright_mix;
+(ok >= 1) && (bright_alpha > 0.0001) ? (
+  gfx_set(1,1,1,bright_alpha,1);
+  gfx_fillrect(0,0,project_w,project_h);
+);
+
+gfx_set(1,1,1,1,0);
+
+DebugOverlay >= 0.5 ? (
+  bx = project_w * 0.03;
+  by = project_h * 0.03;
+  bw = project_w * 0.35;
+  bh = project_h * 0.025;
+  gap = bh * 1.4;
+
+  gfx_set(0,0,0,0.4,0);
+  gfx_fillrect(bx-4, by-4, bw+8, gap*2+bh+8);
+
+  gfx_set(0.25,0.25,0.25,0.9,0);
+  gfx_fillrect(bx, by, bw, bh);
+  gfx_fillrect(bx, by+gap, bw, bh);
+
+  gfx_set(1,0.7,0.1,0.9,0);
+  gfx_fillrect(bx, by, bw*clamp(raw*0.25,0,1), bh);
+
+  gfx_set(0.1,1,0.3,0.9,0);
+  gfx_fillrect(bx, by+gap, bw*lvl, bh);
+);

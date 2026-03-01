@@ -69,6 +69,105 @@ local function GetRepoRawBase(repo_key)
                          repo.user, repo.repo, ref)
 end
 
+-- Helper function to create file entry
+local function CreateFileEntry(url_path, script_type)
+    return {
+        url_path = url_path,
+        target_path = "Scripts/CoolReaperScripts/Vertical FX List/" .. url_path,
+        script_type = script_type,
+    }
+end
+
+-- Function to automatically generate Resources folder file list
+-- Excludes: fx_category_cache.lua, plugin_select_counts.txt, and the three FX data files
+local function GetResourcesFiles()
+    local files = {}
+    
+    -- Files to exclude (relative to Resources folder or full path)
+    local excluded = {
+        "fx_category_cache.lua",
+        "plugin_select_counts.txt",
+        "Vertical FX List Resources/Functions/FX_DEV_LIST_FILE.txt",
+        "Vertical FX List Resources/Functions/FX_CAT_FILE.txt",
+        "Vertical FX List Resources/Functions/FX_LIST.txt",
+    }
+    
+    -- Helper to check if file should be excluded
+    local function IsExcluded(file_path)
+        for _, excl in ipairs(excluded) do
+            if file_path == excl or file_path:match(excl .. "$") then
+                return true
+            end
+        end
+        return false
+    end
+    
+    -- Helper to detect script type from extension
+    local function GetScriptTypeFromPath(path)
+        local ext = path:match("%.([^%.]+)$")
+        if ext then
+            ext = ext:lower()
+            if ext == "lua" then return "lua"
+            elseif ext == "eel" then return "eel"
+            elseif ext == "py" then return "py"
+            elseif ext == "jsfx" then return "jsfx"
+            end
+        end
+        return nil -- Auto-detect for other files
+    end
+    
+    -- Root Resources folder files
+    local root_files = {
+        "camera.png",
+        "copy.png",
+        "folder_open.png",
+        "folder.png",
+        "graph.png",
+        "hide.png",
+        "link.png",
+        "receive.png",
+        "search.png",
+        "send.png",
+        "settings.png",
+        "show.png",
+        "snapshot.png",
+        "star.png",
+        "starHollow.png",
+        "trash.png",
+        "undo.png",
+        "update.png",
+        "volume.png",
+    }
+    
+    -- Functions folder files
+    local function_files = {
+        "AndaleMonoVertical.ttf",
+        "FX Buttons.lua",
+        "FX Parser.lua",
+        "General Functions.Lua",
+        "Sends.lua",
+        "Update.lua",
+    }
+    
+    -- Add root files
+    for _, filename in ipairs(root_files) do
+        local url_path = "Vertical FX List Resources/" .. filename
+        if not IsExcluded(url_path) then
+            table.insert(files, CreateFileEntry(url_path, GetScriptTypeFromPath(filename)))
+        end
+    end
+    
+    -- Add function files
+    for _, filename in ipairs(function_files) do
+        local url_path = "Vertical FX List Resources/Functions/" .. filename
+        if not IsExcluded(url_path) then
+            table.insert(files, CreateFileEntry(url_path, GetScriptTypeFromPath(filename)))
+        end
+    end
+    
+    return files
+end
+
 -- File list: {url_path, target_path, script_type, repo}
 -- url_path: path relative to repo root (e.g., "Scripts/MyTool.lua")
 -- target_path: path relative to REAPER resource folder (e.g., "Scripts/MyTool.lua")
@@ -88,114 +187,23 @@ local FILES_TO_INSTALL = {
         target_path = "Scripts/CoolReaperScripts/Vertical FX List/style_presets_FACTORY.lua",
         script_type = "lua",
     },
-
-    
-    -- Function files
-    {
-        url_path = "Vertical FX List Resources/Functions/General Functions.Lua",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/General Functions.Lua",
-        script_type = "lua",
-    },
-    {
-        url_path = "Vertical FX List Resources/Functions/FX Buttons.lua",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/FX Buttons.lua",
-        script_type = "lua",
-    },
-    {
-        url_path = "Vertical FX List Resources/Functions/Sends.lua",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/Sends.lua",
-        script_type = "lua",
-    },
-    {
-        url_path = "Vertical FX List Resources/Functions/FX Parser.lua",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/Functions/FX Parser.lua",
-    },
-
-    
-    -- Image assets (required)
-    {
-        url_path = "Vertical FX List Resources/star.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/star.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/starHollow.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/starHollow.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/send.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/send.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/receive.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/receive.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/show.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/show.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/hide.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/hide.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/link.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/link.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/snapshot.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/snapshot.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/camera.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/camera.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/folder.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/folder.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/folder_open.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/folder_open.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/settings.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/settings.png",
-    },
-    
-    -- Image assets (optional - script has fallbacks)
-    {
-        url_path = "Vertical FX List Resources/copy.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/copy.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/search.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/search.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/trash.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/trash.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/volume.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/volume.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/graph.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/graph.png",
-    },
-    {
-        url_path = "Vertical FX List Resources/undo.png",
-        target_path = "Scripts/CoolReaperScripts/Vertical FX List/Vertical FX List Resources/undo.png",
-    },
-    
 }
+
+-- Automatically add all Resources folder files (excluding specified files)
+local resources_files = GetResourcesFiles()
+for _, file_entry in ipairs(resources_files) do
+    table.insert(FILES_TO_INSTALL, file_entry)
+end
 
 -- Commit selection GUI state (define early so installers can update it)
 local commit_gui_state = {
     open = true,
     ctx = nil,
     commits = {},
+    releases = {}, -- GitHub releases
+    use_releases = false, -- Whether to use releases or commits
     selected_commits = {}, -- {repo_key = commit_sha}
+    selected_releases = {}, -- {repo_key = release_tag}
     loading = false,
     error_msg = nil,
     current_repo_index = 1,
@@ -470,6 +478,184 @@ local function RegisterScript(filepath, script_type)
     end
 end
 
+-- Download and extract zip archive from GitHub release
+local function DownloadAndExtractZip(zip_url, progress_callback)
+    local OS = r.GetOS()
+    local sep = GetPathSeparator()
+    local resource_path = GetResourcePath()
+    
+    -- Create temp directory
+    local temp_dir = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperScripts" .. sep .. "TEMP"
+    EnsureDirectoryExists(temp_dir)
+    
+    local zip_path = temp_dir .. sep .. "release.zip"
+    
+    if progress_callback then
+        progress_callback("Downloading release archive...")
+    end
+    
+    -- Download zip file
+    local cmd
+    if OS:match("Win") then
+        local escaped_path = zip_path:gsub('"', '\\"')
+        cmd = string.format('curl -L -f -s -S -o "%s" "%s"', escaped_path, zip_url)
+    else
+        local escaped_path = zip_path:gsub('"', '\\"')
+        cmd = string.format('/usr/bin/curl -L -f -s -S -o "%s" "%s"', escaped_path, zip_url)
+    end
+    
+    local result = r.ExecProcess(cmd, 120000) -- 120 second timeout for larger files
+    
+    -- Check if download succeeded
+    local file = io.open(zip_path, "rb")
+    if not file then
+        return nil, "Failed to download zip file"
+    end
+    local size = file:seek("end")
+    file:close()
+    
+    if size == 0 then
+        return nil, "Downloaded zip file is empty"
+    end
+    
+    if progress_callback then
+        progress_callback("Extracting archive...")
+    end
+    
+    -- Extract zip file
+    local extract_cmd
+    local extracted_folder = temp_dir .. sep .. "extracted"
+    EnsureDirectoryExists(extracted_folder)
+    
+    if OS:match("Win") then
+        -- Windows: use PowerShell Expand-Archive
+        local escaped_zip = zip_path:gsub('"', '\\"')
+        local escaped_dest = extracted_folder:gsub('"', '\\"')
+        extract_cmd = string.format('powershell -Command "Expand-Archive -Path \\"%s\\" -DestinationPath \\"%s\\" -Force"', escaped_zip, escaped_dest)
+    else
+        -- macOS/Linux: use unzip
+        extract_cmd = string.format('cd "%s" && /usr/bin/unzip -q -o "%s" -d "%s"', temp_dir, zip_path, extracted_folder)
+    end
+    
+    local extract_result = r.ExecProcess(extract_cmd, 60000) -- 60 second timeout
+    -- Retry with a longer timeout if extraction timed out
+    if extract_result == "-999" then
+        if progress_callback then
+            progress_callback("Extraction timed out, retrying...")
+        end
+        extract_result = r.ExecProcess(extract_cmd, 180000) -- 3 minute timeout
+    end
+    
+    -- Find the extracted folder (GitHub zipballs create a folder like repo-tag/)
+    -- Enumerate directories in extracted_folder
+    local found_folder = nil
+    for i = 0, 100 do
+        local subdir = r.EnumerateSubdirectories(extracted_folder, i)
+        if not subdir then break end
+        found_folder = extracted_folder .. sep .. subdir
+        break -- Take first directory
+    end
+    
+    -- If no subdirectory found, use extracted_folder itself
+    if not found_folder then
+        found_folder = extracted_folder
+    end
+    
+    if progress_callback then
+        progress_callback("Archive extracted successfully")
+    end
+    
+    return found_folder, nil
+end
+
+-- Install files from extracted release folder
+local function InstallFromRelease(extracted_folder, progress_callback)
+    local resource_path = GetResourcePath()
+    local sep = GetPathSeparator()
+    local results = {success = {}, failed = {}}
+    
+    for _, file_info in ipairs(FILES_TO_INSTALL) do
+        local url_path = file_info.url_path
+        local target_path = file_info.target_path
+        local script_type = file_info.script_type
+        
+        -- Build source path in extracted folder
+        -- GitHub zipballs preserve the repo structure
+        local source_path = extracted_folder .. sep .. url_path:gsub("/", sep)
+        
+        -- Build destination path
+        local dest_path = resource_path .. sep .. NormalizePath(target_path)
+        
+        if progress_callback then
+            progress_callback("Installing: " .. url_path)
+        end
+        
+        -- Check if source file exists
+        local source_file = io.open(source_path, "rb")
+        if not source_file then
+            table.insert(results.failed, {path = url_path, error = "File not found in release"})
+            if progress_callback then
+                progress_callback("Failed: " .. url_path .. " (not found)")
+            end
+            goto continue
+        end
+        source_file:close()
+        
+        -- Special handling for Vertical FX List script
+        local filename = target_path:match("([^/\\]+)$") or url_path:match("([^/\\]+)$")
+        local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
+        
+        if is_vertical_fx_list then
+            -- Install directly to CoolReaperScripts/Vertical FX List folder with different name
+            local bryan_scripts_folder = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperScripts" .. sep .. "Vertical FX List"
+            EnsureDirectoryExists(bryan_scripts_folder)
+            local final_path = bryan_scripts_folder .. sep .. "CRS_vertical fx list.lua"
+            
+            local copy_success, copy_error = CopyFile(source_path, final_path)
+            if copy_success then
+                table.insert(results.success, url_path)
+                
+                -- Register script
+                script_type = script_type or DetectScriptType(target_path)
+                if script_type == "lua" or script_type == "eel" or script_type == "py" then
+                    RegisterScript(final_path, script_type)
+                end
+            else
+                table.insert(results.failed, {path = url_path, error = copy_error or "Copy failed"})
+            end
+        else
+            -- Check if file already exists - skip if it does (don't overwrite)
+            local existing_file = io.open(dest_path, "rb")
+            if existing_file then
+                existing_file:close()
+                if progress_callback then
+                    progress_callback("Skipping (exists): " .. target_path)
+                end
+                table.insert(results.success, url_path)
+                goto continue
+            end
+            
+            -- Copy file
+            local copy_success, copy_error = CopyFile(source_path, dest_path)
+            if copy_success then
+                table.insert(results.success, url_path)
+                
+                -- Register script if applicable
+                script_type = script_type or DetectScriptType(target_path)
+                if script_type == "lua" or script_type == "eel" or script_type == "py" then
+                    RegisterScript(dest_path, script_type)
+                end
+            else
+                table.insert(results.failed, {path = url_path, error = copy_error or "Copy failed"})
+            end
+        end
+        
+        ::continue::
+    end
+    
+    return results
+end
+
 -- Copy file from source to destination
 local function CopyFile(source_path, dest_path)
     local source_file = io.open(source_path, "rb")
@@ -495,6 +681,206 @@ local function CopyFile(source_path, dest_path)
     dest_file:close()
     
     return true, nil
+end
+
+-- Download and extract zip archive from GitHub release
+local function DownloadAndExtractZip(zip_url, progress_callback)
+    local OS = r.GetOS()
+    local sep = GetPathSeparator()
+    local resource_path = GetResourcePath()
+    
+    -- Create temp directory
+    local temp_dir = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperScripts" .. sep .. "TEMP"
+    EnsureDirectoryExists(temp_dir)
+    
+    local zip_path = temp_dir .. sep .. "release.zip"
+    
+    -- Download zip file
+    if progress_callback then
+        progress_callback("Downloading release archive...")
+    end
+    
+    local cmd
+    if OS:match("Win") then
+        local escaped_path = zip_path:gsub('"', '\\"')
+        cmd = string.format('curl -L -f -s -S -o "%s" "%s" 2>&1', escaped_path, zip_url)
+    else
+        local escaped_path = zip_path:gsub('"', '\\"')
+        cmd = string.format('/usr/bin/curl -L -f -s -S -o "%s" "%s" 2>&1', escaped_path, zip_url)
+    end
+    
+    local result = r.ExecProcess(cmd, 120000) -- 120 second timeout for larger files
+    
+    -- Check if download succeeded
+    local file = io.open(zip_path, "rb")
+    if not file then
+        return nil, "Failed to download zip file"
+    end
+    local size = file:seek("end")
+    file:close()
+    
+    if size == 0 then
+        return nil, "Downloaded zip file is empty"
+    end
+    
+    if progress_callback then
+        progress_callback("Extracting archive...")
+    end
+    
+    -- Extract zip file
+    local extract_dir = temp_dir .. sep .. "extracted"
+    EnsureDirectoryExists(extract_dir)
+    
+    local extract_cmd
+    if OS:match("Win") then
+        -- Windows: use PowerShell Expand-Archive
+        local escaped_zip = zip_path:gsub('"', '\\"')
+        local escaped_extract = extract_dir:gsub('"', '\\"')
+        extract_cmd = string.format('powershell -Command "Expand-Archive -Path \\"%s\\" -DestinationPath \\"%s\\" -Force"', escaped_zip, escaped_extract)
+    else
+        -- macOS: use ditto (more reliable than unzip)
+        -- Linux: use unzip
+        if OS:match("OSX") or OS:match("macOS") then
+            extract_cmd = string.format('/usr/bin/ditto -xk "%s" "%s"', zip_path, extract_dir)
+        else
+            extract_cmd = string.format('/usr/bin/unzip -q -o "%s" -d "%s"', zip_path, extract_dir)
+        end
+    end
+    
+    local extract_result = r.ExecProcess(extract_cmd, 120000) -- 2 minute timeout
+    
+    -- Check if extraction timed out
+    if extract_result == "-999" then
+        return nil, "Extraction timed out after 2 minutes"
+    end
+    
+    -- Find the extracted folder (GitHub zipballs create a folder like repo-tag/)
+    -- First try subdirectories (most common case)
+    local extracted_folder = nil
+    for i = 0, 100 do
+        local subdir = r.EnumerateSubdirectories(extract_dir, i)
+        if not subdir then break end
+        extracted_folder = extract_dir .. sep .. subdir
+        break -- Take first subdirectory
+    end
+    
+    -- If no subdirectory found, check if extract_dir itself contains files (unlikely but possible)
+    if not extracted_folder then
+        local has_files = false
+        for i = 0, 10 do
+            local file_name = r.EnumerateFiles(extract_dir, i)
+            if file_name then
+                has_files = true
+                break
+            end
+        end
+        if has_files then
+            extracted_folder = extract_dir
+        end
+    end
+    
+    if not extracted_folder then
+        local err = "Failed to find extracted folder"
+        if extract_result and extract_result ~= "" then
+            err = err .. " (extract output: " .. extract_result .. ")"
+        end
+        return nil, err
+    end
+    
+    return extracted_folder, nil
+end
+
+-- Install files from extracted release archive
+local function InstallFromRelease(extracted_folder, progress_callback)
+    local resource_path = GetResourcePath()
+    local sep = GetPathSeparator()
+    local results = {success = {}, failed = {}}
+    
+    for _, file_info in ipairs(FILES_TO_INSTALL) do
+        local url_path = file_info.url_path
+        local target_path = file_info.target_path
+        local script_type = file_info.script_type
+        
+        -- Build source path in extracted folder
+        local source_path = extracted_folder .. sep .. url_path:gsub("/", sep)
+        
+        -- Check if source file exists
+        local source_file = io.open(source_path, "rb")
+        if not source_file then
+            table.insert(results.failed, {path = url_path, error = "File not found in release archive"})
+            if progress_callback then
+                progress_callback("Skipping (not found): " .. url_path)
+            end
+            goto continue
+        end
+        source_file:close()
+        
+        -- Build final target path
+        local full_target = resource_path .. sep .. NormalizePath(target_path)
+        
+        -- Get filename
+        local filename = target_path:match("([^/\\]+)$") or url_path:match("([^/\\]+)$")
+        local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
+        
+        -- Special handling for Vertical FX List script
+        if is_vertical_fx_list then
+            local bryan_scripts_folder = resource_path .. sep .. "Scripts" .. sep .. "CoolReaperScripts" .. sep .. "Vertical FX List"
+            EnsureDirectoryExists(bryan_scripts_folder)
+            full_target = bryan_scripts_folder .. sep .. "CRS_vertical fx list.lua"
+        end
+        
+        -- Copy file from extracted folder to target location
+        if progress_callback then
+            progress_callback("Installing: " .. url_path)
+        end
+        
+        -- For non-Vertical FX List files, check if already exists
+        if not is_vertical_fx_list then
+            local existing_file = io.open(full_target, "rb")
+            if existing_file then
+                existing_file:close()
+                if progress_callback then
+                    progress_callback("Skipping (already exists): " .. target_path)
+                end
+                table.insert(results.success, url_path)
+                goto continue
+            end
+        end
+        
+        local copy_success, copy_error = CopyFile(source_path, full_target)
+        if not copy_success then
+            table.insert(results.failed, {path = url_path, error = copy_error or "Copy failed"})
+            if progress_callback then
+                progress_callback("Failed: " .. url_path)
+            end
+            goto continue
+        end
+        
+        -- Register script if applicable
+        script_type = script_type or DetectScriptType(target_path)
+        if script_type == "lua" or script_type == "eel" or script_type == "py" then
+            if progress_callback then
+                if is_vertical_fx_list then
+                    progress_callback("Registering CRS_vertical fx list.lua")
+                else
+                    progress_callback("Registering: " .. target_path)
+                end
+            end
+            
+            local reg_success, reg_error = RegisterScript(full_target, script_type)
+            if not reg_success then
+                if progress_callback then
+                    progress_callback("Warning: Could not register script: " .. (reg_error or "unknown error"))
+                end
+            end
+        end
+        
+        table.insert(results.success, url_path)
+        
+        ::continue::
+    end
+    
+    return results
 end
 
 local function InstallFile(file_info, progress_callback)
@@ -623,7 +1009,9 @@ local install_state = {
     current_index = 0,
     results = {success = {}, failed = {}},
     total = 0,
-    started = false
+    started = false,
+    use_release = false, -- Whether installing from release
+    release_zip_extracted = nil -- Path to extracted release folder
 }
 
 local function ShowInstallSummary()
@@ -671,7 +1059,7 @@ local function ShowInstallSummary()
         end
         
         -- Reset installation state
-        install_state = {files = {}, current_index = 0, results = {success = {}, failed = {}}, total = 0, started = false}
+        install_state = {files = {}, current_index = 0, results = {success = {}, failed = {}}, total = 0, started = false, use_release = false, release_zip_extracted = nil}
         
         -- Reset GUI installation state (but keep modal open)
         commit_gui_state.installing = false
@@ -684,6 +1072,135 @@ end
 
 -- Process one file per defer call (non-blocking)
 local function ProcessNextFile()
+    -- If using release, handle differently
+    if install_state.use_release then
+        if not install_state.release_zip_extracted then
+            -- Download and extract zip first
+            local repo_key = next(commit_gui_state.selected_releases) or next(REPOSITORIES)
+            local release_tag = commit_gui_state.selected_releases[repo_key]
+            local releases = commit_gui_state.releases
+            
+            -- Find the release zip URL
+            local zip_url = nil
+            for _, release in ipairs(releases) do
+                if release.tag == release_tag then
+                    zip_url = release.zip_url
+                    break
+                end
+            end
+            
+            if not zip_url then
+                local err = "Release zip URL not found"
+                install_state.results.failed = {{path = "release", error = err}}
+                if commit_gui_state.ctx then
+                    table.insert(commit_gui_state.install_log, {
+                        file = "release",
+                        path = "release",
+                        status = "failed",
+                        message = err
+                    })
+                    commit_gui_state.install_failed_count = #install_state.results.failed
+                    commit_gui_state.install_log_expanded = true
+                    commit_gui_state.install_status = "Failed: " .. err
+                end
+                ShowInstallSummary()
+                return
+            end
+            
+            -- Download and extract
+            local extracted_folder, error_msg = DownloadAndExtractZip(zip_url, function(msg)
+                if commit_gui_state.ctx then
+                    commit_gui_state.install_status = msg
+                end
+            end)
+            
+            if not extracted_folder then
+                local err = error_msg or "Failed to extract release"
+                install_state.results.failed = {{path = "release", error = err}}
+                if commit_gui_state.ctx then
+                    table.insert(commit_gui_state.install_log, {
+                        file = "release",
+                        path = "release",
+                        status = "failed",
+                        message = err
+                    })
+                    commit_gui_state.install_failed_count = #install_state.results.failed
+                    commit_gui_state.install_log_expanded = true
+                    commit_gui_state.install_status = "Failed: " .. err
+                end
+                ShowInstallSummary()
+                return
+            end
+            
+            install_state.release_zip_extracted = extracted_folder
+            
+            -- Update progress
+            if commit_gui_state.ctx then
+                commit_gui_state.install_progress = 0.3 -- 30% for download/extract
+                commit_gui_state.install_status = "Installing files from release..."
+            end
+            
+            -- Continue to installation
+            r.defer(ProcessNextFile)
+            return
+        else
+            -- Install files from extracted folder
+            local file_count = 0
+            local results = InstallFromRelease(install_state.release_zip_extracted, function(msg)
+                if commit_gui_state.ctx then
+                    commit_gui_state.install_status = msg
+                    -- Update progress based on files processed (approximate)
+                    file_count = file_count + 1
+                    local total = #FILES_TO_INSTALL
+                    commit_gui_state.install_progress = 0.3 + (file_count / total * 0.7) -- 30-100%
+                end
+            end)
+            
+            install_state.results = results
+            
+            -- Add to install log
+            if commit_gui_state.ctx then
+                for _, file_path in ipairs(results.success) do
+                    local file_name = file_path:match("([^/\\]+)$") or file_path
+                    -- Check if it's Vertical FX List (which gets renamed)
+                    local is_vertical_fx_list = (file_name == "FXD_Vertical FX list.lua")
+                    -- Use the final downloaded filename for log entries
+                    file_name = is_vertical_fx_list and "CRS_vertical fx list.lua" or file_name
+                    table.insert(commit_gui_state.install_log, {
+                        file = file_name,
+                        path = file_path,
+                        status = "success",
+                        message = "Installed successfully"
+                    })
+                end
+                for _, failed in ipairs(results.failed) do
+                    local file_name = failed.path:match("([^/\\]+)$") or failed.path
+                    -- Check if it's Vertical FX List (which gets renamed)
+                    local is_vertical_fx_list = (file_name == "FXD_Vertical FX list.lua")
+                    -- Use the final downloaded filename for log entries
+                    file_name = is_vertical_fx_list and "CRS_vertical fx list.lua" or file_name
+                    table.insert(commit_gui_state.install_log, {
+                        file = file_name,
+                        path = failed.path,
+                        status = "failed",
+                        message = failed.error or "Unknown error"
+                    })
+                end
+                commit_gui_state.install_success_count = #results.success
+                commit_gui_state.install_failed_count = #results.failed
+            end
+            
+            -- Done
+            if commit_gui_state.ctx then
+                commit_gui_state.install_progress = 1.0
+                commit_gui_state.install_status = "Installation complete!"
+            end
+            ShowInstallSummary()
+            return
+        end
+    end
+    
+    -- Original file-by-file installation (for commits)
     if not install_state.started or install_state.current_index >= install_state.total then
         -- Update GUI progress to 100%
         if commit_gui_state.ctx then
@@ -702,7 +1219,11 @@ local function ProcessNextFile()
     -- Update GUI progress
     if commit_gui_state.ctx then
         commit_gui_state.install_progress = i / install_state.total
-        commit_gui_state.install_current_file = file_info.url_path:match("([^/\\]+)$") or file_info.url_path
+        -- Get filename and check if it's Vertical FX List (which gets renamed)
+        local filename = file_info.url_path:match("([^/\\]+)$") or file_info.url_path
+        local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
+        -- Use the final downloaded filename for display
+        commit_gui_state.install_current_file = is_vertical_fx_list and "CRS_vertical fx list.lua" or filename
         commit_gui_state.install_status = "Installing..."
         commit_gui_state.install_success_count = #results.success
         commit_gui_state.install_failed_count = #results.failed
@@ -718,7 +1239,11 @@ local function ProcessNextFile()
         end
     end)
     
-    local file_name = file_info.url_path:match("([^/\\]+)$") or file_info.url_path
+    -- Get filename and check if it's Vertical FX List (which gets renamed)
+    local filename = file_info.url_path:match("([^/\\]+)$") or file_info.url_path
+    local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
+    -- Use the final downloaded filename for log entries
+    local file_name = is_vertical_fx_list and "CRS_vertical fx list.lua" or filename
     local target_path = file_info.target_path or file_info.url_path
     
     if success then
@@ -763,12 +1288,21 @@ local function InstallAllFiles()
         return
     end
     
+    -- Check if using releases
+    local use_release = false
+    local current_repo_key = commit_gui_state.repos_to_select[commit_gui_state.current_repo_index]
+    if current_repo_key and commit_gui_state.selected_releases[current_repo_key] then
+        use_release = true
+    end
+    
     -- Initialize installation state
     install_state.files = FILES_TO_INSTALL
     install_state.current_index = 0
     install_state.results = {success = {}, failed = {}}
     install_state.total = #FILES_TO_INSTALL
     install_state.started = true
+    install_state.use_release = use_release
+    install_state.release_zip_extracted = nil
     
     -- Initialize GUI progress state
     if commit_gui_state.ctx then
@@ -797,6 +1331,227 @@ local function CheckReaImGui()
         return false
     end
     return true
+end
+
+-- Fetch releases from GitHub API (list all releases, no filtering)
+local function FetchReleases(user, repo)
+    local url = string.format("https://api.github.com/repos/%s/%s/releases", user, repo)
+    
+    local OS = r.GetOS()
+    local cmd
+    if OS:match("Win") then
+        cmd = string.format('curl -s -H "Accept: application/vnd.github.v3+json" "%s"', url)
+    else
+        cmd = string.format('/usr/bin/curl -s -H "Accept: application/vnd.github.v3+json" "%s"', url)
+    end
+    
+    local result = r.ExecProcess(cmd, 10000)
+    if not result or result == "" then
+        local handle = io.popen(cmd, "r")
+        if handle then
+            local lines = {}
+            for line in handle:lines() do
+                table.insert(lines, line)
+            end
+            result = table.concat(lines, "\n")
+            handle:close()
+        end
+    end
+    
+    if not result or result == "" then
+        return nil, "Failed to fetch releases (empty response)"
+    end
+    
+    -- Clean up response: remove any leading non-JSON characters
+    local json_start = result:find("[%[%{]")
+    if json_start and json_start > 1 then
+        result = result:sub(json_start)
+    end
+    
+    -- Check for API errors
+    if result:match('"message"') and result:match('"documentation_url"') then
+        local error_msg = result:match('"message":"([^"]+)"')
+        return nil, error_msg or "GitHub API error"
+    end
+    
+    -- Check if response starts with array bracket
+    if not result:match("^%s*%[") then
+        return nil, "Invalid response format (expected JSON array)"
+    end
+    
+    -- Parse releases JSON
+    local releases = {}
+    local pos = 1
+    
+    while true do
+        -- Find "tag_name" field
+        local tag_start = result:find('"tag_name"', pos)
+        if not tag_start then break end
+        
+        -- Find colon after "tag_name"
+        local colon = result:find(':', tag_start)
+        if not colon then break end
+        
+        -- Find opening quote
+        local quote = colon + 1
+        while quote <= #result and result:sub(quote, quote):match("%s") do
+            quote = quote + 1
+        end
+        
+        if result:sub(quote, quote) == '"' then
+            local tag_end = result:find('"', quote + 1)
+            if tag_end then
+                local tag = result:sub(quote + 1, tag_end - 1)
+                
+                -- Find "zipball_url" for this release
+                local zipball_start = result:find('"zipball_url"', tag_start)
+                if zipball_start then
+                    local zip_colon = result:find(':', zipball_start)
+                    if zip_colon then
+                        local zip_quote = zip_colon + 1
+                        while zip_quote <= #result and result:sub(zip_quote, zip_quote):match("%s") do
+                            zip_quote = zip_quote + 1
+                        end
+                        if result:sub(zip_quote, zip_quote) == '"' then
+                            local zip_quote_end = result:find('"', zip_quote + 1)
+                            if zip_quote_end then
+                                local zip_url = result:sub(zip_quote + 1, zip_quote_end - 1)
+                                
+                                -- Extract version from tag (remove 'v' prefix if present)
+                                local version = tag:match("^v?(.+)$") or tag
+                                
+                                table.insert(releases, {
+                                    tag = tag,
+                                    version = version,
+                                    zip_url = zip_url
+                                })
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        pos = tag_start + 10
+    end
+    
+    if #releases == 0 then
+        return nil, "No releases found"
+    end
+    
+    return releases, nil
+end
+
+-- Fetch releases from GitHub API
+local function FetchReleases(user, repo)
+    local url = string.format("https://api.github.com/repos/%s/%s/releases", user, repo)
+    
+    local OS = r.GetOS()
+    local cmd
+    if OS:match("Win") then
+        cmd = string.format('curl -s -H "Accept: application/vnd.github.v3+json" "%s"', url)
+    else
+        cmd = string.format('/usr/bin/curl -s -H "Accept: application/vnd.github.v3+json" "%s"', url)
+    end
+    
+    local result = r.ExecProcess(cmd, 10000)
+    if not result or result == "" then
+        local handle = io.popen(cmd, "r")
+        if handle then
+            local lines = {}
+            for line in handle:lines() do
+                table.insert(lines, line)
+            end
+            result = table.concat(lines, "\n")
+            handle:close()
+        end
+    end
+    
+    if not result or result == "" then
+        return nil, "Failed to fetch releases (empty response)"
+    end
+    
+    -- Clean up response: remove any leading non-JSON characters
+    local json_start = result:find("[%[%{]")
+    if json_start and json_start > 1 then
+        result = result:sub(json_start)
+    end
+    
+    -- Check for API errors
+    if result:match('"message"') and result:match('"documentation_url"') then
+        local error_msg = result:match('"message":"([^"]+)"')
+        return nil, error_msg or "GitHub API error"
+    end
+    
+    -- Check if response starts with array bracket
+    if not result:match("^%s*%[") then
+        return nil, "Invalid response format (expected JSON array)"
+    end
+    
+    -- Parse releases JSON
+    local releases = {}
+    local pos = 1
+    
+    while true do
+        -- Find "tag_name" field
+        local tag_start = result:find('"tag_name"', pos)
+        if not tag_start then break end
+        
+        -- Find colon after "tag_name"
+        local colon = result:find(':', tag_start)
+        if not colon then break end
+        
+        -- Find opening quote
+        local quote = colon + 1
+        while quote <= #result and result:sub(quote, quote):match("%s") do
+            quote = quote + 1
+        end
+        
+        if result:sub(quote, quote) ~= '"' then break end
+        
+        -- Find closing quote
+        local tag_end = result:find('"', quote + 1)
+        if not tag_end then break end
+        
+        local tag = result:sub(quote + 1, tag_end - 1)
+        
+        -- Find zipball_url for this release
+        local zipball_start = result:find('"zipball_url"', tag_start)
+        local zip_url = nil
+        if zipball_start then
+            local zip_colon = result:find(':', zipball_start)
+            if zip_colon then
+                local zip_quote = zip_colon + 1
+                while zip_quote <= #result and result:sub(zip_quote, zip_quote):match("%s") do
+                    zip_quote = zip_quote + 1
+                end
+                if result:sub(zip_quote, zip_quote) == '"' then
+                    local zip_quote_end = result:find('"', zip_quote + 1)
+                    if zip_quote_end then
+                        zip_url = result:sub(zip_quote + 1, zip_quote_end - 1)
+                    end
+                end
+            end
+        end
+        
+        if zip_url then
+            -- Extract version from tag (remove 'v' prefix if present)
+            local version = tag:match("^v?(.+)$") or tag
+            table.insert(releases, {
+                tag = tag,
+                version = version,
+                zip_url = zip_url
+            })
+        end
+        
+        pos = tag_start + 10
+    end
+    
+    if #releases == 0 then
+        return nil, "No releases found"
+    end
+    
+    return releases, nil
 end
 
 -- Fetch commits from GitHub API
@@ -1124,6 +1879,8 @@ local function ApplyCustomTheme(ctx)
     
     -- Frame colors
     r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBg(), bg_medium)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgHovered(), bg_light)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgActive(), bg_light)
     
     -- Button colors
     r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), bg_medium)
@@ -1139,6 +1896,7 @@ local function ApplyCustomTheme(ctx)
     
     -- Header/Selectable colors (for dropdown items)
     -- Transparent hover color
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), 0x00000000) -- Transparent
     r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderHovered(), 0x00000000) -- Transparent
     r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderActive(), 0x00000000) -- Transparent
     
@@ -1170,14 +1928,11 @@ end
 
 -- Pop custom styling theme
 local function PopCustomTheme(ctx)
-    -- Pop all style colors (14 colors - 9 original + 3 title bar + 2 header colors)
-    for i = 1, 14 do
-        r.ImGui_PopStyleColor(ctx)
-    end
+    -- Pop all style colors (17 colors - 9 original + 3 title bar + 3 header + 2 frame colors)
+    -- Use PopStyleColor with count parameter for safety
+    r.ImGui_PopStyleColor(ctx, 17)
     -- Pop all style vars (19 vars)
-    for i = 1, 19 do
-        r.ImGui_PopStyleVar(ctx)
-    end
+    r.ImGui_PopStyleVar(ctx, 19)
 end
 
 -- Initialize commit selection GUI
@@ -1222,7 +1977,7 @@ local function InitCommitGUI()
         r.ImGui_Attach(commit_gui_state.ctx, commit_gui_state.title_font)
     end
     
-    -- Auto-load commits for the first repository
+    -- Auto-load releases or commits for the first repository
     if #commit_gui_state.repos_to_select > 0 then
         local current_repo_key = commit_gui_state.repos_to_select[commit_gui_state.current_repo_index]
         local repo = REPOSITORIES[current_repo_key]
@@ -1230,41 +1985,44 @@ local function InitCommitGUI()
             commit_gui_state.loading = true
             commit_gui_state.error_msg = nil
             commit_gui_state.commits = {}
+            commit_gui_state.releases = {}
             
-            -- Fetch commits in background (non-blocking)
+            -- Try to fetch releases first (non-blocking)
             r.defer(function()
-                local commits, error_msg = FetchCommits(repo.user, repo.repo, repo.branch)
-                commit_gui_state.loading = false
-                if commits then
-                    -- Deduplicate by display string (date + message) and extract versions from commit messages
-                    local unique_commits = {}
-                    local seen_displays = {}
-                    local versioned_commits = {}
-                    
-                    for i, commit in ipairs(commits) do
-                        local display = string.format("%s - %s", commit.date, commit.message)
-                        
-                        -- Check if we've seen this display string before
-                        if not seen_displays[display] then
-                            seen_displays[display] = true
-                            table.insert(unique_commits, commit)
-                            
-                        -- Extract version from commit message (pattern: ##VerX.X##)
-                        local version = ExtractVersionFromMessage(commit.message)
-                        if version then
-                            commit.version = version  -- Add version to commit object
-                            table.insert(versioned_commits, commit)
-                        end
-                    end
-                    end
-                    
-                commit_gui_state.commits = versioned_commits
-                -- Default to latest versioned commit
-                if #versioned_commits > 0 then
-                    commit_gui_state.selected_commits[current_repo_key] = versioned_commits[1].sha
-                end
+                local releases, release_error = FetchReleases(repo.user, repo.repo)
+                if releases and #releases > 0 then
+                    -- Use releases
+                    commit_gui_state.releases = releases
+                    commit_gui_state.use_releases = true
+                    commit_gui_state.loading = false
+                    -- Default to latest release
+                    commit_gui_state.selected_releases[current_repo_key] = releases[1].tag
                 else
-                    commit_gui_state.error_msg = error_msg or "Failed to load commits"
+                    -- Fall back to commits
+                    commit_gui_state.use_releases = false
+                    local commits, error_msg = FetchCommits(repo.user, repo.repo, repo.branch)
+                    commit_gui_state.loading = false
+                    if commits then
+                        -- Extract versions from commit messages (pattern: ##VerX.X##)
+                        local versioned_commits = {}
+                        
+                        for i, commit in ipairs(commits) do
+                            -- Extract version from commit message (pattern: ##VerX.X##)
+                            local version = ExtractVersionFromMessage(commit.message)
+                            if version then
+                                commit.version = version  -- Add version to commit object
+                                table.insert(versioned_commits, commit)
+                            end
+                        end
+                        
+                        commit_gui_state.commits = versioned_commits
+                        -- Default to latest versioned commit
+                        if #versioned_commits > 0 then
+                            commit_gui_state.selected_commits[current_repo_key] = versioned_commits[1].sha
+                        end
+                    else
+                        commit_gui_state.error_msg = error_msg or "Failed to load commits"
+                    end
                 end
             end)
         end
@@ -1355,32 +2113,56 @@ local function RenderCommitGUI()
     r.ImGui_SetCursorPosY(ctx, dropdown_y)
     
     -- Version dropdown on the right
-    local current_selected_sha = commit_gui_state.selected_commits[current_repo_key]
+    local current_selected = nil
     local current_selected_index = 0
     local preview_text = "Select Version..."
+    local items_to_show = {}
     
-    -- Build preview text and find current index
-    if current_selected_sha and #commit_gui_state.commits > 0 then
-        for i, commit in ipairs(commit_gui_state.commits) do
-            if commit.sha == current_selected_sha then
-                current_selected_index = i - 1 -- ImGui uses 0-based indexing
-                preview_text = commit.version or "Unknown"
-                break
+    if commit_gui_state.use_releases then
+        -- Show releases
+        items_to_show = commit_gui_state.releases
+        current_selected = commit_gui_state.selected_releases[current_repo_key]
+        
+        if current_selected and #commit_gui_state.releases > 0 then
+            for i, release in ipairs(commit_gui_state.releases) do
+                if release.tag == current_selected then
+                    current_selected_index = i - 1
+                    preview_text = release.version or release.tag
+                    break
+                end
             end
+        elseif commit_gui_state.loading then
+            preview_text = "Loading..."
+        elseif commit_gui_state.error_msg then
+            preview_text = "Error loading"
         end
-    elseif commit_gui_state.loading then
-        preview_text = "Loading..."
-    elseif commit_gui_state.error_msg then
-        preview_text = "Error loading"
+    else
+        -- Show commits
+        items_to_show = commit_gui_state.commits
+        current_selected = commit_gui_state.selected_commits[current_repo_key]
+        
+        if current_selected and #commit_gui_state.commits > 0 then
+            for i, commit in ipairs(commit_gui_state.commits) do
+                if commit.sha == current_selected then
+                    current_selected_index = i - 1
+                    preview_text = commit.version or "Unknown"
+                    break
+                end
+            end
+        elseif commit_gui_state.loading then
+            preview_text = "Loading..."
+        elseif commit_gui_state.error_msg then
+            preview_text = "Error loading"
+        end
     end
     
     -- Dropdown combo
     r.ImGui_PushItemWidth(ctx, 200)
     
     -- Set transparent hover colors for dropdown items
+    -- Note: FrameBgHovered and FrameBgActive are in theme, but we override them here temporarily
     r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgHovered(), 0x55555533) -- Transparent hover
     r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgActive(), 0x55555533) -- Transparent active
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), 0x55555533) -- Transparent active
     
 
     if r.ImGui_BeginCombo(ctx, "##VersionCombo", preview_text, r.ImGui_ComboFlags_None()) then
@@ -1389,18 +2171,31 @@ local function RenderCommitGUI()
         r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderHovered(), 0x55555533) -- Transparent hover for selectables
         r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderActive(), 0x55555533) -- Transparent active for selectables
         
-        for i, commit in ipairs(commit_gui_state.commits) do
-            local is_selected = (current_selected_index == i - 1)
-            local version_display = commit.version or "Unknown"
+        if commit_gui_state.use_releases then
+            -- Show all releases
+            for i, release in ipairs(commit_gui_state.releases) do
+                local is_selected = (current_selected_index == i - 1)
+                local version_display = release.version or release.tag
 
-            if r.ImGui_Selectable(ctx, version_display, is_selected) then
-                commit_gui_state.selected_commits[current_repo_key] = commit.sha
+                if r.ImGui_Selectable(ctx, version_display, is_selected) then
+                    commit_gui_state.selected_releases[current_repo_key] = release.tag
+                end
+                if is_selected then
+                    r.ImGui_SetItemDefaultFocus(ctx)
+                end
             end
-            if r.ImGui_IsItemHovered(ctx) then 
-                HOVER_VERSION = version_display
-            end
-            if is_selected then
-                r.ImGui_SetItemDefaultFocus(ctx)
+        else
+            -- Show versioned commits
+            for i, commit in ipairs(commit_gui_state.commits) do
+                local is_selected = (current_selected_index == i - 1)
+                local version_display = commit.version or "Unknown"
+
+                if r.ImGui_Selectable(ctx, version_display, is_selected) then
+                    commit_gui_state.selected_commits[current_repo_key] = commit.sha
+                end
+                if is_selected then
+                    r.ImGui_SetItemDefaultFocus(ctx)
+                end
             end
         end
         
@@ -1409,8 +2204,8 @@ local function RenderCommitGUI()
         r.ImGui_EndCombo(ctx)
     end
     
-    -- Pop hover colors
-    r.ImGui_PopStyleColor(ctx, 3)
+    -- Pop hover colors (only FrameBgHovered and FrameBgActive - ButtonActive is in theme)
+    r.ImGui_PopStyleColor(ctx, 2)
     r.ImGui_PopItemWidth(ctx)
     
     r.ImGui_Spacing(ctx)
@@ -1568,7 +2363,12 @@ local function RenderCommitGUI()
         end
     else
         -- Install button (centered, full width)
-        local can_finish = (current_selected_sha ~= nil)
+        local can_finish = false
+        if commit_gui_state.use_releases then
+            can_finish = (commit_gui_state.selected_releases[current_repo_key] ~= nil)
+        else
+            can_finish = (commit_gui_state.selected_commits[current_repo_key] ~= nil)
+        end
         
         if can_finish then
             r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FramePadding(), 12.0, 10.0)
@@ -1584,9 +2384,13 @@ local function RenderCommitGUI()
             r.ImGui_SetCursorPosX(ctx, r.ImGui_GetCursorPosX(ctx) + button_x)
             
             if r.ImGui_Button(ctx, "Install", button_width, 0) then
-                -- Apply selected commits
-                for repo_key, commit_ref in pairs(commit_gui_state.selected_commits) do
-                    SELECTED_COMMITS[repo_key] = commit_ref
+                -- Apply selected commits/releases
+                if commit_gui_state.use_releases then
+                    -- Releases are handled directly in InstallAllFiles
+                else
+                    for repo_key, commit_ref in pairs(commit_gui_state.selected_commits) do
+                        SELECTED_COMMITS[repo_key] = commit_ref
+                    end
                 end
                 -- Don't close window, keep it open to show progress
                 commit_gui_state.installing = true
@@ -1712,15 +2516,18 @@ local function RenderCommitGUI()
             r.ImGui_SetCursorPosX(ctx, r.ImGui_GetCursorPosX(ctx) + button_x)
             
             r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FramePadding(), 10.0, 8.0)
+            local modal_color_count = 0
             if commit_gui_state.modal_type == "success" then
                 r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x2D4F47FF) -- Accent color
                 r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), 0x3A6B5FFF)
                 r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), 0x255A4FFF)
                 r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0xFFFFFFFF) -- White text
+                modal_color_count = 4
             else
                 r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x404040FF) -- Gray for error
                 r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), 0x505050FF)
                 r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), 0x353535FF)
+                modal_color_count = 3
             end
             
             if r.ImGui_Button(ctx, "OK", button_width, 0) then
@@ -1728,7 +2535,9 @@ local function RenderCommitGUI()
                 r.ImGui_CloseCurrentPopup(ctx)
             end
             
-            r.ImGui_PopStyleColor(ctx, 4)
+            if modal_color_count > 0 then
+                r.ImGui_PopStyleColor(ctx, modal_color_count)
+            end
             r.ImGui_PopStyleVar(ctx)
             
             r.ImGui_EndPopup(ctx)

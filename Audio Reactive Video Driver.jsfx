@@ -1,0 +1,168 @@
+desc:Audio Reactive Video Driver (gmem out)
+tags:analysis video reactive sidechain
+in_pin:In 1
+in_pin:In 2
+in_pin:In 3
+in_pin:In 4
+in_pin:In 5
+in_pin:In 6
+in_pin:In 7
+in_pin:In 8
+out_pin:Out 1
+out_pin:Out 2
+out_pin:Out 3
+out_pin:Out 4
+out_pin:Out 5
+out_pin:Out 6
+out_pin:Out 7
+out_pin:Out 8
+options:gmem=audioReactiveVideoBus
+
+slider1:source_pair=0<0,4,1{Auto,1/2,3/4,5/6,7/8}>Input channel pair
+slider2:detect_mode=1<1,2,1{Fullband,Bandpass}>Detector mode
+slider3:band_hz=80<20,12000,1:log=1000>Band center (Hz)
+slider4:band_q=1.2<0.2,12,0.01>Band Q
+slider5:attack_ms=3<0.1,200,0.1>Attack (ms)
+slider6:release_ms=120<5,2000,1>Release (ms)
+slider7:threshold_db=-42<-72,0,0.1>Threshold (dB)
+slider8:sensitivity_db=18<1,60,0.1>Sensitivity range (dB)
+slider9:output_gain=3<0,6,0.01>Detector gain
+slider10:low_split_hz=120<40,600,1:log=200>Low/Mid split (Hz)
+slider11:high_split_hz=2200<400,12000,1:log=2000>Mid/High split (Hz)
+
+@init
+eps = 0.000000000001;
+log10v = log(10);
+
+env = 0;
+env_slow = 0;
+
+bp_x1_l = bp_x2_l = bp_y1_l = bp_y2_l = 0;
+bp_x1_r = bp_x2_r = bp_y1_r = bp_y2_r = 0;
+
+lp_low = 0;
+lp_high = 0;
+
+last_ready = -1;
+
+function clamp(v, lo, hi)
+(
+  v < lo ? lo : v > hi ? hi : v;
+);
+
+function db_to_amp(db)
+(
+  exp(db * log(10) / 20);
+);
+
+function amp_to_db(a)
+(
+  20 * log(max(a, eps)) / log10v;
+);
+
+function onepole_coeff(hz)
+local(x)
+(
+  x = min(hz, srate * 0.45);
+  1 - exp(-2*$pi*x/srate);
+);
+
+function compute_bp_coeff(freq, q)
+local(w0, cs, sn, alpha, a0)
+(
+  w0 = 2*$pi*min(freq, srate*0.45)/srate;
+  cs = cos(w0);
+  sn = sin(w0);
+  alpha = sn / max(q*2, 0.001);
+
+  a0 = 1 + alpha;
+  b0 = alpha / a0;
+  b1 = 0;
+  b2 = -alpha / a0;
+  a1 = -2 * cs / a0;
+  a2 = (1 - alpha) / a0;
+);
+
+function read_pair(pair)
+(
+  pair == 1 ? (
+    src_l = spl0; src_r = spl1;
+  ) : pair == 2 ? (
+    src_l = spl2; src_r = spl3;
+  ) : pair == 3 ? (
+    src_l = spl4; src_r = spl5;
+  ) : (
+    src_l = spl6; src_r = spl7;
+  );
+);
+
+function auto_pick_pair()
+(
+  p12 = 0.5 * (abs(spl0) + abs(spl1));
+  p34 = 0.5 * (abs(spl2) + abs(spl3));
+  p56 = 0.5 * (abs(spl4) + abs(spl5));
+  p78 = 0.5 * (abs(spl6) + abs(spl7));
+
+  sel_pair = 1;
+  best = p12;
+
+  p34 > best ? (best = p34; sel_pair = 2;);
+  p56 > best ? (best = p56; sel_pair = 3;);
+  p78 > best ? (best = p78; sel_pair = 4;);
+);
+
+@slider
+att_c = exp(-1/(max(attack_ms,0.001)*0.001*srate));
+rel_c = exp(-1/(max(release_ms,0.001)*0.001*srate));
+
+compute_bp_coeff(band_hz, band_q);
+
+low_a = onepole_coeff(low_split_hz);
+high_a = onepole_coeff(high_split_hz);
+
+@sample
+source_pair == 0 ? auto_pick_pair() : sel_pair = source_pair;
+read_pair(sel_pair);
+
+in_l = src_l;
+in_r = src_r;
+mono = 0.5 * (in_l + in_r);
+
+detect_mode == 2 ? (
+  y_l = b0*in_l + b1*bp_x1_l + b2*bp_x2_l - a1*bp_y1_l - a2*bp_y2_l;
+  bp_x2_l = bp_x1_l; bp_x1_l = in_l;
+  bp_y2_l = bp_y1_l; bp_y1_l = y_l;
+
+  y_r = b0*in_r + b1*bp_x1_r + b2*bp_x2_r - a1*bp_y1_r - a2*bp_y2_r;
+  bp_x2_r = bp_x1_r; bp_x1_r = in_r;
+  bp_y2_r = bp_y1_r; bp_y1_r = y_r;
+
+  det_in = 0.5 * (abs(y_l) + abs(y_r));
+) : (
+  det_in = 0.5 * (abs(in_l) + abs(in_r));
+);
+
+env_coeff = det_in > env ? att_c : rel_c;
+env = det_in + env_coeff * (env - det_in);
+
+env_slow = env_slow + 0.01 * (env - env_slow);
+transient = max(0, env - env_slow);
+
+db_above = amp_to_db(env * output_gain) - threshold_db;
+detector = clamp(db_above / max(sensitivity_db, 0.001), 0, 1);
+
+abs_m = abs(mono);
+lp_low = lp_low + low_a * (abs_m - lp_low);
+lp_high = lp_high + high_a * (abs_m - lp_high);
+band_high = max(0, abs_m - lp_high);
+band_mid = max(0, abs_m - lp_low - band_high);
+
+@block
+gmem[0] = 1;           // protocol/version marker
+gmem[1] = detector;    // thresholded detector 0..1
+gmem[2] = min(env, 4); // wideband envelope
+gmem[3] = min(lp_low, 4);
+gmem[4] = min(band_mid, 4);
+gmem[5] = min(band_high, 4);
+gmem[6] = min(transient * 4, 4);
+gmem[7] = sel_pair;    // selected pair (1..4), useful for debugging

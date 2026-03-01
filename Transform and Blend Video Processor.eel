@@ -1,0 +1,99 @@
+// Transform + Custom Blend Modes (Video Processor helper)
+// Uses gfx_evalrect for true per-pixel blend formulas.
+//
+// Blend mode list:
+// 0 Normal
+// 1 Add
+// 2 Multiply
+// 3 Screen
+// 4 Overlay
+// 5 Color Burn
+// 6 Difference
+
+//@param1:opacity 'Opacity' 1 0 1 0.5 0.01
+//@param2:zoom 'Zoom (log)' 0 -10 10 0 0.01
+//@param3:xoffs 'X offset' 0 -1 1 0 0.001
+//@param4:yoffs 'Y offset' 0 -1 1 0 0.001
+//@param5:rotate 'Rotate (deg)' 0 -360 360 0 0.1
+//@param6:blend 'Blend mode (0 Nrm 1 Add 2 Mul 3 Scr 4 Ovr 5 Brn 6 Dif)' 0 0 6 0.5 1
+//@param7:filter 'Bilinear filter' 1 0 1 0.5 1
+//@param8:clear 'Clear bg' 1 0 1 0.5 1
+//@param9:force_w 'Force width' 0 0 4096 1024 2
+//@param10:force_h 'Force height' 0 0 4096 1024 2
+//@param11:paspect 'Preserve aspect' 1 0 1 0.5 1
+//@param12:flip_x 'Flip X' 0 0 1 0.5 1
+//@param13:flip_y 'Flip Y' 0 0 1 0.5 1
+
+(bg_img = input_ismaster() ? -2 : input_track(0)) ? (
+  // Optional output-size override
+  force_w &= -2; force_h &= -2;
+  force_w && !force_h ? force_h = (force_w * project_h / project_w) & -2;
+  force_h && !force_w ? force_w = (force_h * project_w / project_h) & -2;
+  force_w > 0 && force_h > 0 ? (project_w = force_w; project_h = force_h);
+
+  // Opacity clamp
+  w = opacity < 0 ? 0 : opacity > 1 ? 1 : opacity;
+
+  // Draw destination/background first
+  gfx_dest = -1;
+  gfx_mode = 0;
+  gfx_a = 1;
+  gfx_a2 = 0;
+  gfx_blit((w < 1 || clear < 0.5) ? bg_img : -2, 1);
+
+  w > 0 ? (
+    z = 10^(zoom / 10);
+    dw = (project_w * z) & -2;
+    dh = (project_h * z) & -2;
+
+    sx = flip_x > 0.5 ? -1 : 1;
+    sy = flip_y > 0.5 ? -1 : 1;
+    rw = dw * sx;
+    rh = dh * sy;
+
+    x = (project_w - dw + xoffs * (project_w + dw)) * 0.5;
+    y = (project_h - dh + yoffs * (project_h + dh)) * 0.5;
+    sx < 0 ? x += dw;
+    sy < 0 ? y += dh;
+
+    bm = blend | 0;
+    bm < 0 ? bm = 0;
+    bm > 6 ? bm = 6;
+
+    // Offscreen FG buffer for transformed source
+    img_fg <= 0 ? img_fg = gfx_img_alloc(project_w, project_h, 1);
+    gfx_img_info(img_fg, iw, ih) != 1 || iw != project_w || ih != project_h ? (
+      img_fg = gfx_img_resize(img_fg, project_w, project_h, 1);
+    );
+
+    gfx_dest = img_fg;
+    gfx_mode = 0;
+    gfx_a = 1;
+    gfx_set(0, 0, 0, 0, 0);
+    gfx_fillrect(0, 0, project_w, project_h);
+
+    // Render transformed source into FG buffer (preserve source alpha)
+    gfx_mode = (filter > 0.5 ? 256 : 0) | 0x10000;
+    gfx_a = 1;
+    rotate == 0 ? (
+      gfx_blit(0, paspect, x | 0, y | 0, rw, rh);
+    ) : (
+      input_info(0, srcw, srch);
+      sc = 2.0;
+      sc2 = sc * 0.5 - 0.5;
+      gfx_rotoblit(0, rotate * $pi / 180, (x - rw * sc2) | 0, (y - rh * sc2) | 0, rw * sc, rh * sc, -srcw * sc2, -srch * sc2, srcw * sc, srch * sc);
+    );
+
+    // Composite FG over destination using custom formula per pixel
+    gfx_dest = -1;
+    blend_amt = w;
+    blend_mode = bm;
+    #blend_expr = "dr=r;dg=g;db=b;da=a;srn=sr;sgn=sg;sbn=sb;amt=blend_amt;br=srn;bg=sgn;bb=sbn;m=blend_mode;m==1?(br=min(255,dr+srn);bg=min(255,dg+sgn);bb=min(255,db+sbn););m==2?(br=dr*srn/255;bg=dg*sgn/255;bb=db*sbn/255;);m==3?(br=255-(255-dr)*(255-srn)/255;bg=255-(255-dg)*(255-sgn)/255;bb=255-(255-db)*(255-sbn)/255;);m==4?(br=dr<128?2*dr*srn/255:255-2*(255-dr)*(255-srn)/255;bg=dg<128?2*dg*sgn/255:255-2*(255-dg)*(255-sgn)/255;bb=db<128?2*db*sbn/255:255-2*(255-db)*(255-sbn)/255;);m==5?(br=srn<=0?0:max(0,255-(255-dr)*255/srn);bg=sgn<=0?0:max(0,255-(255-dg)*255/sgn);bb=sbn<=0?0:max(0,255-(255-db)*255/sbn););m==6?(br=abs(dr-srn);bg=abs(dg-sgn);bb=abs(db-sbn););r=dr+(br-dr)*amt;g=dg+(bg-dg)*amt;b=db+(bb-db)*amt;a=da+(255-da)*amt;";
+    eval_ok = gfx_evalrect(0, 0, project_w, project_h, #blend_expr, 0, img_fg);
+    eval_ok < 0 ? (
+      gfx_mode = 0;
+      gfx_a = w;
+      gfx_blit(img_fg, 1, 0, 0, project_w, project_h);
+    );
+  );
+);
