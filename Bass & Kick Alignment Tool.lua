@@ -184,7 +184,10 @@ local state = {
   cfg_timebase = "beats",
   cal_scale = DEFAULT_HZOOM_SCALE,
   cal_prev = nil,
-  cal_offset_x = 0.0
+  cal_offset_x = 0.0,
+  norm_peak_cache = {},   -- guid -> reference peak (zoom-independent)
+  norm_signature = nil,   -- selected GUID signature
+  norm_peak = 1.0
 }
 
 local function is_finite(v)
@@ -461,7 +464,80 @@ local function get_accessor_for_track(track)
   return acc
 end
 
-local function get_accessor_bounds(acc)
+local get_accessor_bounds
+
+local function get_selected_guid_signature()
+  local guids = {}
+  for i = 1, #state.kick_tracks do
+    guids[#guids + 1] = r.GetTrackGUID(state.kick_tracks[i])
+  end
+  table.sort(guids)
+  return table.concat(guids, ";")
+end
+
+local function estimate_track_reference_peak(track)
+  local guid = r.GetTrackGUID(track)
+  local cached = state.norm_peak_cache[guid]
+  if cached and is_finite(cached) then return cached end
+
+  local acc = get_accessor_for_track(track)
+  if not acc then
+    state.norm_peak_cache[guid] = 1.0
+    return 1.0
+  end
+
+  local t1, t2 = get_accessor_bounds(acc)
+  if not (is_finite(t1) and is_finite(t2) and t2 > t1) then
+    state.norm_peak_cache[guid] = 1.0
+    return 1.0
+  end
+
+  local duration = t2 - t1
+  local probe_points = 4096
+  local sample_rate = math.max(50, math.floor((probe_points / duration) + 0.5))
+  local arr = r.new_array(probe_points * 2)
+  local ok = r.GetAudioAccessorSamples(acc, sample_rate, 2, t1, probe_points, arr)
+  if ok ~= 1 then
+    state.norm_peak_cache[guid] = 1.0
+    return 1.0
+  end
+
+  local t = arr.table()
+  local peak = 0.0
+  local idx = 1
+  for i = 1, probe_points do
+    local l = math.abs(t[idx] or 0.0); idx = idx + 1
+    local rr = math.abs(t[idx] or 0.0); idx = idx + 1
+    local v = 0.5 * (l + rr)
+    if v > peak then peak = v end
+  end
+
+  -- Floor prevents overly huge display when probe misses true transient peaks.
+  peak = math.max(peak, 0.05)
+  state.norm_peak_cache[guid] = peak
+  return peak
+end
+
+local function get_selection_reference_peak()
+  local sig = get_selected_guid_signature()
+  if state.norm_signature == sig and is_finite(state.norm_peak) and state.norm_peak > 0 then
+    return state.norm_peak
+  end
+
+  local max_peak = 0.0
+  for i = 1, #state.kick_tracks do
+    local p = estimate_track_reference_peak(state.kick_tracks[i])
+    if p > max_peak then max_peak = p end
+  end
+  if max_peak <= 0 then max_peak = 1.0 end
+
+  state.norm_signature = sig
+  state.norm_peak = max_peak
+  wave_dbg(string.format("reference peak updated: %.4f", max_peak), "ref_peak", 1.0)
+  return state.norm_peak
+end
+
+get_accessor_bounds = function(acc)
   local t1, t2 = nil, nil
   if r.GetAudioAccessorStartTime then
     local ok, v = pcall(r.GetAudioAccessorStartTime, acc)
@@ -494,7 +570,11 @@ local function build_wave_points(left_t, right_t, width_px)
 
   -- Use a denser lookup table so waveform follows grid-scale changes tightly.
   local points = math.max(512, math.min(32768, math.floor(width_px)))
-  local sample_rate = math.floor(math.max(1000, math.min(192000, points / duration)) + 0.5)
+  -- Use (points - 1) so sampled times span exactly [left_t, right_t].
+  -- Using points/duration leaves the right edge short by ~1 bin and can
+  -- cause repeated/taller right-end artifacts.
+  local rate_target = (points > 1) and ((points - 1) / duration) or (1 / duration)
+  local sample_rate = math.floor(math.max(1000, math.min(192000, rate_target)) + 0.5)
   local channels = 2
   local total = {}
   for i = 1, points do total[i] = 0.0 end
@@ -504,48 +584,51 @@ local function build_wave_points(left_t, right_t, width_px)
     local acc = get_accessor_for_track(tr)
     if acc then
       local astart, aend = get_accessor_bounds(acc)
-      local seg_l = left_t
-      local seg_r = right_t
-      if astart then seg_l = math.max(seg_l, astart) end
-      if aend then seg_r = math.min(seg_r, aend) end
-
-      if seg_r > seg_l then
-        local i1 = math.max(1, math.floor(((seg_l - left_t) / duration) * (points - 1)) + 1)
-        local i2 = math.min(points, math.ceil(((seg_r - left_t) / duration) * (points - 1)) + 1)
-        local npts = math.max(1, i2 - i1 + 1)
-
-        local arr = r.new_array(npts * channels)
-        local ok = r.GetAudioAccessorSamples(acc, sample_rate, channels, seg_l, npts, arr)
-        if ok == 1 then
-          local t = arr.table()
-          local idx = 1
-          for s = 0, npts - 1 do
-            local l = math.abs(t[idx] or 0.0); idx = idx + 1
-            local rr = math.abs(t[idx] or 0.0); idx = idx + 1
-            local out_idx = i1 + s
-            if out_idx >= 1 and out_idx <= points then
-              total[out_idx] = total[out_idx] + (l + rr) * 0.5
-            end
+      local has_start = is_finite(astart)
+      local has_end = is_finite(aend)
+      -- Sample the full visible window directly into output bins.
+      -- This avoids right-edge remap artifacts from segment->bin index conversion.
+      local arr = r.new_array(points * channels)
+      local ok = r.GetAudioAccessorSamples(acc, sample_rate, channels, left_t, points, arr)
+      if ok == 1 then
+        local t = arr.table()
+        local idx = 1
+        for s = 1, points do
+          local l = math.abs(t[idx] or 0.0); idx = idx + 1
+          local rr = math.abs(t[idx] or 0.0); idx = idx + 1
+          -- Mask samples outside accessor bounds to avoid repeated tail values
+          -- being interpreted as valid waveform near the right edge.
+          local ts = left_t + ((s - 1) / sample_rate)
+          local in_bounds = true
+          if has_start and ts < astart then in_bounds = false end
+          if has_end and ts > aend then in_bounds = false end
+          if in_bounds then
+            total[s] = total[s] + (l + rr) * 0.5
           end
-        else
-          dbg("GetAudioAccessorSamples() failed on selected track", "audio_accessor_fail", 1.0)
         end
+      else
+        dbg("GetAudioAccessorSamples() failed on selected track", "audio_accessor_fail", 1.0)
       end
     end
   end
 
-  local peak = 0.0
+  local local_peak = 0.0
   for i = 1, points do
-    if total[i] > peak then peak = total[i] end
+    if total[i] > local_peak then local_peak = total[i] end
   end
-  if peak < 1e-7 then
+  if local_peak < 1e-7 then
     dbg("build_wave_points(): peak too low (silence in view)", "wave_silence", 1.0)
     return nil
   end
 
-  dbg(string.format("build_wave_points(): points=%d sr=%d peak=%.5f", points, sample_rate, peak), "wave_ok", 1.0)
+  local ref_peak = get_selection_reference_peak()
+  if not is_finite(ref_peak) or ref_peak <= 0 then ref_peak = 1.0 end
+  dbg(string.format("build_wave_points(): points=%d sr=%d local_peak=%.5f ref_peak=%.5f",
+      points, sample_rate, local_peak, ref_peak), "wave_ok", 1.0)
   for i = 1, points do
-    total[i] = total[i] / peak
+    local v = total[i] / ref_peak
+    if v > 1.0 then v = 1.0 end
+    total[i] = v
   end
   return total
 end
@@ -560,21 +643,41 @@ local function get_wave_points_cached(left_t, right_t, width_px)
   return c.points
 end
 
-local function sample_wave_at_time(wave, left_t, right_t, t)
+local function sample_wave_window(wave, left_t, right_t, t0, t1)
   if not wave then return 0.0 end
   local n = #wave
   if n <= 0 or right_t <= left_t then return 0.0 end
-  local u = (t - left_t) / (right_t - left_t)
-  if u <= 0 then return wave[1] or 0.0 end
-  if u >= 1 then return wave[n] or 0.0 end
-  local p = 1 + u * (n - 1)
-  local i1 = math.floor(p)
-  local i2 = i1 + 1
-  if i2 > n then i2 = n end
-  local a = p - i1
-  local v1 = wave[i1] or 0.0
-  local v2 = wave[i2] or v1
-  return v1 + (v2 - v1) * a
+
+  if t1 < t0 then t0, t1 = t1, t0 end
+  local span_orig = t1 - t0
+  if span_orig <= 0 then return 0.0 end
+  if t1 <= left_t or t0 >= right_t then return 0.0 end
+  if t0 < left_t then t0 = left_t end
+  if t1 > right_t then t1 = right_t end
+  if t1 <= t0 then return 0.0 end
+  local overlap = (t1 - t0) / span_orig
+  if overlap <= 0 then return 0.0 end
+
+  if n == 1 then
+    return (wave[1] or 0.0) * overlap
+  end
+
+  local u0 = (t0 - left_t) / (right_t - left_t)
+  local u1 = (t1 - left_t) / (right_t - left_t)
+  local p0 = 1 + u0 * (n - 1)
+  local p1 = 1 + u1 * (n - 1)
+  local i0 = math.max(1, math.floor(p0))
+  local i1 = math.min(n, math.ceil(p1))
+  if i1 < i0 then return 0.0 end
+
+  local sum = 0.0
+  local cnt = 0
+  for i = i0, i1 do
+    sum = sum + (wave[i] or 0.0)
+    cnt = cnt + 1
+  end
+  if cnt <= 0 then return 0.0 end
+  return (sum / cnt) * overlap
 end
 
 local setup_flags = flags_or(
@@ -723,10 +826,23 @@ local function draw_wave_overlay()
 
         local prev_x_u, prev_y_u = nil, nil
         local prev_x_l, prev_y_l = nil, nil
-        for i = 0, px_count do
-          local x = rect.x1 + i
-          local t = timeline.x_to_time(x)
-          local norm = sample_wave_at_time(wave, left_t, right_t, t)
+        -- Clip drawing to exact timeline-mapped x-range to avoid right-edge duplication.
+        local tx1 = timeline.time_to_x(left_t)
+        local tx2 = timeline.time_to_x(right_t)
+        if tx2 < tx1 then tx1, tx2 = tx2, tx1 end
+        -- Keep a tiny guard band at both edges to avoid host-side boundary
+        -- sampling artifacts that can occasionally elongate the last visible shape.
+        local EDGE_GUARD_PX = 2
+        local draw_x_min = math.max(rect.x1 + 0.5 + EDGE_GUARD_PX, tx1 + 0.5 + EDGE_GUARD_PX)
+        local draw_x_max = math.min(rect.x2 - 0.5 - EDGE_GUARD_PX, tx2 - 0.5 - EDGE_GUARD_PX)
+        local i_start = math.max(0, math.floor(draw_x_min - rect.x1 - 0.5))
+        local i_end = math.min(px_count - 1, math.floor(draw_x_max - rect.x1 - 0.5))
+
+        for i = i_start, i_end do
+          local x = rect.x1 + i + 0.5
+          local t0 = timeline.x_to_time(x - 0.5)
+          local t1 = timeline.x_to_time(x + 0.5)
+          local norm = sample_wave_window(wave, left_t, right_t, t0, t1)
           local y_up = base_y - norm * amp_h
           local y_dn = base_y + norm * amp_h
 

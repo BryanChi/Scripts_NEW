@@ -6,11 +6,17 @@
 --   line nearest to the mouse position.
 
 local function require_sws()
-  if reaper.BR_GetMouseCursorContext and reaper.BR_GetMouseCursorContext_MIDI and reaper.BR_PositionAtMouseCursor then
+  if reaper.BR_GetMouseCursorContext and reaper.BR_GetMouseCursorContext_MIDI and reaper.BR_GetMouseCursorContext_Position then
     return true
   end
   reaper.MB("This script requires the SWS/S&M extension.", "Missing dependency", 0)
   return false
+end
+
+local function is_valid_midi_take(take)
+  if not take then return false end
+  if not reaper.ValidatePtr2(0, take, "MediaItem_Take*") then return false end
+  return reaper.TakeIsMIDI(take)
 end
 
 local function get_context()
@@ -18,16 +24,19 @@ local function get_context()
   if not editor then return nil end
 
   local take = reaper.MIDIEditor_GetTake(editor)
-  if not (take and reaper.TakeIsMIDI(take)) then return nil end
+  if not is_valid_midi_take(take) then return nil end
 
   local _, _, _ = reaper.BR_GetMouseCursorContext()
   local mouse_take, _, note_row = reaper.BR_GetMouseCursorContext_MIDI()
-  if mouse_take and mouse_take ~= take then
+  if is_valid_midi_take(mouse_take) and mouse_take ~= take then
     -- Mouse is over a different take/editor than the active one.
     take = mouse_take
   end
 
-  local mouse_time = reaper.BR_PositionAtMouseCursor(false)
+  local mouse_time = reaper.BR_GetMouseCursorContext_Position()
+  if (not mouse_time) and reaper.BR_PositionAtMouseCursor then
+    mouse_time = reaper.BR_PositionAtMouseCursor(false)
+  end
   if not mouse_time then return nil end
 
   return take, mouse_time, note_row
@@ -45,25 +54,38 @@ end
 local function find_note_under_mouse(take, mouse_ppq, note_row)
   local _, note_count = reaper.MIDI_CountEvts(take)
 
-  local best_idx = nil
-  local best_start = nil
-  local best_end = nil
+  local best_match_idx = nil
+  local best_match_start = nil
+  local best_match_end = nil
+  local best_any_idx = nil
+  local best_any_start = nil
+  local best_any_end = nil
+  local use_pitch = type(note_row) == "number" and note_row >= 0 and note_row <= 127
 
   for i = 0, note_count - 1 do
     local ok, sel, muted, startppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
     if ok and startppq <= mouse_ppq and mouse_ppq < endppq then
-      if (note_row == nil) or (pitch == note_row) then
-        if (not best_start) or (startppq > best_start) then
-          best_idx = i
-          best_start = startppq
-          best_end = endppq
+      if (not best_any_start) or (startppq > best_any_start) then
+        best_any_idx = i
+        best_any_start = startppq
+        best_any_end = endppq
+      end
+      if use_pitch and pitch == note_row then
+        if (not best_match_start) or (startppq > best_match_start) then
+          best_match_idx = i
+          best_match_start = startppq
+          best_match_end = endppq
         end
       end
     end
   end
 
-  if best_idx ~= nil then
-    return best_idx, best_start, best_end
+  if best_match_idx ~= nil then
+    return best_match_idx, best_match_start, best_match_end
+  end
+
+  if best_any_idx ~= nil then
+    return best_any_idx, best_any_start, best_any_end
   end
 
   return nil
@@ -89,7 +111,7 @@ local function main()
   if not require_sws() then return end
 
   local take, mouse_time, note_row = get_context()
-  if not take then return end
+  if not is_valid_midi_take(take) then return end
 
   local mouse_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, mouse_time)
   local split_ppq = nearest_grid_ppq(take, mouse_ppq)
