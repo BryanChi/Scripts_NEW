@@ -1,5 +1,5 @@
 -- @description Render item in place (replace active take with rendered audio)
--- @version 1.9
+-- @version 1.13
 -- @author Bryan
 -- @about
 --   For each selected media item, runs REAPER's built-in "Item: render items to new take"
@@ -71,11 +71,68 @@ local function copy_take_source_to_take(source_take, destination_take)
     return false, "missing source or destination take"
   end
 
+  local function clear_take_fx(take)
+    local fx_count = r.TakeFX_GetCount(take)
+    if fx_count and fx_count > 0 then
+      for fx = fx_count - 1, 0, -1 do
+        r.TakeFX_Delete(take, fx)
+      end
+      dbg("copy_take_source_to_take: cleared take FX = " .. tostring(fx_count))
+    end
+  end
+
+  local function clear_take_stretch_markers(take)
+    local marker_count = r.GetTakeNumStretchMarkers(take)
+    if marker_count and marker_count > 0 then
+      r.DeleteTakeStretchMarkers(take, 0, marker_count)
+      dbg("copy_take_source_to_take: cleared stretch markers = " .. tostring(marker_count))
+    end
+  end
+
+  local function sync_take_timing(dst_take, src_take)
+    local src_startoffs = r.GetMediaItemTakeInfo_Value(src_take, "D_STARTOFFS")
+    local src_playrate = r.GetMediaItemTakeInfo_Value(src_take, "D_PLAYRATE")
+    local src_pitch = r.GetMediaItemTakeInfo_Value(src_take, "D_PITCH")
+    local src_preserve_pitch = r.GetMediaItemTakeInfo_Value(src_take, "B_PPITCH")
+
+    if src_startoffs ~= nil then
+      r.SetMediaItemTakeInfo_Value(dst_take, "D_STARTOFFS", src_startoffs)
+    end
+    if src_playrate ~= nil then
+      r.SetMediaItemTakeInfo_Value(dst_take, "D_PLAYRATE", src_playrate)
+    end
+    if src_pitch ~= nil then
+      r.SetMediaItemTakeInfo_Value(dst_take, "D_PITCH", src_pitch)
+    end
+    if src_preserve_pitch ~= nil then
+      r.SetMediaItemTakeInfo_Value(dst_take, "B_PPITCH", src_preserve_pitch)
+    end
+
+    dbg(string.format(
+      "copy_take_source_to_take: synced timing startoffs=%.6f playrate=%.6f pitch=%.6f",
+      src_startoffs or -1, src_playrate or -1, src_pitch or -1
+    ))
+  end
+
   local source = r.GetMediaItemTake_Source(source_take)
   if not source then
     return false, "source take has no source"
   end
 
+  -- Preferred path: assign source object directly (works even for non-file-backed sources
+  -- and preserves destination take index/position in the take stack).
+  local set_ok = r.SetMediaItemTake_Source(destination_take, source)
+  if set_ok ~= false then
+    local dst_src = r.GetMediaItemTake_Source(destination_take)
+    if dst_src then
+      sync_take_timing(destination_take, source_take)
+      clear_take_fx(destination_take)
+      clear_take_stretch_markers(destination_take)
+      return true, nil
+    end
+  end
+
+  -- Fallback path: recreate source from file path.
   local _, source_path = r.GetMediaSourceFileName(source, "")
   if not source_path or source_path == "" then
     return false, "could not read source file path"
@@ -87,6 +144,9 @@ local function copy_take_source_to_take(source_take, destination_take)
   end
 
   r.SetMediaItemTake_Source(destination_take, new_src)
+  sync_take_timing(destination_take, source_take)
+  clear_take_fx(destination_take)
+  clear_take_stretch_markers(destination_take)
   return true, nil
 end
 
@@ -167,6 +227,13 @@ local function replace_by_swapping_to_rendered_take(item, original_active_guid, 
   rendered_take = r.GetMediaItemTake(item, rendered_idx)
   if not rendered_take then
     return false, "rendered take pointer invalid after deleting original"
+  end
+  local fx_count = r.TakeFX_GetCount(rendered_take)
+  if fx_count and fx_count > 0 then
+    for fx = fx_count - 1, 0, -1 do
+      r.TakeFX_Delete(rendered_take, fx)
+    end
+    dbg("replace_by_swapping_to_rendered_take: cleared take FX = " .. tostring(fx_count))
   end
   r.SetActiveTake(rendered_take)
   dbg("replace_by_swapping_to_rendered_take: success")
@@ -310,18 +377,14 @@ local function replace_with_rendered_take_only(item)
   local ok_src, err_src = copy_take_source_to_take(rendered_take, target_take)
   if not ok_src then
     dbg("failure new-take source apply: " .. tostring(err_src))
-    -- Some rendered take source types don't expose a file path.
-    -- Fallback: keep rendered take, remove original active take.
-    if tostring(err_src) == "could not read source file path" then
-      local ok_swap, err_swap = replace_by_swapping_to_rendered_take(item, original_active_guid, rendered_guid)
-      if ok_swap then
-        dbg("new-take path: swap fallback succeeded")
-        return true, nil
-      end
-      dbg("new-take path: swap fallback failed: " .. tostring(err_swap))
-      return false, err_swap or "swap fallback failed"
+    -- Last-resort fallback: keep rendered take, remove original active take.
+    local ok_swap, err_swap = replace_by_swapping_to_rendered_take(item, original_active_guid, rendered_guid)
+    if ok_swap then
+      dbg("new-take path: swap fallback succeeded")
+      return true, nil
     end
-    return false, err_src or "could not apply rendered source to original active take"
+    dbg("new-take path: swap fallback failed: " .. tostring(err_swap))
+    return false, err_src or err_swap or "could not apply rendered source to original active take"
   end
 
   local ok_del, err_del = delete_take_by_guid(item, rendered_guid)
