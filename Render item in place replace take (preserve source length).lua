@@ -1,10 +1,11 @@
--- @description Render item in place (replace active take with rendered audio)
+-- @description Render item in place (replace active take, preserve source length)
 -- @version 1.13
 -- @author Bryan
 -- @about
 --   For each selected media item, runs REAPER's built-in "Item: render items to new take"
 --   and replaces ONLY the original active take's source with the rendered result.
 --   Other takes are preserved.
+--   This variant preserves the original active take's source-based item length.
 
 local r = reaper
 
@@ -51,6 +52,28 @@ local function find_active_take_index(item)
     end
   end
   return -1
+end
+
+local function get_take_source_backed_item_length(take)
+  if not take then return nil end
+  local src = r.GetMediaItemTake_Source(take)
+  if not src then return nil end
+
+  local src_len = r.GetMediaSourceLength(src)
+  if not src_len or src_len <= 0 then return nil end
+
+  local playrate = r.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+  if not playrate or playrate == 0 then playrate = 1.0 end
+  playrate = math.abs(playrate)
+  if playrate == 0 then return nil end
+
+  local startoffs = r.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS") or 0
+  local remaining = src_len - startoffs
+  if remaining <= 0 then
+    return 0
+  end
+
+  return remaining / playrate
 end
 
 local function shorten_fx_name(raw_name)
@@ -405,7 +428,19 @@ local function replace_with_rendered_take_only(item)
     return false, "could not read original active take GUID"
   end
   local original_active_idx = find_active_take_index(item)
+  local original_item_len = r.GetMediaItemInfo_Value(item, "D_LENGTH")
+  local source_backed_len = get_take_source_backed_item_length(original_active_take)
   local render_summary = build_render_adjustment_summary(original_active_take)
+
+  local function restore_original_length()
+    if original_item_len and original_item_len >= 0 then
+      r.SetMediaItemInfo_Value(item, "D_LENGTH", original_item_len)
+    end
+  end
+
+  if source_backed_len and original_item_len and source_backed_len > original_item_len then
+    r.SetMediaItemInfo_Value(item, "D_LENGTH", source_backed_len)
+  end
 
   local existing_guids = {}
   for idx = 0, n_before - 1 do
@@ -434,6 +469,7 @@ local function replace_with_rendered_take_only(item)
       end
     end
     if not rendered_item then
+      restore_original_length()
       return false, "render did not produce a replaceable take/item"
     end
 
@@ -445,21 +481,19 @@ local function replace_with_rendered_take_only(item)
       end
     end
     if target_idx < 0 then
+      restore_original_length()
       return false, "original active take not found after copy path"
     end
     local target_take = r.GetMediaItemTake(item, target_idx)
     local rendered_take = r.GetActiveTake(rendered_item)
     if not rendered_take then
+      restore_original_length()
       return false, "rendered item has no active take"
     end
     local ok_src, err_src = copy_take_source_to_take(rendered_take, target_take)
     if not ok_src then
+      restore_original_length()
       return false, err_src or "could not apply rendered source to active take"
-    end
-
-    local rendered_len = r.GetMediaItemInfo_Value(rendered_item, "D_LENGTH")
-    if rendered_len and rendered_len > 0 then
-      r.SetMediaItemInfo_Value(item, "D_LENGTH", rendered_len)
     end
 
     local rendered_track = r.GetMediaItem_Track(rendered_item)
@@ -467,6 +501,7 @@ local function replace_with_rendered_take_only(item)
       r.DeleteTrackMediaItem(rendered_track, rendered_item)
     end
 
+    restore_original_length()
     r.SetActiveTake(target_take)
     add_render_summary_marker(target_take, render_summary)
     return true, nil
@@ -486,6 +521,7 @@ local function replace_with_rendered_take_only(item)
     rendered_guid = get_take_guid(r.GetActiveTake(item))
   end
   if not rendered_guid then
+    restore_original_length()
     return false, "could not identify rendered take"
   end
 
@@ -498,12 +534,14 @@ local function replace_with_rendered_take_only(item)
     end
   end
   if target_idx < 0 then
+    restore_original_length()
     return false, "original active take not found after render"
   end
   local target_take = r.GetMediaItemTake(item, target_idx)
 
   local rendered_idx = find_take_index_by_guid(item, rendered_guid)
   if rendered_idx < 0 then
+    restore_original_length()
     return false, "rendered take missing before replace"
   end
   local rendered_take = r.GetMediaItemTake(item, rendered_idx)
@@ -512,19 +550,23 @@ local function replace_with_rendered_take_only(item)
     -- Last-resort fallback: keep rendered take, remove original active take.
     local ok_swap, err_swap = replace_by_swapping_to_rendered_take(item, original_active_guid, rendered_guid)
     if ok_swap then
+      restore_original_length()
       add_render_summary_marker(r.GetActiveTake(item), render_summary)
       return true, nil
     end
+    restore_original_length()
     return false, err_src or err_swap or "could not apply rendered source to original active take"
   end
 
   local ok_del, err_del = delete_take_by_guid(item, rendered_guid)
   if not ok_del then
+    restore_original_length()
     return false, err_del or "could not remove temporary rendered take"
   end
+
+  restore_original_length()
   r.SetActiveTake(target_take)
   add_render_summary_marker(target_take, render_summary)
-
   return true, nil
 end
 
@@ -556,7 +598,7 @@ local function main()
 
   r.PreventUIRefresh(-1)
   r.UpdateArrange()
-  r.Undo_EndBlock("Render item in place (replace take)", -1)
+  r.Undo_EndBlock("Render item in place (replace take, preserve source length)", -1)
 
   if #failed > 0 then
     r.MB(
