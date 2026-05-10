@@ -1,0 +1,2 @@
+# Pin optional; `pip install whisperx` is enough for most setups.
+whisperx>=3.8.5

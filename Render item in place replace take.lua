@@ -10,6 +10,9 @@ local r = reaper
 
 local CMD_RENDER_ITEMS_NEW_TAKE = 40601 -- Item: render items to new take
 local CMD_DELETE_CURRENT_TAKE = 40129 -- Take: Delete current take from items
+local HISTORY_SECTION = "BRYAN_RENDER_ITEM_HISTORY"
+local HISTORY_LIMIT = 30
+local HANDLE_PADDING_SECONDS = 1.0
 
 local function collect_selected_items()
   local items = {}
@@ -27,6 +30,102 @@ local function get_take_guid(take)
     return guid
   end
   return nil
+end
+
+local function get_item_guid(item)
+  if not item then return nil end
+  local ok, guid = r.GetSetMediaItemInfo_String(item, "GUID", "", false)
+  if ok and guid and guid ~= "" then
+    return guid
+  end
+  return nil
+end
+
+local function encode_blob(s)
+  if not s then return "" end
+  s = s:gsub("\\", "\\\\")
+  s = s:gsub("\n", "\\n")
+  s = s:gsub("\r", "\\r")
+  s = s:gsub("\t", "\\t")
+  return s
+end
+
+local function split_string(s, sep)
+  local out = {}
+  if not s or s == "" then return out end
+  local start = 1
+  while true do
+    local i, j = s:find(sep, start, true)
+    if not i then
+      out[#out + 1] = s:sub(start)
+      break
+    end
+    out[#out + 1] = s:sub(start, i - 1)
+    start = j + 1
+  end
+  return out
+end
+
+local function load_item_history(item_guid)
+  local _, blob = r.GetProjExtState(0, HISTORY_SECTION, item_guid)
+  if not blob or blob == "" then return {} end
+  local rows = split_string(blob, "\n")
+  local entries = {}
+  for _, row in ipairs(rows) do
+    if row ~= "" then
+      local parts = split_string(row, "\t")
+      if #parts >= 4 then
+        entries[#entries + 1] = {
+          ts = parts[1],
+          label = parts[2],
+          summary = parts[3],
+          chunk = parts[4],
+        }
+      end
+    end
+  end
+  return entries
+end
+
+local function save_item_history(item_guid, entries)
+  if #entries == 0 then
+    r.SetProjExtState(0, HISTORY_SECTION, item_guid, "")
+    return
+  end
+  local rows = {}
+  local first = math.max(1, #entries - HISTORY_LIMIT + 1)
+  for i = first, #entries do
+    local e = entries[i]
+    rows[#rows + 1] = table.concat({
+      e.ts or "",
+      e.label or "",
+      e.summary or "",
+      e.chunk or "",
+    }, "\t")
+  end
+  r.SetProjExtState(0, HISTORY_SECTION, item_guid, table.concat(rows, "\n"))
+end
+
+local function save_item_snapshot(item, summary)
+  local item_guid = get_item_guid(item)
+  if not item_guid then return end
+  local ok_chunk, chunk = r.GetItemStateChunk(item, "", false)
+  if not ok_chunk or not chunk or chunk == "" then return end
+
+  local entries = load_item_history(item_guid)
+  local encoded = encode_blob(chunk)
+  local prev = entries[#entries]
+  if prev and prev.chunk == encoded then
+    return
+  end
+
+  entries[#entries + 1] = {
+    ts = tostring(os.time()),
+    label = os.date("%Y-%m-%d %H:%M:%S"),
+    summary = summary or "Before render",
+    chunk = encoded,
+  }
+  save_item_history(item_guid, entries)
 end
 
 local function find_take_index_by_guid(item, wanted_guid)
@@ -405,7 +504,39 @@ local function replace_with_rendered_take_only(item)
     return false, "could not read original active take GUID"
   end
   local original_active_idx = find_active_take_index(item)
+  local original_item_pos = r.GetMediaItemInfo_Value(item, "D_POSITION")
+  local original_item_len = r.GetMediaItemInfo_Value(item, "D_LENGTH")
+  local original_startoffs = r.GetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS") or 0
+  local original_playrate = r.GetMediaItemTakeInfo_Value(original_active_take, "D_PLAYRATE") or 1.0
+  original_playrate = math.abs(original_playrate)
+  if original_playrate == 0 then original_playrate = 1.0 end
+  local pre_source_delta = HANDLE_PADDING_SECONDS * original_playrate
   local render_summary = build_render_adjustment_summary(original_active_take)
+  save_item_snapshot(item, render_summary)
+
+  local function restore_original_item_bounds()
+    if original_item_pos ~= nil then
+      r.SetMediaItemInfo_Value(item, "D_POSITION", original_item_pos)
+    end
+    if original_item_len ~= nil then
+      r.SetMediaItemInfo_Value(item, "D_LENGTH", original_item_len)
+    end
+  end
+
+  local function source_pos_at_project_time(take, item_pos, project_time)
+    if not take then return nil end
+    local startoffs = r.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS") or 0
+    local playrate = r.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE") or 1.0
+    playrate = math.abs(playrate)
+    if playrate == 0 then playrate = 1.0 end
+    return startoffs + ((project_time - item_pos) * playrate)
+  end
+
+  if HANDLE_PADDING_SECONDS > 0 then
+    r.SetMediaItemInfo_Value(item, "D_POSITION", original_item_pos - HANDLE_PADDING_SECONDS)
+    r.SetMediaItemInfo_Value(item, "D_LENGTH", original_item_len + (HANDLE_PADDING_SECONDS * 2.0))
+    r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs - pre_source_delta)
+  end
 
   local existing_guids = {}
   for idx = 0, n_before - 1 do
@@ -434,6 +565,8 @@ local function replace_with_rendered_take_only(item)
       end
     end
     if not rendered_item then
+      restore_original_item_bounds()
+      r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
       return false, "render did not produce a replaceable take/item"
     end
 
@@ -445,21 +578,24 @@ local function replace_with_rendered_take_only(item)
       end
     end
     if target_idx < 0 then
+      restore_original_item_bounds()
+      r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
       return false, "original active take not found after copy path"
     end
     local target_take = r.GetMediaItemTake(item, target_idx)
     local rendered_take = r.GetActiveTake(rendered_item)
     if not rendered_take then
+      restore_original_item_bounds()
+      r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
       return false, "rendered item has no active take"
     end
+    local rendered_item_pos = r.GetMediaItemInfo_Value(rendered_item, "D_POSITION") or original_item_pos
+    local target_startoffs = source_pos_at_project_time(rendered_take, rendered_item_pos, original_item_pos)
     local ok_src, err_src = copy_take_source_to_take(rendered_take, target_take)
     if not ok_src then
+      restore_original_item_bounds()
+      r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
       return false, err_src or "could not apply rendered source to active take"
-    end
-
-    local rendered_len = r.GetMediaItemInfo_Value(rendered_item, "D_LENGTH")
-    if rendered_len and rendered_len > 0 then
-      r.SetMediaItemInfo_Value(item, "D_LENGTH", rendered_len)
     end
 
     local rendered_track = r.GetMediaItem_Track(rendered_item)
@@ -467,6 +603,10 @@ local function replace_with_rendered_take_only(item)
       r.DeleteTrackMediaItem(rendered_track, rendered_item)
     end
 
+    restore_original_item_bounds()
+    if target_startoffs ~= nil then
+      r.SetMediaItemTakeInfo_Value(target_take, "D_STARTOFFS", target_startoffs)
+    end
     r.SetActiveTake(target_take)
     add_render_summary_marker(target_take, render_summary)
     return true, nil
@@ -486,6 +626,8 @@ local function replace_with_rendered_take_only(item)
     rendered_guid = get_take_guid(r.GetActiveTake(item))
   end
   if not rendered_guid then
+    restore_original_item_bounds()
+    r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
     return false, "could not identify rendered take"
   end
 
@@ -498,29 +640,50 @@ local function replace_with_rendered_take_only(item)
     end
   end
   if target_idx < 0 then
+    restore_original_item_bounds()
+    r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
     return false, "original active take not found after render"
   end
   local target_take = r.GetMediaItemTake(item, target_idx)
 
   local rendered_idx = find_take_index_by_guid(item, rendered_guid)
   if rendered_idx < 0 then
+    restore_original_item_bounds()
+    r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
     return false, "rendered take missing before replace"
   end
   local rendered_take = r.GetMediaItemTake(item, rendered_idx)
+  local rendered_item_pos = r.GetMediaItemInfo_Value(item, "D_POSITION") or original_item_pos
+  local target_startoffs = source_pos_at_project_time(rendered_take, rendered_item_pos, original_item_pos)
   local ok_src, err_src = copy_take_source_to_take(rendered_take, target_take)
   if not ok_src then
     -- Last-resort fallback: keep rendered take, remove original active take.
     local ok_swap, err_swap = replace_by_swapping_to_rendered_take(item, original_active_guid, rendered_guid)
     if ok_swap then
+      local swapped_take = r.GetActiveTake(item)
+      local swapped_item_pos = r.GetMediaItemInfo_Value(item, "D_POSITION") or original_item_pos
+      local swapped_startoffs = source_pos_at_project_time(swapped_take, swapped_item_pos, original_item_pos)
+      restore_original_item_bounds()
+      if swapped_take and swapped_startoffs ~= nil then
+        r.SetMediaItemTakeInfo_Value(swapped_take, "D_STARTOFFS", swapped_startoffs)
+      end
       add_render_summary_marker(r.GetActiveTake(item), render_summary)
       return true, nil
     end
+    restore_original_item_bounds()
+    r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
     return false, err_src or err_swap or "could not apply rendered source to original active take"
   end
 
   local ok_del, err_del = delete_take_by_guid(item, rendered_guid)
   if not ok_del then
+    restore_original_item_bounds()
+    r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
     return false, err_del or "could not remove temporary rendered take"
+  end
+  restore_original_item_bounds()
+  if target_startoffs ~= nil then
+    r.SetMediaItemTakeInfo_Value(target_take, "D_STARTOFFS", target_startoffs)
   end
   r.SetActiveTake(target_take)
   add_render_summary_marker(target_take, render_summary)

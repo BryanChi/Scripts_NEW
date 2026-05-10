@@ -1,4 +1,7 @@
 f.DS_Store
+
+# Local WhisperX Python environment (large; machine-specific)
+.venv_whisperx/
 Vertical FX List Resources/plugin_select_counts.txt
 
 fx_favorites.txt

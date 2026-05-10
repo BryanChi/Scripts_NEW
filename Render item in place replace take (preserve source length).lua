@@ -11,6 +11,8 @@ local r = reaper
 
 local CMD_RENDER_ITEMS_NEW_TAKE = 40601 -- Item: render items to new take
 local CMD_DELETE_CURRENT_TAKE = 40129 -- Take: Delete current take from items
+local HISTORY_SECTION = "BRYAN_RENDER_ITEM_HISTORY"
+local HISTORY_LIMIT = 30
 
 local function collect_selected_items()
   local items = {}
@@ -28,6 +30,102 @@ local function get_take_guid(take)
     return guid
   end
   return nil
+end
+
+local function get_item_guid(item)
+  if not item then return nil end
+  local ok, guid = r.GetSetMediaItemInfo_String(item, "GUID", "", false)
+  if ok and guid and guid ~= "" then
+    return guid
+  end
+  return nil
+end
+
+local function encode_blob(s)
+  if not s then return "" end
+  s = s:gsub("\\", "\\\\")
+  s = s:gsub("\n", "\\n")
+  s = s:gsub("\r", "\\r")
+  s = s:gsub("\t", "\\t")
+  return s
+end
+
+local function split_string(s, sep)
+  local out = {}
+  if not s or s == "" then return out end
+  local start = 1
+  while true do
+    local i, j = s:find(sep, start, true)
+    if not i then
+      out[#out + 1] = s:sub(start)
+      break
+    end
+    out[#out + 1] = s:sub(start, i - 1)
+    start = j + 1
+  end
+  return out
+end
+
+local function load_item_history(item_guid)
+  local _, blob = r.GetProjExtState(0, HISTORY_SECTION, item_guid)
+  if not blob or blob == "" then return {} end
+  local rows = split_string(blob, "\n")
+  local entries = {}
+  for _, row in ipairs(rows) do
+    if row ~= "" then
+      local parts = split_string(row, "\t")
+      if #parts >= 4 then
+        entries[#entries + 1] = {
+          ts = parts[1],
+          label = parts[2],
+          summary = parts[3],
+          chunk = parts[4],
+        }
+      end
+    end
+  end
+  return entries
+end
+
+local function save_item_history(item_guid, entries)
+  if #entries == 0 then
+    r.SetProjExtState(0, HISTORY_SECTION, item_guid, "")
+    return
+  end
+  local rows = {}
+  local first = math.max(1, #entries - HISTORY_LIMIT + 1)
+  for i = first, #entries do
+    local e = entries[i]
+    rows[#rows + 1] = table.concat({
+      e.ts or "",
+      e.label or "",
+      e.summary or "",
+      e.chunk or "",
+    }, "\t")
+  end
+  r.SetProjExtState(0, HISTORY_SECTION, item_guid, table.concat(rows, "\n"))
+end
+
+local function save_item_snapshot(item, summary)
+  local item_guid = get_item_guid(item)
+  if not item_guid then return end
+  local ok_chunk, chunk = r.GetItemStateChunk(item, "", false)
+  if not ok_chunk or not chunk or chunk == "" then return end
+
+  local entries = load_item_history(item_guid)
+  local encoded = encode_blob(chunk)
+  local prev = entries[#entries]
+  if prev and prev.chunk == encoded then
+    return
+  end
+
+  entries[#entries + 1] = {
+    ts = tostring(os.time()),
+    label = os.date("%Y-%m-%d %H:%M:%S"),
+    summary = summary or "Before render",
+    chunk = encoded,
+  }
+  save_item_history(item_guid, entries)
 end
 
 local function find_take_index_by_guid(item, wanted_guid)
@@ -431,6 +529,7 @@ local function replace_with_rendered_take_only(item)
   local original_item_len = r.GetMediaItemInfo_Value(item, "D_LENGTH")
   local source_backed_len = get_take_source_backed_item_length(original_active_take)
   local render_summary = build_render_adjustment_summary(original_active_take)
+  save_item_snapshot(item, render_summary)
 
   local function restore_original_length()
     if original_item_len and original_item_len >= 0 then
