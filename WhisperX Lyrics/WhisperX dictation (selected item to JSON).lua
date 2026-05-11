@@ -604,7 +604,6 @@ local function main()
 
   local out_json = default_output_json(media_path)
   local out_tsv, out_plain = sidecar_paths_from_whisperx_json(out_json)
-  local model = "large-v2"
   local model = "small"
   local model_ret = r.GetExtState("BRYAN_WHISPERX", "MODEL")
   if model_ret and model_ret ~= "" then
@@ -648,10 +647,10 @@ local function main()
     shell_quote(out_json),
     "--model",
     shell_quote(model),
+    "--device",
     shell_quote(device),
     "--compute_type",
     shell_quote(compute_type),
-    shell_quote("int8"),
   }
 
   local lang = r.GetExtState("BRYAN_WHISPERX", "LANGUAGE")

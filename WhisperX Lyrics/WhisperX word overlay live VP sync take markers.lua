@@ -1,11 +1,12 @@
 -- @description WhisperX: toggle live VP sync when take markers change
--- @version 1.00
+-- @version 1.01
 -- @author Bryan
 -- @about
 --   Run once to start, run again to stop. While active, if exactly one item is selected and its active take has
 --   WhisperX word markers, the script watches marker times/names and rewrites the take’s Video Processor overlay
 --   whenever they change. Preset / karaoke / layout sliders / subtitle text come from the same extstate as the
 --   ReaImGui bridge (BRYAN_WX_OVERLAY_UI). Save settings or use “Live” in the bridge so EDITOR_TEXT is current.
+--   Per-word styles use the media item’s P_EXT blob (written by the bridge), not global extstate, when an item is selected.
 --   Add the Video Processor once from the bridge (“Apply”) if the item has no overlay yet. Uses SetItemStateChunk
 --   with undo disabled for each tweak to avoid flooding the undo stack.
 
@@ -71,7 +72,7 @@ local function tick()
   end
   last_sig = sig
 
-  local opts = W.overlay_display_opts_from_extstate(SECTION)
+  local opts = W.overlay_display_opts_from_extstate(SECTION, item)
   if (opts.editor_text or "") == "" then
     opts.editor_text = W.default_editor_text_from_words(words)
   end

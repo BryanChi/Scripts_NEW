@@ -20,8 +20,6 @@ import shutil
 import sys
 import threading
 import time
-import threading
-import time
 from typing import Any
 
 
@@ -238,6 +236,8 @@ def main() -> int:
             with open(path, "w", encoding="utf-8") as pf:
                 pf.write(f"{pct}\n{msg}\n")
         except OSError:
+            pass
+
     def start_progress_pulse(pct: int, prefix: str) -> tuple[threading.Event, threading.Thread]:
         """WhisperX has no hooks inside load_model/transcribe/align; pulse so REAPER UI does not look frozen."""
 
@@ -261,8 +261,6 @@ def main() -> int:
     def stop_progress_pulse(stop: threading.Event, th: threading.Thread) -> None:
         stop.set()
         th.join(timeout=2.0)
-
-            pass
 
     dlog(f"argv={sys.argv!r}")
     dlog(f"input={args.input!r} exists={os.path.isfile(args.input)}")
@@ -290,6 +288,7 @@ def main() -> int:
 
     report_progress(10, "loading audio")
     dlog("loading audio…")
+    audio = whisperx.load_audio(args.input)
     dlog(
         "load_model… "
         f"model={args.model!r} device={device!r} compute_type={compute_type!r} "
@@ -300,25 +299,31 @@ def main() -> int:
         asr_model = whisperx.load_model(args.model, device, language=args.language, compute_type=compute_type)
     finally:
         stop_progress_pulse(pulse_stop, pulse_th)
+
+    pulse_stop, pulse_th = start_progress_pulse(32, "transcribing")
     try:
-        report_progress(32, "transcribing")
-        pulse_stop, pulse_th = start_progress_pulse(32, "transcribing")
-        try:
-            result = asr_model.transcribe(audio, batch_size=batch_size, language=args.language)
-        finally:
-            stop_progress_pulse(pulse_stop, pulse_th)
         report_progress(32, "transcribing")
         result = asr_model.transcribe(audio, batch_size=batch_size, language=args.language)
     finally:
-        del asr_model
-        gc.collect()
-        try:
-            import torch
+        stop_progress_pulse(pulse_stop, pulse_th)
 
-            if device == "cuda":
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+    del asr_model
+    gc.collect()
+    try:
+        import torch
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    lang = (args.language or "").strip() or None
+    if not lang:
+        detected = result.get("language")
+        if isinstance(detected, str) and detected.strip():
+            lang = detected.strip()
+        else:
+            lang = "en"
 
     report_progress(58, "loading align model")
     pulse_stop, pulse_th = start_progress_pulse(58, "loading align model")
@@ -326,33 +331,31 @@ def main() -> int:
         align_model, align_meta = whisperx.load_align_model(language_code=lang, device=device)
     finally:
         stop_progress_pulse(pulse_stop, pulse_th)
+
+    pulse_stop, pulse_th = start_progress_pulse(68, "aligning words")
     try:
         report_progress(68, "aligning words")
-        pulse_stop, pulse_th = start_progress_pulse(68, "aligning words")
-        try:
-            result = whisperx.align(
-                result["segments"],
-                align_model,
-                align_meta,
-                audio,
-                device,
-                return_char_alignments=False,
-                interpolate_method=args.interpolate_method,
-            )
-        finally:
-            stop_progress_pulse(pulse_stop, pulse_th)
+        result = whisperx.align(
+            result["segments"],
+            align_model,
+            align_meta,
+            audio,
+            device,
+            return_char_alignments=False,
             interpolate_method=args.interpolate_method,
         )
     finally:
-        del align_model
-        gc.collect()
-        try:
-            import torch
+        stop_progress_pulse(pulse_stop, pulse_th)
 
-            if device == "cuda":
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+    del align_model
+    gc.collect()
+    try:
+        import torch
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
     if args.diarize:
         if not args.hf_token:
@@ -376,13 +379,9 @@ def main() -> int:
         result = whisperx.assign_word_speakers(diarize_segments, result)
 
     segments = result.get("segments") or []
-    payload: dict[str, Any] = {
-        "language": lang,
-        "model": args.model,
-        "source_file": args.input,
-        "segments": [_serialize_segment(s) for s in segments if isinstance(s, dict)],
+    serialized = [_serialize_segment(s) for s in segments if isinstance(s, dict)]
     merged_drop = 0
-    for seg in payload["segments"]:
+    for seg in serialized:
         ws = seg.get("words")
         if isinstance(ws, list) and len(ws) >= 2:
             new_ws = _merge_latin_letter_runs_in_words(ws)
@@ -391,6 +390,11 @@ def main() -> int:
     if merged_drop:
         dlog(f"merged per-letter Latin tokens into words: net −{merged_drop} rows (fewer take markers)")
 
+    payload: dict[str, Any] = {
+        "language": lang,
+        "model": args.model,
+        "source_file": args.input,
+        "segments": serialized,
     }
 
     report_progress(86, "writing JSON and sidecars")
