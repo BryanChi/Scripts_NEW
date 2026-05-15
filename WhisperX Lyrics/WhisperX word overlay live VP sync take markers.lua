@@ -1,5 +1,5 @@
 -- @description WhisperX: toggle live VP sync when take markers change
--- @version 1.01
+-- @version 1.02
 -- @author Bryan
 -- @about
 --   Run once to start, run again to stop. While active, if exactly one item is selected and its active take has
@@ -72,7 +72,7 @@ local function tick()
   end
   last_sig = sig
 
-  local opts = W.overlay_display_opts_from_extstate(SECTION, item)
+  local opts = W.overlay_display_opts_from_extstate(SECTION, item, #words)
   if (opts.editor_text or "") == "" then
     opts.editor_text = W.default_editor_text_from_words(words)
   end

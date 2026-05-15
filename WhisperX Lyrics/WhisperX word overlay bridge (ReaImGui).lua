@@ -1,17 +1,16 @@
 -- @description WhisperX: word overlay bridge — presets & lines (ReaImGui → Video Processor)
--- @version 1.71
+-- @version 1.79
 -- @author Bryan
 -- @about
 --   GUI for the WhisperX Video Processor overlay: subtitle text is taken from take markers only (no free typing).
 --   Words: horizontal drag scales size; triple-stack uses ReaImGui drag–drop onto the previous word or “new phrase” (applied on drop). Ctrl+Shift+click makes a word the first of its phrase.
---   Triple-stack: cut zones between words create phrase/row breaks; marquee selection; Shift+click range. Layout auto-saves to item (P_EXT) + extstate.
+--   Triple-stack: cut zones between words create phrase/row breaks; marquee selection; Shift+click range. Layout auto-saves to the item (P_EXT) + bridge extstate when you change the word grid or other overlay parameters (no manual “save layout” required).
 --   Triple-stack layout parameters can be stored in named presets (save/load/delete).
 --   Other line presets still follow the draft sliders below (words per line / max chars / sentence breaks).
 --   Phrase/row structure is stored in extstate and synced for the VP core parser.
 --   Per-line size & randomize: jitter is stable until you move that row’s Randomize slider; row gap (% of fontPx). Apply/Save writes jitter to extstate for marker-sync.
 --   "Re-read markers → VP" refreshes take marker times from the item and rewrites the Video Processor
---   (keeps your subtitle text if it still parses). Checkbox “Live: update Video Processor…” pushes VP on each tweak
---   (no undo per push); those writes pause while focus is in the main REAPER window to avoid chunk races with take-marker edits.
+--   (no undo per push). “Live VP” (on by default) rewrites VP when controls are idle; uncheck if chunk writes glitch.
 --   Separate action “WhisperX word overlay live VP sync take markers.lua” watches markers.
 --   “Save subtitle text to item” stores the editor in the media item’s extended state (P_EXT) so reopening the bridge restores it when it still matches markers.
 --   Per-word styling and the word color palette are stored on that same item (separate P_EXT keys), so they do not carry over when you select a different item.
@@ -45,9 +44,10 @@ local PRESET_STR =
 local ANIM_SCOPE_STR = "Every word\0First word of phrase\0First word of each row\0"
 local ANIM_TYPE_STR =
   "None\0Fade\0Zoom In\0Zoom Out\0Slide Left\0Slide Right\0Slide Up\0Slide Down\0Whip Left\0Whip Right\0"
-  .. "Pop\0Punch\0Squash\0Stretch\0Drop Bounce\0Rise Bounce\0Drift Left\0Drift Right\0Shake\0Jitter\0"
-  .. "Wave\0Orbit\0Spiral\0Stamp\0Echo Trail\0Clone Burst\0Blur\0Custom\0"
-local ANIM_TYPE_MAX = 27
+  .. "Pop\0Punch\0Squash (dir °)\0Stretch (dir °)\0Drop Bounce\0Rise Bounce\0Drift Left\0Drift Right\0Shake\0Jitter\0"
+  .. "Wave\0Orbit\0Spiral\0Stamp\0Echo Trail\0Clone Burst\0Blur\0Custom\0Wipe Reveal\0"
+--- Built-in type ids 0..28 (Blur=26, Custom=27, Wipe Reveal=28).
+local ANIM_TYPE_MAX = 28
 local ANIM_MAX_DUPES = 8
 --- Word-animation type ids (one table keeps main-chunk local count under Lua 5.1’s 200 limit).
 local ANIM_KIND = {
@@ -73,12 +73,17 @@ local ANIM_KIND = {
   CLONE_BURST = 25,
   BLUR = 26,
   CUSTOM = 27,
+  WIPE_REVEAL = 28,
 }
 local ANIM_CURVE_STR = "Linear\0In Quad\0Out Quad\0InOut Quad\0In Exp\0Out Exp\0InOut Exp\0In Log\0Out Log\0Back Overshoot\0Elastic Bounce\0"
 local ANIM_CURVE_MAX = 10
 local ANIM_CURVE_BACK, ANIM_CURVE_ELASTIC = 9, 10
-local ANIM_GRAPH_CURVE_STR = "Linear\0In Quad\0Out Quad\0InOut Quad\0Square\0"
-local ANIM_GRAPH_CURVE_MAX = 4
+local ANIM_GRAPH_CURVE_SQUARE = 4
+local ANIM_GRAPH_CURVE_IN_LOG = 5
+local ANIM_GRAPH_CURVE_OUT_EXP = 6
+local ANIM_GRAPH_CURVE_STR = "Linear\0In Quad\0Out Quad\0InOut Quad\0Square\0In Log\0Out Exp\0"
+local ANIM_GRAPH_CURVE_MAX = 6
+local ANIM_GRAPH_MODE1_DRAG_PX = 90
 local ANIM_AUTO_LANES = {
   { key = "motion", label = "motion", min = 0, max = 3, integer = false },
   { key = "wiggle", label = "wiggle", min = 0, max = 3, integer = false },
@@ -118,6 +123,111 @@ end
 if not ok_imgui then
   r.MB("ReaImGui is required.\nInstall from ReaPack, then reload REAPER.", WINDOW_TITLE, 0)
   return
+end
+
+local wx_bridge_icon_images = {
+  settings = nil,
+  expand = nil,
+  _attached_ctx = nil,
+}
+
+--- Icon PNGs live next to this script (`…/WhisperX Lyrics/icons`) or under `…/WhisperX Lyrics/icons`
+--- when the bridge `.lua` sits directly under the scripts bundle folder.
+local WX_ICON_DIR_CANDIDATES = {}
+do
+  local seen = {}
+  local function add(dir)
+    dir = tostring(dir or ""):gsub("\\", "/"):gsub("/+$", "")
+    if dir == "" or seen[dir] then
+      return
+    end
+    seen[dir] = true
+    WX_ICON_DIR_CANDIDATES[#WX_ICON_DIR_CANDIDATES + 1] = dir
+  end
+  local base = (script_dir or ""):gsub("\\", "/"):gsub("/+$", "")
+  add(base .. "/icons")
+  add(base .. "/WhisperX Lyrics/icons")
+  local up = base:match("^(.+)/[^/]+$")
+  if up then
+    add(up .. "/icons")
+    add(up .. "/WhisperX Lyrics/icons")
+  end
+end
+
+local function wx_bridge_icon_file_readable(path)
+  path = tostring(path or "")
+  if path == "" then
+    return false
+  end
+  if r.APIExists and r.APIExists("file_exists") and r.file_exists(path) then
+    return true
+  end
+  local f = io.open(path, "rb")
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+local function wx_bridge_icons_try_load(ctx)
+  if not (ctx and ImGui.CreateImage and ImGui.Attach) then
+    return
+  end
+  if wx_bridge_icon_images._attached_ctx == ctx then
+    return
+  end
+  local function try_load_image(abs_path)
+    if not wx_bridge_icon_file_readable(abs_path) then
+      return nil
+    end
+    local ok, img = pcall(ImGui.CreateImage, abs_path)
+    if not ok or not img then
+      return nil
+    end
+    local ok2 = pcall(ImGui.Attach, ctx, img)
+    if not ok2 then
+      return nil
+    end
+    return img
+  end
+  local function load_first(field, names)
+    if wx_bridge_icon_images[field] then
+      return
+    end
+    for ni = 1, #names do
+      local fname = names[ni]
+      for di = 1, #WX_ICON_DIR_CANDIDATES do
+        local abs_path = WX_ICON_DIR_CANDIDATES[di] .. "/" .. fname
+        local img = try_load_image(abs_path)
+        if img then
+          wx_bridge_icon_images[field] = img
+          return
+        end
+      end
+    end
+  end
+  load_first("settings", { "settings.png" })
+  load_first("expand", { "expand.png" })
+  wx_bridge_icon_images._attached_ctx = ctx
+end
+
+--- ImageButton with optional tint; signature varies by ReaImGui build.
+local function wx_bridge_image_button(ctx, id_str, img, sz, tint_abgr)
+  if not (ctx and img and ImGui.ImageButton) then
+    return false
+  end
+  tint_abgr = tonumber(tint_abgr) or 0xFFFFFFFF
+  local ok, clicked = pcall(function()
+    return ImGui.ImageButton(ctx, id_str, img, sz, sz, nil, nil, nil, nil, nil, tint_abgr)
+  end)
+  if ok then
+    return clicked and true or false
+  end
+  ok, clicked = pcall(function()
+    return ImGui.ImageButton(ctx, id_str, img, sz, sz)
+  end)
+  return ok and clicked and true or false
 end
 
 local function es_get(key, default)
@@ -194,6 +304,15 @@ local function write_editor_text_to_item(item, text)
   end
   return r.GetSetMediaItemInfo_String(item, ITEM_EXT.EDITOR, text or "", true)
 end
+
+VIDEO_RATIO_GUIDES = {
+  { id = "169", label = "16:9", key = "VIDEO_GUIDE_169", ratio = 16 / 9, color = 0x00E5FF },
+  { id = "916", label = "9:16", key = "VIDEO_GUIDE_916", ratio = 9 / 16, color = 0xFF66CC },
+  { id = "11", label = "1:1", key = "VIDEO_GUIDE_11", ratio = 1, color = 0xFFD447 },
+  { id = "45", label = "4:5", key = "VIDEO_GUIDE_45", ratio = 4 / 5, color = 0x66FF66 },
+  { id = "43", label = "4:3", key = "VIDEO_GUIDE_43", ratio = 4 / 3, color = 0xAA88FF },
+  { id = "235", label = "2.35:1", key = "VIDEO_GUIDE_235", ratio = 2.35, color = 0xFF8844 },
+}
 
 local state = {
   preset_idx = tonumber(es_get("PRESET_IDX", "0")) or 0,
@@ -274,6 +393,7 @@ local state = {
   anim_phrase_out_dupes = math.max(1, math.min(ANIM_MAX_DUPES, math.floor(tonumber(es_get("ANIM_PHRASE_OUT_DUPES", es_get("ANIM_OUT_DUPES", "3"))) or 3))),
   anim_phrase_out_dir = math.max(-180, math.min(180, tonumber(es_get("ANIM_PHRASE_OUT_DIR", es_get("ANIM_OUT_DIR", "90"))) or 90)),
   anim_phrase_out_twist = math.max(-720, math.min(720, tonumber(es_get("ANIM_PHRASE_OUT_TWIST", es_get("ANIM_OUT_TWIST", "0"))) or 0)),
+  anim_wipe_mask_offset = math.max(-300, math.min(300, tonumber(es_get("ANIM_WIPE_MASK_OFFSET", "0")) or 0)),
   anim_in_use_graph = es_bool("ANIM_IN_USE_GRAPH", false),
   anim_out_use_graph = es_bool("ANIM_OUT_USE_GRAPH", false),
   anim_phrase_out_use_graph = es_bool("ANIM_PHRASE_OUT_USE_GRAPH", false),
@@ -287,12 +407,16 @@ local state = {
   anim_graph_editor_side_key = "in",
   anim_graph_editor_points = nil,
   anim_graph_editor_curves = nil,
+  anim_graph_editor_blends = nil,
   anim_graph_editor_selected = 1,
   anim_graph_editor_drag_point = nil,
   anim_graph_editor_drag_t = nil,
   anim_graph_editor_popup_seg = nil,
   anim_graph_editor_auto_drag_lane = "",
   anim_graph_editor_auto_drag_point = nil,
+  --- Graph segment drag: 1=In Log / Linear / Out Exp (smooth vertical drag + Tab), 2=Quad family, 3=Square; X cycles families.
+  anim_graph_seg_family_mode = 1,
+  anim_graph_seg_mode1_bias0 = nil,
   --- Triple-stack: phrase_after[i] / row_after[i] for i = 1 .. n-1 (after word i). Word scales [1..n] for VP.
   ml_phrase_after = {},
   ml_row_after = {},
@@ -320,13 +444,20 @@ local state = {
   word_grid_h = tonumber(es_get("WORD_GRID_H", "240")) or 240,
   --- Show words panel in a separate floating window.
   word_grid_floating = es_bool("WORD_GRID_FLOAT", false),
-  word_follow_play = es_bool("WORD_FOLLOW_PLAY", true),
+  img_post_wave = es_bool("IMG_POST_WAVE", false),
+  img_post_wave_amp = math.max(0, math.min(240, tonumber(es_get("IMG_POST_WAVE_AMP", "24")) or 24)),
+  img_post_wave_len = math.max(8, math.min(2000, tonumber(es_get("IMG_POST_WAVE_LEN", "90")) or 90)),
+  img_post_wave_speed = math.max(-20, math.min(20, tonumber(es_get("IMG_POST_WAVE_SPEED", "6")) or 6)),
+  video_guides = {},
   current_play_word = nil,
   current_play_src = nil,
   _last_follow_word = nil,
   --- Pixel height of subtitle multiline field (persisted in extstate).
   editor_body_h = tonumber(es_get("EDITOR_BODY_H", "140")) or 140,
   _wig_rects = {},
+  --- Fingerprint of last successful `auto_persist_layout` flush (subtitle + sliders + VP-affecting state).
+  overlay_autosave_sig_saved = nil,
+  overlay_autosave_force = false,
   ml_word_n = 0,
   ml_preset_names = {},
   ml_preset_idx = 0,
@@ -347,7 +478,7 @@ local state = {
   font_favorites = {},
   font_list_ready = false,
   font_scan_attempted = false,
-  live_gui_vp = es_bool("LIVE_GUI_VP", false),
+  live_gui_vp = es_bool("LIVE_GUI_VP", true),
   wx_slider_style = tonumber(es_get("WX_SLIDER_STYLE", "1")) or 1,
   wx_slider_demo_value = tonumber(es_get("WX_SLIDER_DEMO_VALUE", "42")) or 42,
   wx_slider_demo_step_value = 2,
@@ -365,6 +496,9 @@ state.max_chars = math.max(0, math.min(500, math.floor(state.max_chars)))
 state.word_grid_h = math.max(120, math.min(700, tonumber(state.word_grid_h) or 240))
 state.wx_slider_demo_value = math.max(0, math.min(100, math.floor(tonumber(state.wx_slider_demo_value) or 42)))
 state.wx_slider_demo_step_value = math.max(0, math.min(5, math.floor(tonumber(state.wx_slider_demo_step_value) or 2)))
+for _, guide in ipairs(VIDEO_RATIO_GUIDES) do
+  state.video_guides[guide.id] = es_bool(guide.key, false)
+end
 state.wx_slider_colors = {}
 state.wx_slider_highlight_colors = {}
 for i = 1, 10 do
@@ -440,6 +574,56 @@ local function trim(s)
   return (s or ""):match("^%s*(.-)%s*$")
 end
 
+local function wx_visible_label(label)
+  local s = tostring(label or "")
+  local last
+  local pos = 1
+  while true do
+    local p = s:find("##", pos, true)
+    if not p then
+      break
+    end
+    last = p
+    pos = p + 2
+  end
+  return last and s:sub(1, last - 1) or s
+end
+
+--- Word grid labels: keep marker text unchanged; only calculate enough button width for UTF-8 text.
+--- (Helpers in do/end so they do not add 3 extra top-level locals — Lua 5.1 chunk limit is 200.)
+local wx_word_grid_button_label_and_width
+do
+  local function utf8_len_safe(s)
+    if type(s) ~= "string" or s == "" then
+      return 0
+    end
+    if utf8 and utf8.len then
+      local ok, n = pcall(utf8.len, s)
+      if ok and type(n) == "number" then
+        return n
+      end
+    end
+    return #s
+  end
+
+  wx_word_grid_button_label_and_width = function(ctx, raw, sc, byte_cap, max_show_cp)
+    sc = tonumber(sc) or 1
+    raw = tostring(raw or "")
+    byte_cap = math.floor(tonumber(byte_cap) or 24)
+    max_show_cp = math.max(1, math.floor(tonumber(max_show_cp) or 7))
+    local wtxt = raw
+    local bw = math.max(28, math.floor(utf8_len_safe(raw) * 8 * sc + 18))
+    if ImGui and ImGui.CalcTextSize then
+      local ok, tw = pcall(ImGui.CalcTextSize, ctx, wtxt)
+      if ok and tonumber(tw) then
+        local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
+        bw = math.max(bw, math.floor(tw + fs * 1.35 * sc + 10))
+      end
+    end
+    return wtxt, bw
+  end
+end
+
 state.font_name = trim(state.font_name or "")
 
 local function split_sep(s, sep)
@@ -495,7 +679,14 @@ function anim_graph_decode_blob(blob)
   end)
   points[1].t = 0
   points[#points].t = 1
-  for tok in tostring(cblob):gmatch("[^,]+") do
+  local cpart = trim(tostring(cblob))
+  local bpart
+  local til = cpart:find("~", 1, true)
+  if til then
+    bpart = trim(cpart:sub(til + 1))
+    cpart = trim(cpart:sub(1, til - 1))
+  end
+  for tok in cpart:gmatch("[^,]+") do
     curves[#curves + 1] = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(tok) or 0)))
   end
   for i = 1, #points - 1 do
@@ -503,10 +694,24 @@ function anim_graph_decode_blob(blob)
       curves[i] = 0
     end
   end
-  return points, curves
+  local blends = {}
+  if bpart and bpart ~= "" then
+    local bi = 1
+    for tok in bpart:gmatch("[^,]+") do
+      local tt = trim(tok)
+      if tt ~= "d" and tt ~= "D" and tt ~= "" then
+        local bv = tonumber(tt)
+        if bv then
+          blends[bi] = math.max(-1, math.min(1, bv))
+        end
+      end
+      bi = bi + 1
+    end
+  end
+  return points, curves, blends
 end
 
-function anim_graph_encode_blob(points, curves)
+function anim_graph_encode_blob(points, curves, blends)
   if type(points) ~= "table" or #points < 2 then
     return anim_graph_default_blob()
   end
@@ -522,7 +727,29 @@ function anim_graph_encode_blob(points, curves)
   for i = 1, #points - 1 do
     cv[#cv + 1] = tostring(math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(curves and curves[i]) or 0))))
   end
-  return table.concat(pt, "|") .. ";" .. table.concat(cv, ",")
+  local out = table.concat(pt, "|") .. ";" .. table.concat(cv, ",")
+  local need_tilde = false
+  if blends then
+    for i = 1, #points - 1 do
+      if type(blends[i]) == "number" then
+        need_tilde = true
+        break
+      end
+    end
+  end
+  if need_tilde then
+    local bp = {}
+    for i = 1, #points - 1 do
+      local bv = blends and blends[i]
+      if type(bv) == "number" then
+        bp[#bp + 1] = string.format("%.5g", bv)
+      else
+        bp[#bp + 1] = "d"
+      end
+    end
+    out = out .. "~" .. table.concat(bp, ",")
+  end
+  return out
 end
 
 function anim_graph_side_blob_key(side_key)
@@ -532,13 +759,171 @@ function anim_graph_side_blob_key(side_key)
   return "anim_" .. side_key .. "_graph_blob"
 end
 
+function anim_graph_auto_blob_key(side_key)
+  if side_key == "phrase_out" then
+    return "anim_phrase_out_graph_auto_blob"
+  end
+  return "anim_" .. side_key .. "_graph_auto_blob"
+end
+
+function anim_side_param_value(side_key, lane_key)
+  if side_key == "phrase_out" then
+    return tonumber(state["anim_phrase_out_" .. lane_key]) or 0
+  end
+  return tonumber(state["anim_" .. side_key .. "_" .. lane_key]) or 0
+end
+
+function anim_graph_auto_lane_spec(lane_key)
+  for i = 1, #ANIM_AUTO_LANES do
+    if ANIM_AUTO_LANES[i].key == lane_key then
+      return ANIM_AUTO_LANES[i]
+    end
+  end
+  return nil
+end
+
+function anim_graph_auto_decode_blob(blob, side_key)
+  local lanes = {}
+  local raw = split_sep(blob or "", ML_PRESET_SEP)
+  for i = 1, #raw do
+    local rec = raw[i]
+    local p = split_sep(rec, "~")
+    local key = trim(p[1] or "")
+    if key ~= "" then
+      local lane = { enabled = tostring(p[2] or "") == "1", points = {}, curves = {} }
+      for tok in tostring(p[3] or ""):gmatch("[^|]+") do
+        local vs, ts = tok:match("^%s*([%-%d%.eE]+)%s*@%s*([%-%d%.eE]+)%s*$")
+        local v, t = tonumber(vs), tonumber(ts)
+        if v and t then
+          lane.points[#lane.points + 1] = { v = v, t = math.max(0, math.min(1, t)) }
+        end
+      end
+      for tok in tostring(p[4] or ""):gmatch("[^,]+") do
+        lane.curves[#lane.curves + 1] = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(tok) or 0)))
+      end
+      lane.curve_blends = {}
+      if p[5] and trim(tostring(p[5])) ~= "" then
+        local bi = 1
+        for tok in tostring(p[5]):gmatch("[^,]+") do
+          local tt = trim(tok)
+          if tt ~= "d" and tt ~= "D" and tt ~= "" then
+            local bv = tonumber(tt)
+            if bv then
+              lane.curve_blends[bi] = math.max(-1, math.min(1, bv))
+            end
+          end
+          bi = bi + 1
+        end
+      end
+      lanes[key] = lane
+    end
+  end
+  for i = 1, #ANIM_AUTO_LANES do
+    local spec = ANIM_AUTO_LANES[i]
+    local lane = lanes[spec.key]
+    local base = anim_side_param_value(side_key, spec.key)
+    base = math.max(spec.min, math.min(spec.max, base))
+    if spec.integer then
+      base = math.floor(base + 0.5)
+    end
+    if type(lane) ~= "table" or type(lane.points) ~= "table" or #lane.points < 2 then
+      lane = { enabled = false, points = { { v = base, t = 0 }, { v = base, t = 1 } }, curves = { 0 }, curve_blends = {} }
+      lanes[spec.key] = lane
+    end
+    table.sort(lane.points, function(a, b)
+      return (a.t or 0) < (b.t or 0)
+    end)
+    lane.points[1].t = 0
+    lane.points[#lane.points].t = 1
+    for pidx = 1, #lane.points do
+      local p = lane.points[pidx]
+      p.v = math.max(spec.min, math.min(spec.max, tonumber(p.v) or base))
+      if spec.integer then
+        p.v = math.floor(p.v + 0.5)
+      end
+    end
+    for cidx = 1, #lane.points - 1 do
+      if lane.curves[cidx] == nil then
+        lane.curves[cidx] = 0
+      end
+      lane.curves[cidx] = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(lane.curves[cidx]) or 0)))
+    end
+  end
+  return lanes
+end
+
+function anim_graph_auto_encode_blob(lanes)
+  local recs = {}
+  for i = 1, #ANIM_AUTO_LANES do
+    local spec = ANIM_AUTO_LANES[i]
+    local lane = lanes and lanes[spec.key]
+    if type(lane) == "table" and type(lane.points) == "table" and #lane.points >= 2 then
+      local pts = {}
+      for pidx = 1, #lane.points do
+        local p = lane.points[pidx]
+        local v = math.max(spec.min, math.min(spec.max, tonumber(p.v) or 0))
+        if spec.integer then
+          v = math.floor(v + 0.5)
+        end
+        local t = math.max(0, math.min(1, tonumber(p.t) or 0))
+        pts[#pts + 1] = string.format("%.17g@%.17g", v, t)
+      end
+      local curves = {}
+      for cidx = 1, #lane.points - 1 do
+        curves[#curves + 1] = tostring(math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(lane.curves and lane.curves[cidx]) or 0))))
+      end
+      local need_bl = false
+      if lane.curve_blends then
+        for cidx = 1, #lane.points - 1 do
+          if type(lane.curve_blends[cidx]) == "number" then
+            need_bl = true
+            break
+          end
+        end
+      end
+      local parts = {
+        spec.key,
+        lane.enabled and "1" or "0",
+        table.concat(pts, "|"),
+        table.concat(curves, ","),
+      }
+      if need_bl then
+        local bp = {}
+        for cidx = 1, #lane.points - 1 do
+          local bv = lane.curve_blends and lane.curve_blends[cidx]
+          if type(bv) == "number" then
+            bp[#bp + 1] = string.format("%.5g", bv)
+          else
+            bp[#bp + 1] = "d"
+          end
+        end
+        parts[#parts + 1] = table.concat(bp, ",")
+      end
+      recs[#recs + 1] = table.concat(parts, "~")
+    end
+  end
+  return table.concat(recs, ML_PRESET_SEP)
+end
+
+function anim_graph_auto_lane_enabled(side_key, lane_key)
+  local lanes = anim_graph_auto_decode_blob(state[anim_graph_auto_blob_key(side_key)] or "", side_key)
+  local lane = lanes[lane_key]
+  return lane and lane.enabled and true or false
+end
+
 do
-  local p, c = anim_graph_decode_blob(state.anim_in_graph_blob)
-  state.anim_in_graph_blob = anim_graph_encode_blob(p, c)
-  p, c = anim_graph_decode_blob(state.anim_out_graph_blob)
-  state.anim_out_graph_blob = anim_graph_encode_blob(p, c)
-  p, c = anim_graph_decode_blob(state.anim_phrase_out_graph_blob)
-  state.anim_phrase_out_graph_blob = anim_graph_encode_blob(p, c)
+  local p, c, gb = anim_graph_decode_blob(state.anim_in_graph_blob)
+  state.anim_in_graph_blob = anim_graph_encode_blob(p, c, gb)
+  p, c, gb = anim_graph_decode_blob(state.anim_out_graph_blob)
+  state.anim_out_graph_blob = anim_graph_encode_blob(p, c, gb)
+  p, c, gb = anim_graph_decode_blob(state.anim_phrase_out_graph_blob)
+  state.anim_phrase_out_graph_blob = anim_graph_encode_blob(p, c, gb)
+  local lanes = anim_graph_auto_decode_blob(state.anim_in_graph_auto_blob or "", "in")
+  state.anim_in_graph_auto_blob = anim_graph_auto_encode_blob(lanes)
+  lanes = anim_graph_auto_decode_blob(state.anim_out_graph_auto_blob or "", "out")
+  state.anim_out_graph_auto_blob = anim_graph_auto_encode_blob(lanes)
+  lanes = anim_graph_auto_decode_blob(state.anim_phrase_out_graph_auto_blob or "", "phrase_out")
+  state.anim_phrase_out_graph_auto_blob = anim_graph_auto_encode_blob(lanes)
 end
 
 function anim_custom_type_key(name)
@@ -616,6 +1001,7 @@ function anim_custom_type_pack(side_key)
     string.format("%.17g", state["anim_" .. side_key .. "_dir"] or 90),
     state["anim_" .. side_key .. "_use_graph"] and "1" or "0",
     state[anim_graph_side_blob_key(side_key)] or anim_graph_default_blob(),
+    state[anim_graph_auto_blob_key(side_key)] or "",
   }, ML_PRESET_SEP)
 end
 
@@ -653,9 +1039,11 @@ function anim_custom_type_apply_blob(side_key, blob)
   if t[11] ~= nil and (t[11] == "0" or t[11] == "1") then
     state["anim_" .. side_key .. "_use_graph"] = tostring(t[11]) == "1"
     state[anim_graph_side_blob_key(side_key)] = (t[12] ~= nil and trim(t[12]) ~= "") and t[12] or anim_graph_default_blob()
+    state[anim_graph_auto_blob_key(side_key)] = t[13] or ""
   elseif t[11] ~= nil then
     state["anim_" .. side_key .. "_use_graph"] = false
     state[anim_graph_side_blob_key(side_key)] = trim(t[11]) ~= "" and t[11] or anim_graph_default_blob()
+    state[anim_graph_auto_blob_key(side_key)] = t[12] or ""
   end
   return true
 end
@@ -697,8 +1085,17 @@ function anim_custom_type_delete_named(name)
 end
 
 state.anim_custom_type_names = anim_custom_type_names_load()
+do
+  local mig = W.migrate_anim_type_id
+  if type(mig) == "function" then
+    state.anim_in_type = mig(state.anim_in_type, SECTION)
+    state.anim_out_type = mig(state.anim_out_type, SECTION)
+    state.anim_phrase_out_type = mig(state.anim_phrase_out_type, SECTION)
+  end
+end
 state.anim_in_type = math.max(0, math.min(anim_type_ui_max(), math.floor(tonumber(state.anim_in_type) or 0)))
 state.anim_out_type = math.max(0, math.min(anim_type_ui_max(), math.floor(tonumber(state.anim_out_type) or 0)))
+state.anim_phrase_out_type = math.max(0, math.min(anim_type_ui_max(), math.floor(tonumber(state.anim_phrase_out_type) or 0)))
 
 do
   state.font_combo_filter = es_get("FONT_COMBO_FILTER", "") or ""
@@ -881,6 +1278,11 @@ local function persist_anim_settings_extstate()
   r.SetExtState(SECTION, "ANIM_IN_GRAPH", state.anim_in_graph_blob or anim_graph_default_blob(), true)
   r.SetExtState(SECTION, "ANIM_OUT_GRAPH", state.anim_out_graph_blob or anim_graph_default_blob(), true)
   r.SetExtState(SECTION, "ANIM_PHRASE_OUT_GRAPH", state.anim_phrase_out_graph_blob or anim_graph_default_blob(), true)
+  r.SetExtState(SECTION, "ANIM_IN_GRAPH_AUTO", state.anim_in_graph_auto_blob or "", true)
+  r.SetExtState(SECTION, "ANIM_OUT_GRAPH_AUTO", state.anim_out_graph_auto_blob or "", true)
+  r.SetExtState(SECTION, "ANIM_PHRASE_OUT_GRAPH_AUTO", state.anim_phrase_out_graph_auto_blob or "", true)
+  r.SetExtState(SECTION, "KARAOKE", state.karaoke and "1" or "0", true)
+  r.SetExtState(SECTION, "ANIM_TYPE_REV", "3", true)
 end
 
 local function ml_preset_blob(name)
@@ -1065,6 +1467,11 @@ local function anim_preset_pack_current()
     state.anim_in_graph_blob or anim_graph_default_blob(),
     state.anim_out_graph_blob or anim_graph_default_blob(),
     state.anim_phrase_out_graph_blob or state.anim_out_graph_blob or anim_graph_default_blob(),
+    state.anim_in_graph_auto_blob or "",
+    state.anim_out_graph_auto_blob or "",
+    state.anim_phrase_out_graph_auto_blob or "",
+    state.karaoke and "1" or "0",
+    "3",
   }
   return table.concat(vals, ML_PRESET_SEP)
 end
@@ -1074,12 +1481,23 @@ local function anim_preset_apply_blob(blob)
   if #t < 9 then
     return false, "Animation preset data is incomplete."
   end
+  local types_are_v3 = (tonumber(t[#t] or "") == 3)
+  local function migr_preset_type(raw)
+    raw = math.floor(tonumber(raw) or 0)
+    if types_are_v3 then
+      return raw
+    end
+    if type(W.migrate_anim_type_compact_to_v3) == "function" then
+      return W.migrate_anim_type_compact_to_v3(raw)
+    end
+    return raw
+  end
   local p = 1
   state.anim_scope = math.max(0, math.min(2, math.floor(tonumber(t[p]) or 0)))
   p = p + 1
   state.anim_in_on = tostring(t[p] or "") == "1"
   p = p + 1
-  state.anim_in_type = math.max(0, math.min(anim_type_ui_max(), math.floor(tonumber(t[p]) or 0)))
+  state.anim_in_type = math.max(0, math.min(anim_type_ui_max(), migr_preset_type(t[p])))
   p = p + 1
   state.anim_in_curve = math.max(0, math.min(ANIM_CURVE_MAX, math.floor(tonumber(t[p]) or 0)))
   p = p + 1
@@ -1160,7 +1578,7 @@ local function anim_preset_apply_blob(blob)
   end
   state.anim_out_on = tostring(t[p] or "") == "1"
   p = p + 1
-  state.anim_out_type = math.max(0, math.min(anim_type_ui_max(), math.floor(tonumber(t[p]) or 0)))
+  state.anim_out_type = math.max(0, math.min(anim_type_ui_max(), migr_preset_type(t[p])))
   p = p + 1
   state.anim_out_curve = math.max(0, math.min(ANIM_CURVE_MAX, math.floor(tonumber(t[p]) or 0)))
   p = p + 1
@@ -1211,7 +1629,7 @@ local function anim_preset_apply_blob(blob)
     state.anim_phrase_out_on = false
   end
   if t[p] ~= nil then
-    state.anim_phrase_out_type = math.max(0, math.min(anim_type_ui_max(), math.floor(tonumber(t[p]) or (state.anim_out_type or 0))))
+    state.anim_phrase_out_type = math.max(0, math.min(anim_type_ui_max(), migr_preset_type(t[p])))
     p = p + 1
   else
     state.anim_phrase_out_type = state.anim_out_type
@@ -1291,12 +1709,28 @@ local function anim_preset_apply_blob(blob)
   state.anim_out_graph_blob = (t[p] ~= nil and trim(t[p]) ~= "") and t[p] or anim_graph_default_blob()
   if t[p] ~= nil then p = p + 1 end
   state.anim_phrase_out_graph_blob = (t[p] ~= nil and trim(t[p]) ~= "") and t[p] or state.anim_out_graph_blob or anim_graph_default_blob()
-  local gp, gc = anim_graph_decode_blob(state.anim_in_graph_blob)
-  state.anim_in_graph_blob = anim_graph_encode_blob(gp, gc)
-  gp, gc = anim_graph_decode_blob(state.anim_out_graph_blob)
-  state.anim_out_graph_blob = anim_graph_encode_blob(gp, gc)
-  gp, gc = anim_graph_decode_blob(state.anim_phrase_out_graph_blob)
-  state.anim_phrase_out_graph_blob = anim_graph_encode_blob(gp, gc)
+  if t[p] ~= nil then p = p + 1 end
+  state.anim_in_graph_auto_blob = t[p] or state.anim_in_graph_auto_blob or ""
+  if t[p] ~= nil then p = p + 1 end
+  state.anim_out_graph_auto_blob = t[p] or state.anim_out_graph_auto_blob or ""
+  if t[p] ~= nil then p = p + 1 end
+  state.anim_phrase_out_graph_auto_blob = t[p] or state.anim_phrase_out_graph_auto_blob or state.anim_out_graph_auto_blob or ""
+  local gp, gc, gb = anim_graph_decode_blob(state.anim_in_graph_blob)
+  state.anim_in_graph_blob = anim_graph_encode_blob(gp, gc, gb)
+  gp, gc, gb = anim_graph_decode_blob(state.anim_out_graph_blob)
+  state.anim_out_graph_blob = anim_graph_encode_blob(gp, gc, gb)
+  gp, gc, gb = anim_graph_decode_blob(state.anim_phrase_out_graph_blob)
+  state.anim_phrase_out_graph_blob = anim_graph_encode_blob(gp, gc, gb)
+  local al = anim_graph_auto_decode_blob(state.anim_in_graph_auto_blob or "", "in")
+  state.anim_in_graph_auto_blob = anim_graph_auto_encode_blob(al)
+  al = anim_graph_auto_decode_blob(state.anim_out_graph_auto_blob or "", "out")
+  state.anim_out_graph_auto_blob = anim_graph_auto_encode_blob(al)
+  al = anim_graph_auto_decode_blob(state.anim_phrase_out_graph_auto_blob or "", "phrase_out")
+  state.anim_phrase_out_graph_auto_blob = anim_graph_auto_encode_blob(al)
+  if t[p] ~= nil and (tostring(t[p]) == "0" or tostring(t[p]) == "1") then
+    state.karaoke = tostring(t[p]) == "1"
+    p = p + 1
+  end
   persist_anim_settings_extstate()
   return true
 end
@@ -1597,12 +2031,13 @@ local function font_items_filtered()
   return out
 end
 
--- Forward declare: font_selector_ui runs before refresh_preview is assigned (Lua 5.1 local scoping).
+-- Forward declare (Lua 5.1 local scoping): refresh_preview, wx_custom_*, wx_bridge_transport_strip (assigned after wx_custom_small_button).
 local refresh_preview
 local wx_custom_slider_int
 local wx_custom_combo
 local wx_custom_button
 local wx_custom_small_button
+local wx_bridge_transport_strip
 
 local function font_selector_ui(ctx, item)
   ensure_font_items(false)
@@ -1692,6 +2127,7 @@ local function font_selector_ui(ctx, item)
     state.font_name = nm
     r.SetExtState(SECTION, "FONT_NAME", state.font_name, true)
     refresh_preview(item)
+    overlay_request_autosave()
   end
 end
 
@@ -1745,6 +2181,17 @@ local function display_opts_from_state(words_for_scale)
   if state.preset_idx == 0 then
     karaoke = false
   end
+  local video_guides = nil
+  for _, guide in ipairs(VIDEO_RATIO_GUIDES) do
+    if state.video_guides and state.video_guides[guide.id] then
+      video_guides = video_guides or {}
+      video_guides[#video_guides + 1] = {
+        label = guide.label,
+        ratio = guide.ratio,
+        color = guide.color,
+      }
+    end
+  end
   local ls, lr, jit = {}, {}, {}
   for i = 1, 6 do
     ls[i] = state.ml_s[i]
@@ -1775,6 +2222,16 @@ local function display_opts_from_state(words_for_scale)
     end
   end
   local wstyles = nil
+  --- Snapshot for triple CJK minimal parse (`parse_editor_phrases_for_multiline` uses markers + flags only).
+  local ml_pa_tabs, ml_ra_tabs = nil, nil
+  if type(words_for_scale) == "table" and #words_for_scale > 0 then
+    local nw = #words_for_scale
+    ml_pa_tabs, ml_ra_tabs = {}, {}
+    for i = 1, nw - 1 do
+      ml_pa_tabs[i] = state.ml_phrase_after[i] and true or false
+      ml_ra_tabs[i] = state.ml_row_after[i] and true or false
+    end
+  end
   if type(words_for_scale) == "table" and #words_for_scale > 0 then
     for i = 1, #words_for_scale do
       local st = state.word_styles and state.word_styles[i]
@@ -1820,6 +2277,9 @@ local function display_opts_from_state(words_for_scale)
     layout_word_scale = wscale,
     layout_row_indent = row_indent,
     layout_row_gap = row_gap,
+    ml_phrase_after = ml_pa_tabs,
+    ml_row_after = ml_ra_tabs,
+    video_guides = video_guides,
     word_styles = wstyles,
     anim_scope = state.anim_scope,
     anim_in_on = state.anim_in_on,
@@ -1839,6 +2299,7 @@ local function display_opts_from_state(words_for_scale)
     anim_in_twist = state.anim_in_twist,
     anim_in_use_graph = state.anim_in_use_graph and true or false,
     anim_in_graph = state.anim_in_graph_blob or anim_graph_default_blob(),
+    anim_in_auto_blob = state.anim_in_graph_auto_blob or "",
     anim_out_on = state.anim_out_on,
     anim_out_type = anim_type_to_core(state.anim_out_type),
     anim_out_curve = state.anim_out_curve,
@@ -1856,6 +2317,7 @@ local function display_opts_from_state(words_for_scale)
     anim_out_twist = state.anim_out_twist,
     anim_out_use_graph = state.anim_out_use_graph and true or false,
     anim_out_graph = state.anim_out_graph_blob or anim_graph_default_blob(),
+    anim_out_auto_blob = state.anim_out_graph_auto_blob or "",
     anim_phrase_out_on = state.anim_phrase_out_on,
     anim_phrase_out_type = anim_type_to_core(state.anim_phrase_out_type),
     anim_phrase_out_curve = state.anim_phrase_out_curve,
@@ -1871,9 +2333,15 @@ local function display_opts_from_state(words_for_scale)
     anim_phrase_out_dupes = state.anim_phrase_out_dupes,
     anim_phrase_out_dir = state.anim_phrase_out_dir,
     anim_phrase_out_twist = state.anim_phrase_out_twist,
+    anim_wipe_mask_offset = state.anim_wipe_mask_offset,
     anim_phrase_out_use_graph = state.anim_phrase_out_use_graph and true or false,
     anim_phrase_out_graph = state.anim_phrase_out_graph_blob or state.anim_out_graph_blob or anim_graph_default_blob(),
+    anim_phrase_out_auto_blob = state.anim_phrase_out_graph_auto_blob or state.anim_out_graph_auto_blob or "",
     font_name = trim(state.font_name or ""),
+    img_post_wave = state.img_post_wave and true or false,
+    img_post_wave_amp = state.img_post_wave_amp,
+    img_post_wave_len = state.img_post_wave_len,
+    img_post_wave_speed = state.img_post_wave_speed,
   }
 end
 
@@ -2576,6 +3044,8 @@ refresh_preview = function(item)
     local preset = opts.preset
     if preset == W.PRESET_LINE_TRIPLE or preset == W.PRESET_LINE_STAIRS then
       local ph, gerr, ghint = W.parse_editor_phrases_for_multiline(words, state.editor_text, opts)
+      --- Do not clear `ml_phrase_after` / `ml_row_after` on parse failure: that threw away phrase splits
+      --- (e.g. embedded newlines in marker text, rare "|" in a word) and made triple UI feel "stuck".
       state.parse_hint = ghint
       if ph then
         state.preview_lines = #ph
@@ -2597,6 +3067,8 @@ refresh_preview = function(item)
     local lines = W.split_words_into_lines(words, opts.words_per_line, opts.max_chars, opts.break_after_sentence)
     state.preview_lines = #lines
   end
+
+  opts.editor_text = state.editor_text or ""
 
   local segs, serr, shint = W.build_display_segments(words, src_end, opts)
   if shint then
@@ -2792,7 +3264,7 @@ local function ml_make_word_phrase_start(wi, n)
 end
 
 --- Scale embedded alpha channel (0xRRGGBBAA layout used throughout this script).
-local function wx_im_col_alpha_mul(c, mul)
+function wx_im_col_alpha_mul(c, mul)
   c = tonumber(c) or 0xFFFFFFFF
   mul = math.max(0, math.min(1, tonumber(mul) or 1))
   local a = math.floor((c & 0xFF) * mul + 0.5)
@@ -2802,20 +3274,20 @@ local function wx_im_col_alpha_mul(c, mul)
   return (c & ~0xFF) | a
 end
 
-local function wx_im_col_alpha_set(c, a_byte)
+function wx_im_col_alpha_set(c, a_byte)
   c = tonumber(c) or 0xFFFFFFFF
   local a = math.floor(math.max(0, math.min(255, tonumber(a_byte) or 255)))
   return (c & ~0xFF) | a
 end
 
-local function word_grid_reset_drag_state()
+function word_grid_reset_drag_state()
   state.word_drag_lock = nil
   state.word_drag_acc_x = 0
   state.word_drag_acc_y = 0
 end
 
 --- Horizontal drag adjusts word scale (triple: horizontal only; other presets: dominant axis).
-local function word_grid_drag_on_word(ctx, item, words, n, wi, triple_preset)
+function word_grid_drag_on_word(ctx, item, words, n, wi, triple_preset)
   if not (ImGui.IsItemActive(ctx) and ImGui.IsMouseDragging and ImGui.IsMouseDragging(ctx, 0, 0)) then
     return
   end
@@ -2877,7 +3349,7 @@ local function word_grid_drag_on_word(ctx, item, words, n, wi, triple_preset)
   end
 end
 
-local function word_grid_show_size_labels(ctx, n)
+function word_grid_show_size_labels(ctx, n)
   local now = (r.time_precise and r.time_precise()) or 0
   if not state.word_scale_tip_active and now > (state.word_scale_tip_until or 0) then
     return
@@ -2907,10 +3379,10 @@ local function word_grid_show_size_labels(ctx, n)
   end
 end
 
-local function word_grid_current_play_word(item, words)
+function word_grid_current_play_word(item, words)
   state.current_play_word = nil
   state.current_play_src = nil
-  if not state.word_follow_play or not item or not words or #words == 0 then
+  if not item or not words or #words == 0 then
     state._last_follow_word = nil
     return nil
   end
@@ -2955,7 +3427,32 @@ local function word_grid_current_play_word(item, words)
   return nil
 end
 
-local function word_grid_cut_zone(ctx, item, words, n, wi, bh)
+local function word_grid_seek_word(item, words, wi)
+  if not (item and words and words[wi] and r.SetEditCurPos) then
+    return false
+  end
+  local take = r.GetActiveTake and r.GetActiveTake(item)
+  if not take then
+    return false
+  end
+  local ipos = r.GetMediaItemInfo_Value(item, "D_POSITION")
+  local ilen = r.GetMediaItemInfo_Value(item, "D_LENGTH")
+  local startoffs = r.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS") or 0
+  local playrate = r.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE") or 1
+  local src_t = tonumber(words[wi].t)
+  if type(ipos) ~= "number" or type(ilen) ~= "number" or not src_t then
+    return false
+  end
+  if playrate == 0 then
+    playrate = 1
+  end
+  local proj_t = ipos + (src_t - startoffs) / playrate
+  proj_t = math.max(ipos, math.min(ipos + ilen, proj_t))
+  r.SetEditCurPos(proj_t, true, false)
+  return true
+end
+
+function word_grid_cut_zone(ctx, item, words, n, wi, bh)
   if wi < 1 or wi >= n then
     return
   end
@@ -3006,7 +3503,7 @@ local function word_grid_cut_zone(ctx, item, words, n, wi, bh)
 end
 
 --- East–west grip: horizontal shaft with triangular chevrons (← and →), not four separate diags.
-local function wx_draw_ew_arrow_in_rect(dl, x0, y0, x1, y1, col, thick)
+function wx_draw_ew_arrow_in_rect(dl, x0, y0, x1, y1, col, thick)
   if not (dl and ImGui.DrawList_AddLine and x0 and y0 and x1 and y1) then
     return
   end
@@ -3042,7 +3539,7 @@ local GRIP_LABEL_CLR_IDLE = 0x888888FF
 local GRIP_LABEL_CLR_HOT = 0xEAEAEAFF
 
 --- Optional `label_lift_px`: pull value text closer to the grip (indent uses a few px).
-local function wx_draw_grip_int_below(dl, ctx, x0, x1, y1, val, _, emphasize, label_lift_px)
+function wx_draw_grip_int_below(dl, ctx, x0, x1, y1, val, _, emphasize, label_lift_px)
   if not (dl and ImGui.DrawList_AddText) then
     return
   end
@@ -3073,7 +3570,7 @@ local function wx_draw_grip_int_below(dl, ctx, x0, x1, y1, val, _, emphasize, la
   end
 end
 
-local function word_grid_row_indent_handle(ctx, item, words, row_start_w, bh, row_sc, row_any_selected)
+function word_grid_row_indent_handle(ctx, item, words, row_start_w, bh, row_sc, row_any_selected)
   if row_start_w < 1 then
     return
   end
@@ -3179,7 +3676,7 @@ local function word_grid_row_indent_handle(ctx, item, words, row_start_w, bh, ro
 end
 
 --- North–south grip: vertical shaft with narrow ∧ / ∨ chevrons (matches EW style).
-local function wx_draw_ns_arrow_in_rect(dl, x0, y0, x1, y1, col, thick)
+function wx_draw_ns_arrow_in_rect(dl, x0, y0, x1, y1, col, thick)
   if not (dl and ImGui.DrawList_AddLine and x0 and y0 and x1 and y1) then
     return
   end
@@ -3209,7 +3706,7 @@ local function wx_draw_ns_arrow_in_rect(dl, x0, y0, x1, y1, col, thick)
   ImGui.DrawList_AddLine(dl, cx, yt_back, cx, yb_back, col, thick)
 end
 
-local function word_grid_row_spacing_handle(ctx, item, words, lower_row_start_w, base_gap, slot_h)
+function word_grid_row_spacing_handle(ctx, item, words, lower_row_start_w, base_gap, slot_h)
   if lower_row_start_w < 1 then
     return
   end
@@ -3320,7 +3817,7 @@ local function word_grid_row_spacing_handle(ctx, item, words, lower_row_start_w,
   ImGui.PopID(ctx)
 end
 
-local function separator_text(ctx, label)
+function separator_text(ctx, label)
   if ImGui.SeparatorText then
     ImGui.SeparatorText(ctx, label)
   else
@@ -3330,7 +3827,7 @@ local function separator_text(ctx, label)
   end
 end
 
-local function word_style_menu_item(ctx, label, selected)
+function word_style_menu_item(ctx, label, selected)
   if ImGui.Checkbox then
     local rv = ImGui.Checkbox(ctx, label, selected and true or false)
     if type(rv) == "boolean" then
@@ -3345,7 +3842,7 @@ local function word_style_menu_item(ctx, label, selected)
   return ImGui.Selectable(ctx, (selected and "✓ " or "  ") .. label, false)
 end
 
-local function word_style_apply_change(item, words, ctx)
+function word_style_apply_change(item, words, ctx)
   local n = (words and #words) or state.ml_word_n or 0
   persist_word_styles(n, item)
   refresh_preview(item)
@@ -3354,7 +3851,7 @@ local function word_style_apply_change(item, words, ctx)
   end
 end
 
-local function word_color_edit(ctx, label, color, default_rgb)
+function word_color_edit(ctx, label, color, default_rgb)
   color = tonumber(color) or default_rgb or 0xFFFFFF
   local rv, out = false, color
   if ImGui.ColorEdit3 then
@@ -3375,7 +3872,7 @@ local function word_color_edit(ctx, label, color, default_rgb)
   return rv, out
 end
 
-local function word_color_button(ctx, label, rgb)
+function word_color_button(ctx, label, rgb)
   if not ImGui.ColorButton then
     return wx_custom_small_button and wx_custom_small_button(ctx, label, state.wx_slider_style)
   end
@@ -3389,7 +3886,7 @@ local function word_color_button(ctx, label, rgb)
   return ImGui.ColorButton(ctx, label, rgb & 0xFFFFFF, flags, 18, 18)
 end
 
-local function word_color_drop_target(ctx)
+function word_color_drop_target(ctx)
   if not (ImGui.BeginDragDropTarget and ImGui.BeginDragDropTarget(ctx)) then
     return nil
   end
@@ -3412,7 +3909,7 @@ local function word_color_drop_target(ctx)
   return nil
 end
 
-local function word_color_palette_ui(ctx, prefix, apply_fn, palette_item)
+function word_color_palette_ui(ctx, prefix, apply_fn, palette_item)
   local palette = state.word_color_palette or {}
   local per_row = 8
   for i = 1, #palette do
@@ -3442,9 +3939,16 @@ local function word_color_palette_ui(ctx, prefix, apply_fn, palette_item)
   ImGui.PopID(ctx)
 end
 
-local function word_style_popup_ui(ctx, item, words, wi)
+function word_style_popup_ui(ctx, item, words, wi)
   if ImGui.IsItemHovered and ImGui.IsItemHovered(ctx) and overlay_mod_ctrl(ctx) and ImGui.IsMouseClicked and ImGui.IsMouseClicked(ctx, MOUSE_RIGHT) then
-    state.word_sel = { [wi] = true }
+    local sel = state.word_sel or {}
+    local sel_count = 0
+    for _ in pairs(sel) do
+      sel_count = sel_count + 1
+    end
+    if sel_count <= 1 or not sel[wi] then
+      state.word_sel = { [wi] = true }
+    end
     state.word_anchor = wi
     if ImGui.OpenPopup then
       ImGui.OpenPopup(ctx, "##word_style_popup")
@@ -3453,8 +3957,55 @@ local function word_style_popup_ui(ctx, item, words, wi)
   if not (ImGui.BeginPopup and ImGui.BeginPopup(ctx, "##word_style_popup")) then
     return
   end
+  local nwords = #(words or {})
+  local function word_style_popup_targets()
+    local sel = state.word_sel or {}
+    local list = {}
+    for j = 1, nwords do
+      if sel[j] then
+        list[#list + 1] = j
+      end
+    end
+    table.sort(list)
+    if #list <= 1 then
+      return { wi }
+    end
+    return list
+  end
+  local targets = word_style_popup_targets()
+  local function word_style_propagate_primary_to_others()
+    if #targets <= 1 then
+      return
+    end
+    local raw = state.word_styles and state.word_styles[wi]
+    local cp = raw and word_style_copy(raw) or nil
+    for ti = 1, #targets do
+      local t = targets[ti]
+      if t ~= wi then
+        state.word_styles[t] = cp and word_style_copy(cp) or nil
+      end
+    end
+  end
+  local function word_style_set_flag_on_targets(flag, on)
+    for ti = 1, #targets do
+      local t = targets[ti]
+      local s = word_style_get(t)
+      if on then
+        s.flags = s.flags | flag
+      else
+        s.flags = s.flags & (~flag)
+      end
+      if word_style_is_empty(s) then
+        state.word_styles[t] = nil
+      end
+    end
+  end
   local st = word_style_get(wi)
-  ImGui.Text(ctx, "Word style: " .. tostring(words[wi] and words[wi].w or wi))
+  if #targets > 1 then
+    ImGui.Text(ctx, string.format("Word style (%d words)", #targets))
+  else
+    ImGui.Text(ctx, "Word style: " .. tostring(words[wi] and words[wi].w or wi))
+  end
   if ImGui.Separator then
     ImGui.Separator(ctx)
   end
@@ -3479,8 +4030,11 @@ local function word_style_popup_ui(ctx, item, words, wi)
       local nm = state.word_style_preset_names[(wp_idx or 0) + 1]
       if nm then
         local blob = es_get(word_style_preset_key(nm), "")
-        local okp, perr = word_style_preset_apply_blob(wi, blob)
+        local okp, perr = word_style_preset_apply_blob(targets[1], blob)
         if okp then
+          for ti = 2, #targets do
+            word_style_preset_apply_blob(targets[ti], blob)
+          end
           state.word_style_preset_name = nm
           state.word_style_preset_save_name = nm
           r.SetExtState(SECTION, "WORD_STYLE_PRESET_LAST", nm, true)
@@ -3557,7 +4111,8 @@ local function word_style_popup_ui(ctx, item, words, wi)
 
   local function toggle_line(lbl, flag)
     if word_style_menu_item(ctx, lbl, (st.flags & flag) ~= 0) then
-      word_style_toggle_flag(wi, flag)
+      local on = ((st.flags & flag) == 0)
+      word_style_set_flag_on_targets(flag, on)
       st = word_style_get(wi)
       changed = true
     end
@@ -3661,16 +4216,19 @@ local function word_style_popup_ui(ctx, item, words, wi)
     ImGui.Separator(ctx)
   end
   if wx_custom_button(ctx, "Clear word style", 130, 0, state.wx_slider_style) then
-    state.word_styles[wi] = nil
+    for ti = 1, #targets do
+      state.word_styles[targets[ti]] = nil
+    end
     changed = true
   end
   if changed then
+    word_style_propagate_primary_to_others()
     word_style_apply_change(item, words, ctx)
   end
   ImGui.EndPopup(ctx)
 end
 
-local function auto_phrase_from_lyrics(item, words, lyrics_text, char_split, ctx)
+function auto_phrase_from_lyrics(item, words, lyrics_text, char_split, ctx)
   local n = #words
   if n == 0 then return end
   
@@ -3795,20 +4353,67 @@ local function auto_phrase_from_lyrics(item, words, lyrics_text, char_split, ctx
   end
 end
 
-local function word_grid_ui(ctx, item, words)
+function word_grid_ui(ctx, item, words)
   if not words or #words == 0 then
     return
   end
   local n = #words
   state._wig_rects = {}
-  separator_text(ctx, "Words (take markers)")
-  local rv_follow, follow_play = ImGui.Checkbox(ctx, "Follow play cursor", state.word_follow_play)
-  if rv_follow then
-    state.word_follow_play = follow_play and true or false
-    state._last_follow_word = nil
-    r.SetExtState(SECTION, "WORD_FOLLOW_PLAY", state.word_follow_play and "1" or "0", true)
+  wx_bridge_icons_try_load(ctx)
+  local fs_row = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
+  local expand_ic_sz = math.max(22, math.floor(fs_row * 1.65 + 0.5))
+  if ImGui.AlignTextToFramePadding then
+    ImGui.AlignTextToFramePadding(ctx)
   end
-  ImGui.SameLine(ctx)
+  if ImGui.BeginGroup then
+    ImGui.BeginGroup(ctx)
+  end
+  if ImGui.SeparatorText then
+    ImGui.SeparatorText(ctx, "Words (take markers)")
+  else
+    ImGui.Text(ctx, "Words (take markers)")
+  end
+  ImGui.SameLine(ctx, 0, 8)
+  local float_hit = false
+  if wx_bridge_icon_images.expand then
+    local etint = state.word_grid_floating and 0xFFFFFFFF or 0x55FFFFFF
+    float_hit = wx_bridge_image_button(ctx, "##wx_float_words", wx_bridge_icon_images.expand, expand_ic_sz, etint)
+    if ImGui.SetItemTooltip then
+      ImGui.SetItemTooltip(ctx, "Float words panel — words in a separate window.")
+    elseif ImGui.SetTooltip and ImGui.IsItemHovered and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, "Float words panel — words in a separate window.")
+    end
+  else
+    local rv_f, v_f = ImGui.Checkbox(ctx, "Float##wx_float_words_fallback", state.word_grid_floating)
+    if rv_f then
+      state.word_grid_floating = v_f and true or false
+      r.SetExtState(SECTION, "WORD_GRID_FLOAT", state.word_grid_floating and "1" or "0", true)
+    end
+    if ImGui.SetItemTooltip then
+      ImGui.SetItemTooltip(ctx, "Float words panel")
+    elseif ImGui.SetTooltip and ImGui.IsItemHovered and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, "Float words panel")
+    end
+  end
+  if float_hit then
+    state.word_grid_floating = not state.word_grid_floating
+    r.SetExtState(SECTION, "WORD_GRID_FLOAT", state.word_grid_floating and "1" or "0", true)
+  end
+  if ImGui.EndGroup then
+    ImGui.EndGroup(ctx)
+  end
+  if not ImGui.SeparatorText then
+    ImGui.Separator(ctx)
+  end
+
+  if ImGui.AlignTextToFramePadding then
+    ImGui.AlignTextToFramePadding(ctx)
+  end
+  if ImGui.BeginGroup then
+    ImGui.BeginGroup(ctx)
+  end
+  wx_bridge_transport_strip(ctx, state.wx_slider_style)
+  ImGui.SameLine(ctx, 0, 14)
   local active_play_word = word_grid_current_play_word(item, words)
   if active_play_word then
     ImGui.TextColored(ctx, 0x66DDFFFF, "Current: " .. tostring(words[active_play_word].w or active_play_word))
@@ -3823,6 +4428,10 @@ local function word_grid_ui(ctx, item, words)
     if ImGui.OpenPopup then
       ImGui.OpenPopup(ctx, "Auto-phrase from lyrics")
     end
+  end
+
+  if ImGui.EndGroup then
+    ImGui.EndGroup(ctx)
   end
   
   if ImGui.BeginPopupModal and ImGui.BeginPopupModal(ctx, "Auto-phrase from lyrics", nil, ImGui.WindowFlags_AlwaysAutoResize) then
@@ -3865,6 +4474,59 @@ local function word_grid_ui(ctx, item, words)
   end
   if wordgrid_visible then
   local sel_fill = wx_active_style_fill_rgba()
+  local accent_abgr = wx_active_style_accent_rgba()
+  local function word_grid_word_btn_fill_and_outline(wi)
+    local fill_mark = nil
+    local outline
+    if state.word_sel[wi] then
+      fill_mark = sel_fill
+      outline = wx_im_col_alpha_mul(accent_abgr, 0.95)
+    elseif active_play_word == wi then
+      outline = 0x22AAFFFF
+    elseif not word_style_is_empty(state.word_styles and state.word_styles[wi]) then
+      outline = 0x665522FF
+    else
+      outline = wx_im_col_alpha_mul(accent_abgr, 0.78)
+    end
+    return fill_mark, outline
+  end
+  --- Native ImGui.Button path: faint fill unless selected; Col_Border outlines the frame.
+  local function word_grid_push_native_word_btn_styles(wi)
+    local fill_mark, outline = word_grid_word_btn_fill_and_outline(wi)
+    local pc, pv = 0, 0
+    if ImGui.PushStyleVar and ImGui.StyleVar_FrameBorderSize then
+      ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameBorderSize, 1)
+      pv = pv + 1
+    end
+    if ImGui.PushStyleColor and ImGui.Col_Border then
+      ImGui.PushStyleColor(ctx, ImGui.Col_Border, outline)
+      pc = pc + 1
+    end
+    if state.word_sel[wi] and ImGui.Col_Button then
+      ImGui.PushStyleColor(ctx, ImGui.Col_Button, sel_fill)
+      pc = pc + 1
+      if ImGui.Col_ButtonHovered then
+        ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, wx_im_col_alpha_mul(sel_fill, 0.92))
+        pc = pc + 1
+      end
+      if ImGui.Col_ButtonActive then
+        ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, wx_im_col_alpha_mul(sel_fill, 0.84))
+        pc = pc + 1
+      end
+    elseif ImGui.Col_Button then
+      ImGui.PushStyleColor(ctx, ImGui.Col_Button, wx_im_col_alpha_mul(0xFFFFFFFF, 0.05))
+      pc = pc + 1
+      if ImGui.Col_ButtonHovered then
+        ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, wx_im_col_alpha_mul(accent_abgr, 0.14))
+        pc = pc + 1
+      end
+      if ImGui.Col_ButtonActive then
+        ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, wx_im_col_alpha_mul(accent_abgr, 0.26))
+        pc = pc + 1
+      end
+    end
+    return fill_mark, outline, pc, pv
+  end
   local mx, my = ImGui.GetMousePos(ctx)
   local function word_sel_pair_count()
     if not state.word_sel then
@@ -3957,41 +4619,25 @@ local function word_grid_ui(ctx, item, words)
             end
             ImGui.PushID(ctx, wi + 910000)
             local sc = state.ml_word_scales[wi] or 1
-            local wtxt = tostring(words[wi].w or "")
-            if #wtxt > 24 then
-              wtxt = wtxt:sub(1, 21) .. "..."
-            end
-            local bw = math.max(28, math.floor(#(words[wi].w or "") * 7 * sc + 16))
+            local wtxt, bw = wx_word_grid_button_label_and_width(ctx, words[wi].w, sc, 24, 7)
             local bh = math.max(20, math.floor(18 * sc + 6))
             local pushed_var = false
+            local wv_word_border = 0
             if ImGui.PushStyleVar and ImGui.StyleVar_FramePadding then
               ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 4 * sc, 3 * sc)
               pushed_var = true
             end
-            local pushed_color = 0
-            local word_btn_mark = nil
-            if active_play_word == wi and ImGui.PushStyleColor and ImGui.Col_Button then
-              word_btn_mark = 0x22AAFFFF
-              ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x22AAFFFF)
-              pushed_color = pushed_color + 1
-              if ImGui.Col_ButtonHovered then
-                ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, 0x33BBFFFF)
-                pushed_color = pushed_color + 1
-              end
-              if ImGui.Col_ButtonActive then
-                ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, 0x55CCFFFF)
-                pushed_color = pushed_color + 1
-              end
-            elseif state.word_sel[wi] and ImGui.PushStyleColor and ImGui.Col_Button then
-              word_btn_mark = sel_fill
-              ImGui.PushStyleColor(ctx, ImGui.Col_Button, sel_fill)
-              pushed_color = pushed_color + 1
-            elseif (not word_style_is_empty(state.word_styles and state.word_styles[wi])) and ImGui.PushStyleColor and ImGui.Col_Button then
-              word_btn_mark = 0x665522FF
-              ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x665522FF)
-              pushed_color = pushed_color + 1
+            local wb_fill, wb_outline, wc_extra, wv_b = word_grid_push_native_word_btn_styles(wi)
+            local pushed_color = wc_extra
+            wv_word_border = wv_b
+            local word_clicked = false
+            if ImGui.Button then
+              word_clicked = ImGui.Button(ctx, wtxt .. "##w", bw, bh) and true or false
+            else
+              word_clicked = wx_custom_button(ctx, wtxt .. "##w", bw, bh, state.wx_slider_style, false, wb_fill, wb_outline)
             end
-            if wx_custom_button(ctx, wtxt .. "##w", bw, bh, state.wx_slider_style, false, word_btn_mark) then
+            if word_clicked then
+              word_grid_seek_word(item, words, wi)
               if state.preset_idx == 3 and overlay_mod_ctrl_shift(ctx) then
                 if ml_make_word_phrase_start(wi, n) then
                   ml_sync_editor_text(words)
@@ -4080,6 +4726,11 @@ local function word_grid_ui(ctx, item, words)
             if pushed_color > 0 and ImGui.PopStyleColor then
               ImGui.PopStyleColor(ctx, pushed_color)
             end
+            if wv_word_border > 0 and ImGui.PopStyleVar then
+              for _ = 1, wv_word_border do
+                ImGui.PopStyleVar(ctx)
+              end
+            end
             if pushed_var and ImGui.PopStyleVar and ImGui.StyleVar_FramePadding then
               ImGui.PopStyleVar(ctx)
             end
@@ -4142,6 +4793,20 @@ local function word_grid_ui(ctx, item, words)
         ImGui.EndGroup(ctx)
       end
       ImGui.EndGroup(ctx)
+      do
+        local clicked_phrase_empty = false
+        if ImGui.IsMouseClicked and ImGui.GetItemRectMin and ImGui.GetItemRectMax then
+          local gx0, gy0 = ImGui.GetItemRectMin(ctx)
+          local gx1, gy1 = ImGui.GetItemRectMax(ctx)
+          local any_hovered = ImGui.IsAnyItemHovered and ImGui.IsAnyItemHovered(ctx)
+          if gx0 and gy0 and gx1 and gy1 and not any_hovered and ImGui.IsMouseClicked(ctx, MOUSE_LEFT) then
+            clicked_phrase_empty = mx >= gx0 and mx <= gx1 and my >= gy0 and my <= gy1
+          end
+        end
+        if clicked_phrase_empty then
+          word_grid_seek_word(item, words, ps)
+        end
+      end
       if pi < #phrases then
         ImGui.Separator(ctx)
       end
@@ -4171,36 +4836,20 @@ local function word_grid_ui(ctx, item, words)
         end
         ImGui.PushID(ctx, wi + 920000)
         local sc = state.ml_word_scales[wi] or 1
-        local wtxt = tostring(words[wi].w or "")
-        if #wtxt > 20 then
-          wtxt = wtxt:sub(1, 17) .. "..."
-        end
-        local bw = math.max(28, math.floor(#(words[wi].w or "") * 7 * sc + 12))
+        local wtxt, bw = wx_word_grid_button_label_and_width(ctx, words[wi].w, sc, 20, 6)
         local bh = math.max(20, math.floor(18 * sc + 4))
-        local pushed_color = 0
-        local word_btn_mark = nil
-        if active_play_word == wi and ImGui.PushStyleColor and ImGui.Col_Button then
-          word_btn_mark = 0x22AAFFFF
-          ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x22AAFFFF)
-          pushed_color = pushed_color + 1
-          if ImGui.Col_ButtonHovered then
-            ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, 0x33BBFFFF)
-            pushed_color = pushed_color + 1
-          end
-          if ImGui.Col_ButtonActive then
-            ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, 0x55CCFFFF)
-            pushed_color = pushed_color + 1
-          end
-        elseif state.word_sel[wi] and ImGui.PushStyleColor and ImGui.Col_Button then
-          word_btn_mark = sel_fill
-          ImGui.PushStyleColor(ctx, ImGui.Col_Button, sel_fill)
-          pushed_color = pushed_color + 1
-        elseif (not word_style_is_empty(state.word_styles and state.word_styles[wi])) and ImGui.PushStyleColor and ImGui.Col_Button then
-          word_btn_mark = 0x665522FF
-          ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x665522FF)
-          pushed_color = pushed_color + 1
+        local wv_word_border = 0
+        local wb_fill, wb_outline, wc_extra, wv_b = word_grid_push_native_word_btn_styles(wi)
+        local pushed_color = wc_extra
+        wv_word_border = wv_b
+        local word_clicked = false
+        if ImGui.Button then
+          word_clicked = ImGui.Button(ctx, wtxt .. "##w2", bw, bh) and true or false
+        else
+          word_clicked = wx_custom_button(ctx, wtxt .. "##w2", bw, bh, state.wx_slider_style, false, wb_fill, wb_outline)
         end
-        if wx_custom_button(ctx, wtxt .. "##w2", bw, bh, state.wx_slider_style, false, word_btn_mark) then
+        if word_clicked then
+          word_grid_seek_word(item, words, wi)
           if overlay_mod_shift(ctx) and state.word_anchor then
             local a, b = state.word_anchor, wi
             if a > b then
@@ -4219,6 +4868,11 @@ local function word_grid_ui(ctx, item, words)
         end
         if pushed_color > 0 and ImGui.PopStyleColor then
           ImGui.PopStyleColor(ctx, pushed_color)
+        end
+        if wv_word_border > 0 and ImGui.PopStyleVar then
+          for _ = 1, wv_word_border do
+            ImGui.PopStyleVar(ctx)
+          end
         end
         do
           local rmin_a, rmin_b = ImGui.GetItemRectMin(ctx)
@@ -4302,7 +4956,7 @@ local function word_grid_ui(ctx, item, words)
 end
 
 --- Color ABGR for ImGui.TextColored (green / magenta / gray).
-local function draw_parse_hint(ctx, hint)
+function draw_parse_hint(ctx, hint)
   if type(hint) ~= "table" then
     return
   end
@@ -4343,7 +4997,7 @@ local function draw_parse_hint(ctx, hint)
   end
 end
 
-local function save_settings()
+function save_settings()
   r.SetExtState(SECTION, "PRESET_IDX", tostring(state.preset_idx), true)
   r.SetExtState(SECTION, "KARAOKE", state.karaoke and "1" or "0", true)
   r.SetExtState(SECTION, "WORDS_PER_LINE", tostring(state.words_per_line), true)
@@ -4368,7 +5022,14 @@ local function save_settings()
   r.SetExtState(SECTION, "LIVE_GUI_VP", state.live_gui_vp and "1" or "0", true)
   r.SetExtState(SECTION, "WORD_GRID_H", tostring(math.floor((state.word_grid_h or 240) + 0.5)), true)
   r.SetExtState(SECTION, "WORD_GRID_FLOAT", state.word_grid_floating and "1" or "0", true)
-  r.SetExtState(SECTION, "WORD_FOLLOW_PLAY", state.word_follow_play and "1" or "0", true)
+  r.SetExtState(SECTION, "ANIM_WIPE_MASK_OFFSET", string.format("%.17g", state.anim_wipe_mask_offset or 0), true)
+  r.SetExtState(SECTION, "IMG_POST_WAVE", state.img_post_wave and "1" or "0", true)
+  r.SetExtState(SECTION, "IMG_POST_WAVE_AMP", string.format("%.17g", state.img_post_wave_amp or 24), true)
+  r.SetExtState(SECTION, "IMG_POST_WAVE_LEN", string.format("%.17g", state.img_post_wave_len or 90), true)
+  r.SetExtState(SECTION, "IMG_POST_WAVE_SPEED", string.format("%.17g", state.img_post_wave_speed or 6), true)
+  for _, guide in ipairs(VIDEO_RATIO_GUIDES) do
+    r.SetExtState(SECTION, guide.key, (state.video_guides and state.video_guides[guide.id]) and "1" or "0", true)
+  end
   local sel_save_item = (r.CountSelectedMediaItems(0) == 1) and r.GetSelectedMediaItem(0, 0) or nil
   word_palette_persist(sel_save_item)
   r.SetExtState(SECTION, "EDITOR_BODY_H", tostring(math.floor((state.editor_body_h or 140) + 0.5)), true)
@@ -4393,7 +5054,7 @@ local function save_settings()
   state.status_err = false
 end
 
-local function write_vp_for_item(item, live_opts)
+function write_vp_for_item(item, live_opts)
   live_opts = live_opts or {}
   local no_undo = live_opts.no_undo == true
   local skip_refresh = live_opts.skip_refresh == true
@@ -4510,14 +5171,252 @@ local function write_vp_for_item(item, live_opts)
   return true, nil
 end
 
+--- Queue a subtitle + item/extstate autosave flush on the next end-of-frame pass (handles font, guides, global sliders, …).
+local function overlay_request_autosave()
+  state.overlay_autosave_force = true
+end
+
+--- Fingerprint written to disk by `auto_persist_layout`; used to coalesce autosaves (word grid + globals + VP settings).
+local function overlay_autosave_state_sig(words)
+  words = words or {}
+  local n = #words
+  local z = "\255"
+  local p = {}
+
+  local function ap(s)
+    p[#p + 1] = s or ""
+  end
+
+  local function fq(x)
+    return string.format("%.17g", tonumber(x) or 0)
+  end
+
+  ap(z .. "PS")
+  ap(z .. tostring(math.floor(state.preset_idx or 0)))
+  ap(z .. "FONT")
+  ap(z)
+  ap(state.font_name or "")
+  ap(z .. "KAR")
+  ap(z)
+  ap(state.karaoke and "1" or "0")
+  ap(z .. "VG")
+  for _, guide in ipairs(VIDEO_RATIO_GUIDES) do
+    ap(z)
+    ap(state.video_guides[guide.id] and "1" or "0")
+  end
+  ap(z .. "IMGW")
+  ap(z)
+  ap(state.img_post_wave and "1" or "0")
+  ap(z .. fq(state.img_post_wave_amp or 24))
+  ap(z .. fq(state.img_post_wave_len or 90))
+  ap(z .. fq(state.img_post_wave_speed or 6))
+
+  ap(z .. "LM")
+  ap(z .. tostring(math.floor(state.ml_max_rows or 0)))
+  ap(z .. fq(state.ml_line_gap or 0))
+  ap(z .. tostring(math.floor(state.ml_row_chars or 0)))
+  ap(z .. tostring(math.floor(state.ml_row_chars_rand or 0)))
+  ap(z .. tostring(math.floor(state.ml_row_v_align or 0)))
+  ap(z .. fq(state.ml_chars_seed or 0))
+  ap(z .. fq(state.ml_indent_step or 0))
+  ap(z .. fq(state.ml_indent_rand or 0))
+  ap(z .. fq(state.ml_indent_seed or 0))
+  for li = 1, 6 do
+    ap(z .. fq(state.ml_s[li] or 1))
+    ap(z .. fq(state.ml_r[li] or 0))
+    ap(z .. fq(state.ml_jitter[li] or 0))
+  end
+
+  ap(z .. "AW")
+  ap(z .. fq(state.anim_wipe_mask_offset or 0))
+
+  local function blob_len_field(key, blob)
+    blob = blob or ""
+    ap(z .. key)
+    ap(z .. tostring(#blob))
+    ap(z)
+    ap(blob)
+  end
+
+  ap(z .. "LGV")
+  ap(z .. (state.live_gui_vp and "1" or "0"))
+
+  local function scalar_anim_blob()
+    ap(z .. "ANIM")
+    ap(z .. tostring(math.floor(state.anim_scope or 0)))
+    ap(z .. (state.anim_in_on and "1" or "0"))
+    ap(z .. tostring(math.floor(state.anim_in_type or 0)))
+    ap(z .. tostring(math.floor(state.anim_in_curve or 0)))
+    ap(z .. fq(state.anim_in_dur or 0.12))
+    ap(z .. fq(state.anim_in_amp or 1))
+    ap(z .. fq(state.anim_in_bounce or 0.7))
+    ap(z .. fq(state.anim_in_motion or 1))
+    ap(z .. fq(state.anim_in_wiggle or 1))
+    ap(z .. fq(state.anim_in_scale or 0))
+    ap(z .. fq(state.anim_in_fade or 0))
+    ap(z .. fq(state.anim_in_blur or 0))
+    ap(z .. fq(state.anim_in_ghost or 1))
+    ap(z .. tostring(math.floor(state.anim_in_dupes or 3)))
+    ap(z .. fq(state.anim_in_dir or 90))
+    ap(z .. fq(state.anim_in_twist or 0))
+    ap(z .. (state.anim_in_use_graph and "1" or "0"))
+
+    ap(z .. (state.anim_out_on and "1" or "0"))
+    ap(z .. tostring(math.floor(state.anim_out_type or 0)))
+    ap(z .. tostring(math.floor(state.anim_out_curve or 0)))
+    ap(z .. fq(state.anim_out_dur or 0.12))
+    ap(z .. fq(state.anim_out_amp or 1))
+    ap(z .. fq(state.anim_out_bounce or 0.7))
+    ap(z .. fq(state.anim_out_motion or 1))
+    ap(z .. fq(state.anim_out_wiggle or 1))
+    ap(z .. fq(state.anim_out_scale or 0))
+    ap(z .. fq(state.anim_out_fade or 0))
+    ap(z .. fq(state.anim_out_blur or 0))
+    ap(z .. fq(state.anim_out_ghost or 1))
+    ap(z .. tostring(math.floor(state.anim_out_dupes or 3)))
+    ap(z .. fq(state.anim_out_dir or 90))
+    ap(z .. fq(state.anim_out_twist or 0))
+    ap(z .. (state.anim_out_use_graph and "1" or "0"))
+
+    ap(z .. (state.anim_phrase_out_on and "1" or "0"))
+    ap(z .. tostring(math.floor(state.anim_phrase_out_type or state.anim_out_type or 0)))
+    ap(z .. tostring(math.floor(state.anim_phrase_out_curve or state.anim_out_curve or 0)))
+    ap(z .. fq(state.anim_phrase_out_dur or state.anim_out_dur or 0.12))
+    ap(z .. fq(state.anim_phrase_out_amp or state.anim_out_amp or 1))
+    ap(z .. fq(state.anim_phrase_out_bounce or state.anim_out_bounce or 0.7))
+    ap(z .. fq(state.anim_phrase_out_motion or state.anim_out_motion or 1))
+    ap(z .. fq(state.anim_phrase_out_wiggle or state.anim_out_wiggle or 1))
+    ap(z .. fq(state.anim_phrase_out_scale or state.anim_out_scale or 0))
+    ap(z .. fq(state.anim_phrase_out_fade or state.anim_out_fade or 0))
+    ap(z .. fq(state.anim_phrase_out_blur or state.anim_out_blur or 0))
+    ap(z .. fq(state.anim_phrase_out_ghost or state.anim_out_ghost or 1))
+    ap(z .. tostring(math.floor(state.anim_phrase_out_dupes or state.anim_out_dupes or 3)))
+    ap(z .. fq(state.anim_phrase_out_dir or state.anim_out_dir or 90))
+    ap(z .. fq(state.anim_phrase_out_twist or state.anim_out_twist or 0))
+    ap(z .. (state.anim_phrase_out_use_graph and "1" or "0"))
+
+    blob_len_field("AIG", state.anim_in_graph_blob)
+    blob_len_field("AOG", state.anim_out_graph_blob)
+    blob_len_field("APG", state.anim_phrase_out_graph_blob)
+    blob_len_field("AIGA", state.anim_in_graph_auto_blob or "")
+    blob_len_field("AOGA", state.anim_out_graph_auto_blob or "")
+    blob_len_field("APGA", state.anim_phrase_out_graph_auto_blob or "")
+  end
+
+  scalar_anim_blob()
+
+  ap(z .. "WN")
+  ap(z .. tostring(n))
+  ap(z .. "ET")
+  ap(z .. tostring(#(state.editor_text or "")))
+  ap(z .. (state.editor_text or ""))
+
+  ap(z .. "MLB")
+  for i = 1, math.max(0, n - 1) do
+    local pa = state.ml_phrase_after[i] and "1" or "0"
+    local ra = state.ml_row_after[i] and "1" or "0"
+    ap(z .. pa .. ra)
+  end
+
+  ap(z .. "MLS")
+  for i = 1, n do
+    ap(z .. fq(state.ml_word_scales[i] or 1))
+  end
+  ap(z .. "IND")
+  for i = 1, n do
+    ap(z .. fq(state.ml_row_indents[i] or 0))
+  end
+  ap(z .. "RNG")
+  for i = 1, n do
+    local sp = state.ml_row_spacings[i]
+    if sp == nil then
+      ap(z .. "x")
+    else
+      ap(z .. fq(sp))
+    end
+  end
+  ap(z .. "WS")
+  for i = 1, n do
+    local st = state.word_styles and state.word_styles[i]
+    ap(z)
+    if word_style_is_empty(st) then
+      ap("-")
+    else
+      word_style_defaults(st)
+      ap(
+        tostring(math.floor(st.flags or 0))
+          .. "^"
+          .. tostring(math.floor(st.text_color or -1))
+          .. "^"
+          .. tostring(math.floor(st.highlight_color or -1))
+          .. "^"
+          .. fq(st.shadow_dx or 0)
+          .. "^"
+          .. fq(st.shadow_dy or 0)
+          .. "^"
+          .. fq(st.shadow_alpha or 0)
+          .. "^"
+          .. tostring(math.floor(st.pseudo_bold_copies or 2))
+          .. "^"
+          .. fq(st.pseudo_bold_offset or 1)
+          .. "^"
+          .. fq(st.pseudo_slant or 2)
+          .. "^"
+          .. tostring(math.floor(st.underline_thick or 1))
+          .. "^"
+          .. fq(st.underline_offset or 1)
+          .. "^"
+          .. trim(st.anim_preset_name or "")
+      )
+    end
+  end
+
+  return table.concat(p)
+end
+
 --- Live VP: avoid SetItemStateChunk races with native take-marker / item UI (can hard-crash REAPER).
 --- Skip while an ImGui control is active, while keyboard focus is outside this ReaImGui context (user in the arrange),
 --- and briefly after each successful live chunk write (coalesce frames).
 local LIVE_VP_MIN_WRITE_INTERVAL = 0.09
 
-local function live_vp_safe_for_chunk_write(ctx)
+function anim_graph_live_vp_interacting()
+  if state.anim_graph_editor_drag_point then
+    return true
+  end
+  if state.anim_graph_editor_drag_t then
+    return true
+  end
+  if state.anim_graph_editor_seg_drag_seg then
+    return true
+  end
+  if (state.anim_graph_editor_lane_seg_lane or "") ~= "" then
+    return true
+  end
+  if (state.anim_graph_editor_auto_drag_lane or "") ~= "" then
+    return true
+  end
+  return false
+end
+
+function anim_graph_update_live_vp_coalesce()
+  if anim_graph_live_vp_interacting() then
+    state.anim_graph_live_vp_was_interacting = true
+    return
+  end
+  if state.anim_graph_live_vp_was_interacting then
+    state.anim_graph_live_vp_was_interacting = false
+    if state.live_gui_vp then
+      state.anim_graph_vp_defer_flush = true
+    end
+  end
+end
+
+function live_vp_safe_for_chunk_write(ctx)
   if not ctx then
     return true
+  end
+  if anim_graph_live_vp_interacting() then
+    return false
   end
   if ImGui.IsAnyItemActive and ImGui.IsAnyItemActive(ctx) then
     return false
@@ -4527,7 +5426,7 @@ local function live_vp_safe_for_chunk_write(ctx)
       return false
     end
   end
-  if r.time_precise then
+  if not state.anim_graph_vp_defer_flush and r.time_precise then
     local now = r.time_precise()
     local last = state._live_vp_last_chunk_write_t
     if type(last) == "number" and (now - last) < LIVE_VP_MIN_WRITE_INTERVAL then
@@ -4570,11 +5469,15 @@ auto_persist_layout = function(item, words, ctx)
   end
   refresh_preview(item)
   if state.live_gui_vp and state.preview_parse_err == "" and state.preview_segs > 0 and live_vp_safe_for_chunk_write(ctx) then
-    write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
+    local ok_vp = write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
+    if ok_vp and state.anim_graph_vp_defer_flush then
+      state.anim_graph_vp_defer_flush = false
+    end
   end
+  state.overlay_autosave_sig_saved = overlay_autosave_state_sig(words)
 end
 
-local function apply_to_selection()
+function apply_to_selection()
   local nsel = r.CountSelectedMediaItems(0)
   if nsel ~= 1 then
     state.status = "Select exactly one media item with take markers."
@@ -4598,7 +5501,7 @@ local function apply_to_selection()
 end
 
 --- Re-read take marker times from the item; keep subtitle field when it still parses; then rewrite VP.
-local function refresh_markers_and_apply(item)
+function refresh_markers_and_apply(item)
   if not item then
     state.status = "Select exactly one media item."
     state.status_err = true
@@ -4645,19 +5548,64 @@ local function refresh_markers_and_apply(item)
 end
 
 --- Narrow width for per-row size / randomize sliders (fits label + two sliders on one line).
-local function ml_row_slider_w(ctx)
+function ml_row_slider_w(ctx)
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
   return math.max(72, math.floor(fs * 7.8))
 end
 
 --- Main tri-stack parameter sliders: cap width so panels stay dense.
-local function ml_stack_param_item_w(ctx)
+function ml_stack_param_item_w(ctx)
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
   local avail = (ImGui.GetContentRegionAvail and ImGui.GetContentRegionAvail(ctx)) or 400
   return math.max(fs * 12, math.min(fs * 18, avail * 0.58))
 end
 
-local function anim_combo_w(ctx, chars, min_w)
+--- Content region width (X) for layout; ReaImGui may return one or two values.
+local function ml_content_region_avail_x(ctx)
+  if not ImGui.GetContentRegionAvail then
+    return 400
+  end
+  local a, b = ImGui.GetContentRegionAvail(ctx)
+  local w = tonumber(a)
+  if w and w > 1 then
+    return math.max(80, w)
+  end
+  if type(a) == "table" then
+    w = tonumber(a[1])
+    if w and w > 1 then
+      return math.max(80, w)
+    end
+  end
+  return 400
+end
+
+--- Packs several controls per horizontal row when the window is wide enough (tri-stack Layout section).
+local ml_flow_layout = { col = 0, cols = 1, item_w = 400, gap = 8 }
+
+function ml_layout_flow_start(ctx, min_item_w)
+  min_item_w = tonumber(min_item_w) or 168
+  local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
+  min_item_w = math.max(min_item_w, math.floor(fs * 11))
+  local avail = ml_content_region_avail_x(ctx)
+  local gap = ml_flow_layout.gap
+  local cols = math.min(4, math.max(1, math.floor((avail + gap) / (min_item_w + gap))))
+  ml_flow_layout.cols = cols
+  ml_flow_layout.item_w = math.max(1, math.floor(((avail - (cols - 1) * gap) / cols) + 0.5))
+  ml_flow_layout.col = 0
+end
+
+function ml_layout_flow_next_cell(ctx)
+  if ml_flow_layout.col > 0 and ImGui.SameLine then
+    ImGui.SameLine(ctx, 0, ml_flow_layout.gap)
+  end
+  ml_flow_layout.col = ml_flow_layout.col + 1
+  if ml_flow_layout.col >= ml_flow_layout.cols then
+    ml_flow_layout.col = 0
+  end
+  return ml_flow_layout.item_w
+end
+
+function anim_combo_w(ctx, chars, min_w)
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
   local w = fs * (tonumber(chars) or 14)
   local mw = tonumber(min_w) or 120
@@ -4688,7 +5636,7 @@ function wx_active_style_fill_rgba()
     or 0xFFFFFFFF
 end
 
-local function clamp_num(v, lo, hi)
+function clamp_num(v, lo, hi)
   v = tonumber(v) or 0
   if v < lo then
     return lo
@@ -4699,7 +5647,7 @@ local function clamp_num(v, lo, hi)
   return v
 end
 
-local function wx_text_size(ctx, text)
+function wx_text_size(ctx, text)
   if ImGui.CalcTextSize then
     local ok, tw, th = pcall(ImGui.CalcTextSize, ctx, tostring(text or ""))
     if ok and tonumber(tw) then
@@ -4710,7 +5658,7 @@ local function wx_text_size(ctx, text)
   return #tostring(text or "") * fs * 0.58, fs
 end
 
-local function interp_color(c1, c2, t)
+function interp_color(c1, c2, t)
   local r1, g1, b1, a1 = (c1 >> 24) & 0xFF, (c1 >> 16) & 0xFF, (c1 >> 8) & 0xFF, c1 & 0xFF
   local r2, g2, b2, a2 = (c2 >> 24) & 0xFF, (c2 >> 16) & 0xFF, (c2 >> 8) & 0xFF, c2 & 0xFF
   local r = math.floor(r1 + (r2 - r1) * t)
@@ -4721,7 +5669,7 @@ local function interp_color(c1, c2, t)
 end
 
 --- When a style’s base ColorEdit is set (WX_SLIDER_C*), derive bg / knob / accent so sliders, buttons, and combos match that swatch.
-local function wx_effective_style_colors(style_idx)
+function wx_effective_style_colors(style_idx)
   style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
   local st = WX_SLIDER_STYLES[style_idx] or WX_SLIDER_STYLES[1]
   if state.wx_slider_colors and state.wx_slider_colors[style_idx] ~= nil then
@@ -4745,7 +5693,7 @@ function wx_active_style_accent_rgba()
   return accent
 end
 
-local function wx_effective_highlight_color(style_idx, fallback_fill)
+function wx_effective_highlight_color(style_idx, fallback_fill)
   style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
   return (state.wx_slider_highlight_colors and state.wx_slider_highlight_colors[style_idx])
     or fallback_fill
@@ -4753,12 +5701,12 @@ local function wx_effective_highlight_color(style_idx, fallback_fill)
     or 0xFFFFFFFF
 end
 
-function wx_custom_button(ctx, label, w, h, style_idx, small, mark_col)
+wx_custom_button = function(ctx, label, w, h, style_idx, small, mark_col, outline_col)
   style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
   local st = WX_SLIDER_STYLES[style_idx] or WX_SLIDER_STYLES[1]
   local ebg, fill, knob, accent = wx_effective_style_colors(style_idx)
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
-  local shown_label = tostring(label or ""):gsub("##.*$", "")
+  local shown_label = wx_visible_label(label)
   if shown_label == "" then
     shown_label = " "
   end
@@ -4787,16 +5735,32 @@ function wx_custom_button(ctx, label, w, h, style_idx, small, mark_col)
     clicked = ImGui.IsItemClicked(ctx, 0) and true or false
   end
   local dl = ImGui.GetWindowDrawList(ctx)
-  local bg = active and fill or (hovered and accent or ebg)
-  local text_col = active and 0x101010FF or (hovered and 0xFFFFFFFF or knob)
-  if mark_col then
-    bg = active and fill or (hovered and interp_color(mark_col, accent, 0.35) or mark_col)
-    text_col = 0xFFFFFFFF
-  end
   local can_rect = ImGui.DrawList_AddRect ~= nil
   local can_line = ImGui.DrawList_AddLine ~= nil
   local can_circle = ImGui.DrawList_AddCircleFilled ~= nil
   local rrad = (style_idx == 4 or style_idx == 9) and 2 or math.max(3, math.floor(bh * 0.28))
+  local bg = active and fill or (hovered and accent or ebg)
+  local text_col = active and 0x101010FF or (hovered and 0xFFFFFFFF or knob)
+  if outline_col and not mark_col then
+    local bgq = wx_im_col_alpha_mul(ebg, 0.06)
+    if active then
+      bgq = wx_im_col_alpha_mul(accent, 0.22)
+    elseif hovered then
+      bgq = wx_im_col_alpha_mul(accent, 0.12)
+    end
+    ImGui.DrawList_AddRectFilled(dl, x, y, x + bw, y + bh, bgq, rrad)
+    if can_rect then
+      ImGui.DrawList_AddRect(dl, x, y, x + bw, y + bh, outline_col, rrad, 0, (active or hovered) and 2 or 1)
+    end
+    if ImGui.DrawList_AddText then
+      ImGui.DrawList_AddText(dl, x + (bw - tw) * 0.5, y + (bh - th) * 0.5 - 1, text_col, shown_label)
+    end
+    return clicked
+  end
+  if mark_col then
+    bg = active and fill or (hovered and interp_color(mark_col, accent, 0.35) or mark_col)
+    text_col = 0xFFFFFFFF
+  end
 
   if style_idx == 1 then
     ImGui.DrawList_AddRectFilled(dl, x, y, x + bw, y + bh, bg, rrad)
@@ -4866,20 +5830,61 @@ function wx_custom_button(ctx, label, w, h, style_idx, small, mark_col)
     ImGui.DrawList_AddRectFilled(dl, x, y, x + bw, y + bh, bg, rrad)
   end
 
+  if outline_col and mark_col and can_rect then
+    ImGui.DrawList_AddRect(dl, x, y, x + bw, y + bh, outline_col, rrad, 0, (hovered or active) and 2 or 1)
+  end
+
   if ImGui.DrawList_AddText then
     ImGui.DrawList_AddText(dl, x + (bw - tw) * 0.5, y + (bh - th) * 0.5 - 1, text_col, shown_label)
   end
   return clicked
 end
 
-function wx_custom_small_button(ctx, label, style_idx)
+wx_custom_small_button = function(ctx, label, style_idx)
   return wx_custom_button(ctx, label, 0, 0, style_idx, true)
+end
+
+wx_bridge_transport_strip = function(ctx, slider_style_idx)
+  if not r.Main_OnCommand then
+    return
+  end
+  slider_style_idx = tonumber(slider_style_idx) or 1
+  if ImGui.BeginGroup then
+    ImGui.BeginGroup(ctx)
+  end
+  if wx_custom_small_button(ctx, "Stop##wx_tr_stop", slider_style_idx) then
+    r.Main_OnCommand(40667, 0) -- Transport: Stop
+  end
+  if ImGui.SetItemTooltip then
+    ImGui.SetItemTooltip(ctx, "Transport: Stop")
+  end
+  if ImGui.SameLine then
+    ImGui.SameLine(ctx, 0, 4)
+  end
+  if wx_custom_small_button(ctx, "Play##wx_tr_play", slider_style_idx) then
+    r.Main_OnCommand(40073, 0) -- Transport: Play/pause
+  end
+  if ImGui.SetItemTooltip then
+    ImGui.SetItemTooltip(ctx, "Transport: Play / Pause")
+  end
+  if ImGui.SameLine then
+    ImGui.SameLine(ctx, 0, 4)
+  end
+  if wx_custom_small_button(ctx, "Home##wx_tr_home", slider_style_idx) then
+    r.Main_OnCommand(40042, 0) -- Transport: Go to start of project
+  end
+  if ImGui.SetItemTooltip then
+    ImGui.SetItemTooltip(ctx, "Transport: Go to start of project")
+  end
+  if ImGui.EndGroup then
+    ImGui.EndGroup(ctx)
+  end
 end
 
 local _wx_slider_drag_part = {}
 
 --- Pixels above rail_y (slider centerline) to topmost drawn rail/knob art (for readout vertical clearance).
-local function wx_slider_extent_above_rail(si, rail_h, fs, h_main, main_active, stepped_rail)
+function wx_slider_extent_above_rail(si, rail_h, fs, h_main, main_active, stepped_rail)
   if stepped_rail then
     local body = rail_h * 0.55
     local knob = math.max(main_active and fs * 0.52 or fs * 0.45, h_main * 0.38)
@@ -4910,7 +5915,7 @@ end
 
 --- Discrete "mono chunk" rail: one segment per integer step (min_v..max_v), using the active style palette.
 --- Returns block width (for knob sizing).
-local function wx_slider_draw_stepped_rail(dl, ctx, style_idx, rail_x0, rail_y, rail_x1, rail_h, min_v, max_v, value,
+function wx_slider_draw_stepped_rail(dl, ctx, style_idx, rail_x0, rail_y, rail_x1, rail_h, min_v, max_v, value,
     fs, h_main, rrad, st, bg, fill, accent, main_active, main_hovered, can_rect, can_circle)
   local n = math.max(1, max_v - min_v + 1)
   local gap = math.max(1, math.min(3, math.floor(fs * 0.11 + 0.5)))
@@ -5005,12 +6010,12 @@ function wx_degree_knob_int(ctx, id, label, value, min_v, max_v, fmt, width, sty
   value = math.floor(clamp_num(value, min_v, max_v) + 0.5)
   style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
   local ebg, fill, knob_outline, accent = wx_effective_style_colors(style_idx)
-  local shown_label = tostring(label or ""):gsub("##.*$", "")
+  local shown_label = wx_visible_label(label)
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
-  local avail = (ImGui.GetContentRegionAvail and ImGui.GetContentRegionAvail(ctx)) or 260
+  local avail = ml_content_region_avail_x(ctx)
   local requested_w = tonumber(width)
-  local min_w = requested_w and math.max(fs * 4.8, math.min(requested_w, fs * 10)) or (fs * 6)
-  local w = math.max(min_w, math.min(requested_w or (fs * 7), avail))
+  local w = requested_w and math.min(requested_w, avail) or math.min(fs * 7, avail)
+  w = math.max(1, w)
   local fmt_use = fmt or "%d°"
   local value_text = string.format(fmt_use, value)
   local knob_r = math.floor(math.max(13, math.min(w * 0.39, fs * 1.42)) + 0.5)
@@ -5107,7 +6112,7 @@ function wx_degree_knob_int(ctx, id, label, value, min_v, max_v, fmt, width, sty
   return changed, value
 end
 
-function wx_custom_slider_int(ctx, id, label, value, min_v, max_v, fmt, width, style_idx, rand_value, rand_max, rand_fmt, stepped)
+wx_custom_slider_int = function(ctx, id, label, value, min_v, max_v, fmt, width, style_idx, rand_value, rand_max, rand_fmt, stepped)
   -- stepped: when true, rail draws one filled chunk per integer step (max 36 slots); for low-range params.
   value = math.floor(clamp_num(value, min_v, max_v) + 0.5)
   local has_rand = rand_max and rand_max > 0
@@ -5118,14 +6123,19 @@ function wx_custom_slider_int(ctx, id, label, value, min_v, max_v, fmt, width, s
   local st = WX_SLIDER_STYLES[style_idx] or WX_SLIDER_STYLES[1]
   local ebg, fill, knob, accent = wx_effective_style_colors(style_idx)
   local hfill = wx_effective_highlight_color(style_idx, fill)
-  local shown_label = tostring(label or ""):gsub("##.*$", "")
+  local shown_label = wx_visible_label(label)
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
-  local avail = (ImGui.GetContentRegionAvail and ImGui.GetContentRegionAvail(ctx)) or 260
+  local avail = ml_content_region_avail_x(ctx)
   local requested_w = tonumber(width)
-  local min_w = requested_w and math.max(fs * 5, math.min(requested_w, fs * 12)) or (fs * 12)
-  local w = math.max(min_w, math.min(requested_w or (fs * 18), avail))
+  local w = requested_w and math.min(requested_w, avail) or math.min(fs * 18, avail)
+  w = math.max(1, w)
   local value_text = string.format(fmt or "%d", value)
   local readout_gap = math.max(4, math.floor(fs * 0.28))
+  -- Label left / readout right on one row; vertical centering uses readout box in draw (tw_l, th_l).
+  local tw_l, th_l = wx_text_size(ctx, (shown_label ~= "") and shown_label or " ")
+  local readout_pad = math.max(3, math.floor(fs * 0.24 + 0.5))
+  local span_slots = math.max(1, max_v - min_v + 1)
+  local stepped_rail = stepped == true and span_slots <= 36
   local h_main = math.max(34, math.floor(fs * 2.55 + 0.5))
   local h_rand = has_rand and math.floor(fs * 1.6) or 0
   local h = h_main + h_rand
@@ -5222,9 +6232,6 @@ function wx_custom_slider_int(ctx, id, label, value, min_v, max_v, fmt, width, s
   if main_hover_paint then
     bg = accent
   end
-
-  local span_slots = math.max(1, max_v - min_v + 1)
-  local stepped_rail = stepped == true and span_slots <= 36
 
   local can_circle = ImGui.DrawList_AddCircleFilled ~= nil
   local can_rect = ImGui.DrawList_AddRect ~= nil
@@ -5352,26 +6359,30 @@ function wx_custom_slider_int(ctx, id, label, value, min_v, max_v, fmt, width, s
   end
 
   if ImGui.DrawList_AddText then
-    ImGui.DrawList_AddText(dl, x, y + 1, main_hover_paint and 0xFFFFFFFF or 0xCFCFCFFF, shown_label)
+    local pad_top = 1
+    value_text = string.format(fmt or "%d", value)
     local tw, th = wx_text_size(ctx, value_text)
-    
-    local readout_pad = math.max(3, math.floor(fs * 0.24 + 0.5))
     local box_w = math.max(fs * 3.2, tw + readout_pad * 2 + fs * 0.35)
     local box_h = math.max(fs * 1.25, th + readout_pad * 2)
     local bx1 = x + w
     local bx0 = bx1 - box_w
     local extent_up = wx_slider_extent_above_rail(style_idx, rail_h, fs, h_main, main_active, stepped_rail)
     local cap_by1 = (rail_y - extent_up) - readout_gap
-    local by1 = math.min(y + box_h, cap_by1)
+    local row_h = math.max(th_l, box_h)
+    local row_top = y + pad_top
+    local by1 = math.min(row_top + row_h, cap_by1)
     local by0 = by1 - box_h
-    if by0 < y then
-      by0 = y
+    if by0 < row_top then
+      by0 = row_top
       by1 = math.min(by0 + box_h, cap_by1)
     end
     if by1 <= by0 then
       by1 = by0 + math.max(math.floor(th + 0.5) + 2, 6)
     end
     local box_draw_h = by1 - by0
+    local mid_y = by0 + box_draw_h * 0.5
+    local label_ty = mid_y - th_l * 0.5 - 1
+    ImGui.DrawList_AddText(dl, x, label_ty, main_hover_paint and 0xFFFFFFFF or 0xCFCFCFFF, shown_label)
     
     local text_col = main_active and fill or (main_hover_paint and 0xFFFFFFFF or 0xBBBBBBFF)
 
@@ -5478,16 +6489,16 @@ function wx_custom_slider_int(ctx, id, label, value, min_v, max_v, fmt, width, s
   return changed, value, changed_rand, rand_value
 end
 
-function wx_custom_combo(ctx, id, label, current_idx, items_str, width, style_idx, popup_header_fn)
+wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_idx, popup_header_fn)
   current_idx = math.floor(tonumber(current_idx) or 0)
   style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
   local ebg, fill, knob, accent = wx_effective_style_colors(style_idx)
-  local shown_label = tostring(label or ""):gsub("##.*$", "")
+  local shown_label = wx_visible_label(label)
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
-  local avail = (ImGui.GetContentRegionAvail and ImGui.GetContentRegionAvail(ctx)) or 260
+  local avail = ml_content_region_avail_x(ctx)
   local requested_w = tonumber(width)
-  local min_w = requested_w and math.max(fs * 5, math.min(requested_w, fs * 12)) or (fs * 12)
-  local w = math.max(min_w, math.min(requested_w or (fs * 18), avail))
+  local w = requested_w and math.min(requested_w, avail) or math.min(fs * 18, avail)
+  w = math.max(1, w)
   local h = math.max(26, math.floor(fs * 1.72 + 0.5))
   local x, y = 0, 0
   if ImGui.GetCursorScreenPos then x, y = ImGui.GetCursorScreenPos(ctx) end
@@ -5779,7 +6790,7 @@ function wx_custom_combo(ctx, id, label, current_idx, items_str, width, style_id
   return changed, current_idx
 end
 
-local function wx_slider_style_gallery_ui(ctx)
+function wx_slider_style_gallery_ui(ctx)
   separator_text(ctx, "Sliders, combos & buttons")
   ImGui.TextColored(ctx, 0x888888FF,
     "Preview each look below. First swatch is base/style color; second swatch is highlight fill for slider value, +/- random range, and word-grid highlights. Use this saves the style globally.")
@@ -5872,8 +6883,9 @@ local function wx_slider_style_gallery_ui(ctx)
   end
 end
 
-local function wx_draw_hint_row_with_gear(ctx, hint)
+function wx_draw_hint_row_with_gear(ctx, hint)
   hint = tostring(hint or "")
+  wx_bridge_icons_try_load(ctx)
   local fs_top = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
   local gear_sz = math.max(26, math.floor(fs_top * 2 + 0.5))
   if ImGui.BeginTable and ImGui.TableSetupColumn then
@@ -5898,7 +6910,13 @@ local function wx_draw_hint_row_with_gear(ctx, hint)
       if ImGui.AlignTextToFramePadding then
         ImGui.AlignTextToFramePadding(ctx)
       end
-      if wx_custom_button(ctx, "⚙##wx_open_settings", gear_sz, gear_sz, state.wx_slider_style) then
+      local gear_clicked = false
+      if wx_bridge_icon_images.settings then
+        gear_clicked = wx_bridge_image_button(ctx, "##wx_open_settings_img", wx_bridge_icon_images.settings, gear_sz, 0xFFFFFFFF)
+      elseif wx_custom_button(ctx, "⚙##wx_open_settings", gear_sz, gear_sz, state.wx_slider_style) then
+        gear_clicked = true
+      end
+      if gear_clicked then
         state.wx_settings_open = true
       end
       if ImGui.SetItemTooltip then
@@ -5912,13 +6930,24 @@ local function wx_draw_hint_row_with_gear(ctx, hint)
     if hint ~= "" then
       ImGui.TextWrapped(ctx, hint)
     end
-    if wx_custom_button(ctx, "Appearance…##wx_open_settings_fb", 0, 0, state.wx_slider_style) then
+    local gear_clicked_fb = false
+    if wx_bridge_icon_images.settings then
+      gear_clicked_fb = wx_bridge_image_button(ctx, "##wx_open_settings_img_fb", wx_bridge_icon_images.settings, gear_sz, 0xFFFFFFFF)
+    elseif wx_custom_button(ctx, "Appearance…##wx_open_settings_fb", 0, 0, state.wx_slider_style) then
+      gear_clicked_fb = true
+    end
+    if gear_clicked_fb then
       state.wx_settings_open = true
+    end
+    if ImGui.SetItemTooltip then
+      ImGui.SetItemTooltip(ctx, "Appearance settings — sliders & combos")
+    elseif ImGui.SetTooltip and ImGui.IsItemHovered and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, "Appearance settings — sliders & combos")
     end
   end
 end
 
-local function wx_draw_settings_modal(ctx)
+function wx_draw_settings_modal(ctx)
   local pid = "Appearance###wx_settings_modal"
   if state.wx_settings_open then
     state.wx_settings_open = false
@@ -5965,7 +6994,7 @@ end
 
 function anim_type_uses_motion(typ)
   typ = math.floor(tonumber(typ) or 0)
-  return typ >= ANIM_KIND.CUSTOM
+  return (typ > ANIM_TYPE_MAX or typ == ANIM_KIND.CUSTOM)
     or typ == ANIM_KIND.SLIDE_LEFT
     or typ == ANIM_KIND.SLIDE_RIGHT
     or typ == ANIM_KIND.SLIDE_UP
@@ -5989,7 +7018,7 @@ end
 
 function anim_type_uses_wiggle(typ)
   typ = math.floor(tonumber(typ) or 0)
-  return typ >= ANIM_KIND.CUSTOM
+  return (typ > ANIM_TYPE_MAX or typ == ANIM_KIND.CUSTOM)
     or typ == ANIM_KIND.PUNCH
     or typ == ANIM_KIND.DROP_BOUNCE
     or typ == ANIM_KIND.RISE_BOUNCE
@@ -6006,12 +7035,15 @@ end
 
 function anim_type_uses_duplicates(typ)
   typ = math.floor(tonumber(typ) or 0)
-  return typ == ANIM_KIND.ECHO_TRAIL or typ == ANIM_KIND.CLONE_BURST or typ >= ANIM_KIND.CUSTOM
+  if typ == ANIM_KIND.WIPE_REVEAL then
+    return false
+  end
+  return typ == ANIM_KIND.ECHO_TRAIL or typ == ANIM_KIND.CLONE_BURST or typ > ANIM_TYPE_MAX or typ == ANIM_KIND.CUSTOM
 end
 
 function anim_type_uses_blur(typ)
   typ = math.floor(tonumber(typ) or 0)
-  return typ >= ANIM_KIND.CUSTOM or typ == ANIM_KIND.BLUR
+  return typ > ANIM_TYPE_MAX or typ == ANIM_KIND.CUSTOM or typ == ANIM_KIND.BLUR
 end
 
 function anim_uses_bounce(typ, curve)
@@ -6020,7 +7052,8 @@ function anim_uses_bounce(typ, curve)
   if typ <= 0 then
     return false
   end
-  return typ >= ANIM_KIND.CUSTOM
+  return typ > ANIM_TYPE_MAX
+    or typ == ANIM_KIND.CUSTOM
     or typ == ANIM_KIND.DROP_BOUNCE
     or typ == ANIM_KIND.RISE_BOUNCE
     or curve == ANIM_CURVE_BACK
@@ -6055,14 +7088,19 @@ end
 function anim_graph_open_editor(side_key)
   side_key = side_key or "in"
   local key = anim_graph_side_blob_key(side_key)
-  local pts, curves = anim_graph_decode_blob(state[key] or anim_graph_default_blob())
+  local pts, curves, blends = anim_graph_decode_blob(state[key] or anim_graph_default_blob())
   state.anim_graph_editor_side_key = side_key
   state.anim_graph_editor_points = pts
   state.anim_graph_editor_curves = curves
+  state.anim_graph_editor_blends = blends
+  state.anim_graph_seg_mode1_bias0 = nil
   state.anim_graph_editor_selected = math.max(1, math.min(#pts, state.anim_graph_editor_selected or 1))
   state.anim_graph_editor_drag_point = nil
   state.anim_graph_editor_drag_t = nil
   state.anim_graph_editor_popup_seg = nil
+  state.anim_graph_editor_seg_drag_seg = nil
+  state.anim_graph_editor_lane_seg_lane = ""
+  state.anim_graph_editor_lane_seg_idx = nil
   state.anim_graph_editor_open = true
 end
 
@@ -6074,7 +7112,7 @@ function anim_graph_apply_editor_to_state()
   if type(pts) ~= "table" or #pts < 2 then
     return false
   end
-  local blob = anim_graph_encode_blob(pts, curves)
+  local blob = anim_graph_encode_blob(pts, curves, state.anim_graph_editor_blends)
   if blob ~= (state[key] or "") then
     state[key] = blob
     return true
@@ -6083,8 +7121,197 @@ function anim_graph_apply_editor_to_state()
 end
 
 function anim_graph_curve_name(idx)
-  local names = { "Linear", "In Quad", "Out Quad", "InOut Quad", "Square" }
+  local names = { "Linear", "In Quad", "Out Quad", "InOut Quad", "Square", "In Log", "Out Exp" }
   return names[math.max(1, math.min(#names, math.floor(tonumber(idx) or 0) + 1))]
+end
+
+function anim_graph_curve_apply(curve_id, u)
+  curve_id = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(curve_id) or 0)))
+  u = math.max(0, math.min(1, tonumber(u) or 0))
+  if curve_id == 1 then
+    return u * u
+  end
+  if curve_id == 2 then
+    return 1 - (1 - u) * (1 - u)
+  end
+  if curve_id == 3 then
+    if u < 0.5 then
+      return 2 * u * u
+    end
+    local k = (2 - 2 * u)
+    return 1 - (k * k) * 0.5
+  end
+  if curve_id == ANIM_GRAPH_CURVE_SQUARE then
+    return (u < 1) and 0 or 1
+  end
+  if curve_id == ANIM_GRAPH_CURVE_IN_LOG then
+    return math.log(1 + 9 * u) / 2.302585
+  end
+  if curve_id == ANIM_GRAPH_CURVE_OUT_EXP then
+    if u >= 1 then
+      return 1
+    end
+    return 1 - (math.exp(6.907755 * (1 - u)) - 1) / 999
+  end
+  return u
+end
+
+function anim_graph_curve_mode1_blend(u, b)
+  u = math.max(0, math.min(1, tonumber(u) or 0))
+  b = math.max(-1, math.min(1, tonumber(b) or 0))
+  local yl = anim_graph_curve_apply(ANIM_GRAPH_CURVE_IN_LOG, u)
+  local ym = u
+  local yr = anim_graph_curve_apply(ANIM_GRAPH_CURVE_OUT_EXP, u)
+  if b <= 0 then
+    return ym + (yl - ym) * (-b)
+  end
+  return ym + (yr - ym) * b
+end
+
+function anim_graph_curve_ease_at(curve_id, u, blend_bias)
+  if type(blend_bias) == "number" then
+    return anim_graph_curve_mode1_blend(u, blend_bias)
+  end
+  return anim_graph_curve_apply(curve_id, u)
+end
+
+function anim_graph_mode1_bias_from_curve(curve_id)
+  curve_id = math.floor(tonumber(curve_id) or 0)
+  if curve_id == ANIM_GRAPH_CURVE_IN_LOG then
+    return -1
+  end
+  if curve_id == ANIM_GRAPH_CURVE_OUT_EXP then
+    return 1
+  end
+  return 0
+end
+
+function anim_graph_mode1_representative_curve(bias)
+  bias = tonumber(bias) or 0
+  if bias < -0.34 then
+    return ANIM_GRAPH_CURVE_IN_LOG
+  end
+  if bias > 0.34 then
+    return ANIM_GRAPH_CURVE_OUT_EXP
+  end
+  return 0
+end
+
+function anim_graph_seg_read_mode1_bias(blends, curves, si)
+  if blends and type(blends[si]) == "number" then
+    return blends[si]
+  end
+  return anim_graph_mode1_bias_from_curve(curves[si] or 0)
+end
+
+function anim_graph_seg_apply_mode1_bias_drag(blends, curves, si, my, my0, bias0)
+  if not (blends and curves and si and my and my0) then
+    return false
+  end
+  local b = math.max(-1, math.min(1, (tonumber(bias0) or 0) + (my - my0) / ANIM_GRAPH_MODE1_DRAG_PX))
+  local ob = blends[si]
+  if ob == b or (type(ob) == "number" and math.abs(ob - b) < 1e-6) then
+    return false
+  end
+  blends[si] = b
+  curves[si] = anim_graph_mode1_representative_curve(b)
+  return true
+end
+
+function anim_graph_blends_on_point_insert(blends, k, old_pt_count)
+  blends = blends or {}
+  local nb = {}
+  for i = 1, k - 2 do
+    nb[i] = blends[i]
+  end
+  local spl = blends[k - 1]
+  nb[k - 1] = spl
+  nb[k] = spl
+  for m = k + 1, old_pt_count do
+    nb[m] = blends[m - 1]
+  end
+  return nb
+end
+
+function anim_graph_blends_on_point_remove(blends, k, old_pt_count)
+  blends = blends or {}
+  local n = old_pt_count
+  local nb = {}
+  for i = 1, k - 2 do
+    nb[i] = blends[i]
+  end
+  nb[k - 1] = nil
+  for i = k, n - 2 do
+    nb[i] = blends[i + 1]
+  end
+  return nb
+end
+
+function anim_draw_curve_segment(dl, ax, ay, bx, by, curve_id, col, thick, blend_bias)
+  if not (dl and ImGui.DrawList_AddLine) then
+    return
+  end
+  local curve = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(curve_id) or 0)))
+  if curve == ANIM_GRAPH_CURVE_SQUARE then
+    ImGui.DrawList_AddLine(dl, ax, ay, bx, ay, col, thick or 1)
+    ImGui.DrawList_AddLine(dl, bx, ay, bx, by, col, thick or 1)
+    return
+  end
+  local prev_x, prev_y = ax, ay
+  local steps = 22
+  for s = 1, steps do
+    local u = s / steps
+    local e = anim_graph_curve_ease_at(curve, u, blend_bias)
+    local x = ax + (bx - ax) * u
+    local y = ay + (by - ay) * e
+    ImGui.DrawList_AddLine(dl, prev_x, prev_y, x, y, col, thick or 1)
+    prev_x, prev_y = x, y
+  end
+end
+
+--- Small arrow on the drawn curve showing motion from point i → i+1 in timeline order (not left-to-right screen X).
+function anim_draw_segment_time_arrow(dl, ax, ay, bx, by, curve_id, col, blend_bias)
+  if not (dl and ImGui.DrawList_AddLine) then
+    return
+  end
+  curve_id = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(curve_id) or 0)))
+  local function smooth_pt(uu)
+    local e = anim_graph_curve_ease_at(curve_id, uu, blend_bias)
+    return ax + (bx - ax) * uu, ay + (by - ay) * e
+  end
+  local function square_pt(uu)
+    uu = math.max(0, math.min(1, uu))
+    if uu <= 0.5 then
+      local k = uu * 2
+      return ax + (bx - ax) * k, ay
+    end
+    local k = (uu - 0.5) * 2
+    return bx, ay + (by - ay) * k
+  end
+  local sample = (curve_id == ANIM_GRAPH_CURVE_SQUARE) and square_pt or smooth_pt
+  local x0, y0 = sample(0.52)
+  local x1, y1 = sample(0.68)
+  local dx, dy = x1 - x0, y1 - y0
+  local len = math.sqrt(dx * dx + dy * dy)
+  if len < 3 then
+    dx, dy = bx - ax, by - ay
+    len = math.sqrt(dx * dx + dy * dy)
+    x0, y0 = ax + dx * 0.35, ay + dy * 0.35
+    x1, y1 = ax + dx * 0.55, ay + dy * 0.55
+    dx, dy = x1 - x0, y1 - y0
+    len = math.sqrt(dx * dx + dy * dy)
+  end
+  if len < 1e-6 then
+    return
+  end
+  dx, dy = dx / len, dy / len
+  local cx, cy = sample(0.58)
+  local ah, hw = 5, 2.8
+  local ex, ey = cx + dx * ah, cy + dy * ah
+  local px, py = -dy, dx
+  ImGui.DrawList_AddLine(dl, cx, cy, ex, ey, col, 1.5)
+  ImGui.DrawList_AddLine(dl, ex, ey, ex - dx * ah + px * hw, ey - dy * ah + py * hw, col, 1.5)
+  ImGui.DrawList_AddLine(dl, ex, ey, ex - dx * ah - px * hw, ey - dy * ah - py * hw, col, 1.5)
 end
 
 function point_to_segment_dist(px, py, ax, ay, bx, by)
@@ -6101,6 +7328,524 @@ function point_to_segment_dist(px, py, ax, ay, bx, by)
   local ny = ay + vy * t
   local dx, dy = px - nx, py - ny
   return math.sqrt(dx * dx + dy * dy)
+end
+
+--- Distance from (px,py) to the same polyline `anim_draw_curve_segment` draws (not the chord AB).
+function anim_graph_point_to_curve_seg_dist(px, py, ax, ay, bx, by, curve_id, blend_bias)
+  curve_id = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(curve_id) or 0)))
+  if math.abs(bx - ax) < 1e-6 and math.abs(by - ay) < 1e-6 then
+    local dx, dy = px - ax, py - ay
+    return math.sqrt(dx * dx + dy * dy)
+  end
+  if curve_id == ANIM_GRAPH_CURVE_SQUARE then
+    local d1 = point_to_segment_dist(px, py, ax, ay, bx, ay)
+    local d2 = point_to_segment_dist(px, py, bx, ay, bx, by)
+    return math.min(d1, d2)
+  end
+  local min_d = math.huge
+  local steps = 24
+  local prev_x, prev_y = ax, ay
+  for s = 1, steps do
+    local u = s / steps
+    local e = anim_graph_curve_ease_at(curve_id, u, blend_bias)
+    local x = ax + (bx - ax) * u
+    local y = ay + (by - ay) * e
+    local dseg = point_to_segment_dist(px, py, prev_x, prev_y, x, y)
+    if dseg < min_d then
+      min_d = dseg
+    end
+    prev_x, prev_y = x, y
+  end
+  return min_d
+end
+
+--- Segment hit distance; ignore hits near endpoints so nodes keep priority (CurveEditor-style).
+function anim_graph_curve_seg_pick_dist(mx, my, ax, ay, bx, by, curve_id, node_r, blend_bias)
+  node_r = tonumber(node_r) or 10
+  local d_end = math.min(
+    math.sqrt((mx - ax) * (mx - ax) + (my - ay) * (my - ay)),
+    math.sqrt((mx - bx) * (mx - bx) + (my - by) * (my - by))
+  )
+  if d_end < node_r * 0.75 then
+    return math.huge
+  end
+  return anim_graph_point_to_curve_seg_dist(mx, my, ax, ay, bx, by, curve_id, blend_bias)
+end
+
+function anim_graph_curve_hotkey_step(ctx)
+  if not (ctx and ImGui.IsKeyPressed) then
+    return 0
+  end
+  local function pressed(name)
+    local key = ImGui[name]
+    if not key then
+      return false
+    end
+    local k = type(key) == "function" and key() or key
+    local ok, v = pcall(ImGui.IsKeyPressed, ctx, k, false)
+    return ok and v
+  end
+  if pressed("Key_Tab") then
+    return 1
+  end
+  if pressed("Key_X") then
+    return -1
+  end
+  return 0
+end
+
+--- Segment curve families for path editor: drag + Tab stay inside family; X cycles which family (1→2→3→1).
+local function anim_graph_seg_family_snap(cc, mode)
+  cc = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(cc) or 0)))
+  mode = math.max(1, math.min(3, math.floor(tonumber(mode) or 1)))
+  if mode == 1 then
+    if cc == ANIM_GRAPH_CURVE_IN_LOG or cc == 0 or cc == ANIM_GRAPH_CURVE_OUT_EXP then
+      return cc
+    end
+    return ANIM_GRAPH_CURVE_IN_LOG
+  end
+  if mode == 2 then
+    if cc >= 1 and cc <= 3 then
+      return cc
+    end
+    return 1
+  end
+  return ANIM_GRAPH_CURVE_SQUARE
+end
+
+function anim_graph_seg_family_cycle_x(ctx)
+  if not (ctx and ImGui.IsKeyPressed) then
+    return false
+  end
+  local key = ImGui.Key_X
+  if type(key) == "function" then
+    key = key()
+  end
+  if not key then
+    return false
+  end
+  local ok, v = pcall(ImGui.IsKeyPressed, ctx, key, false)
+  return ok and v and true or false
+end
+
+local function wx_imgui_member(name)
+  local ok, v = pcall(function()
+    return ImGui[name]
+  end)
+  return ok and v or nil
+end
+
+local function wx_imgui_key(name)
+  local key = wx_imgui_member(name)
+  if type(key) == "function" then
+    key = key()
+  end
+  return key
+end
+
+local function wx_wants_text_input(ctx)
+  local get_io = wx_imgui_member("GetIO")
+  if get_io then
+    local ok, io = pcall(get_io, ctx)
+    if ok and io ~= nil then
+      local ok_want, want = pcall(function()
+        return io.WantTextInput
+      end)
+      if ok_want and want ~= nil then
+        return want == true
+      end
+    end
+  end
+  local get_want_text_input = wx_imgui_member("GetIO_WantTextInput")
+  if get_want_text_input then
+    local ok, v = pcall(get_want_text_input, ctx)
+    if ok then
+      return v == true
+    end
+  end
+  return false
+end
+
+local function wx_bridge_transport_spacebar(ctx)
+  local is_key_pressed = wx_imgui_member("IsKeyPressed")
+  if not (ctx and is_key_pressed and r.Main_OnCommand) then
+    return
+  end
+  if wx_wants_text_input(ctx) then
+    return
+  end
+  local space = wx_imgui_key("Key_Space")
+  if not space then
+    return
+  end
+  local ok, pressed = pcall(is_key_pressed, ctx, space, false)
+  if ok and pressed then
+    r.Main_OnCommand(40044, 0) -- Transport: Play/stop
+  end
+end
+
+local function anim_graph_seg_family_advance_tab(curves, blends, si, direction)
+  direction = (tonumber(direction) or 1) >= 0 and 1 or -1
+  local mode = math.max(1, math.min(3, math.floor(tonumber(state.anim_graph_seg_family_mode) or 1)))
+  local fam
+  if mode == 1 then
+    fam = { ANIM_GRAPH_CURVE_IN_LOG, 0, ANIM_GRAPH_CURVE_OUT_EXP }
+    if blends then
+      blends[si] = nil
+    end
+  elseif mode == 2 then
+    fam = { 1, 2, 3 }
+  else
+    fam = { ANIM_GRAPH_CURVE_SQUARE }
+  end
+  local cc = anim_graph_seg_family_snap(curves[si] or 0, mode)
+  local idx = 1
+  for i = 1, #fam do
+    if fam[i] == cc then
+      idx = i
+      break
+    end
+  end
+  idx = idx + direction
+  if idx < 1 then
+    idx = #fam
+  elseif idx > #fam then
+    idx = 1
+  end
+  curves[si] = fam[idx]
+end
+
+--- Mouse rdy: positive = downward. Updates curves[si] within current family; returns whether curves[si] changed.
+function anim_graph_seg_apply_drag_delta_to_family(curves, si, rdy)
+  if not (curves and si and type(rdy) == "number" and math.abs(rdy) > 2.5) then
+    return false
+  end
+  local mode = math.max(1, math.min(3, math.floor(tonumber(state.anim_graph_seg_family_mode) or 1)))
+  if mode == 1 then
+    return false
+  end
+  local cc = anim_graph_seg_family_snap(curves[si] or 0, mode)
+  local newc = cc
+  if mode == 2 then
+    local fam = { 1, 2, 3 }
+    local idx = 1
+    for i = 1, 3 do
+      if fam[i] == cc then
+        idx = i
+        break
+      end
+    end
+    if rdy > 0 then
+      idx = idx - 1
+      if idx < 1 then
+        idx = 3
+      end
+    else
+      idx = idx + 1
+      if idx > 3 then
+        idx = 1
+      end
+    end
+    newc = fam[idx]
+  else
+    newc = ANIM_GRAPH_CURVE_SQUARE
+  end
+  if newc ~= (curves[si] or 0) then
+    curves[si] = newc
+    return true
+  end
+  return false
+end
+
+--- When GetMouseDragDelta is missing: ~14px steps within the active family only (not full 0..MAX).
+function anim_graph_seg_apply_continuous_dy_to_family(curves, si, dy, c0)
+  if not (curves and si) then
+    return false
+  end
+  dy = tonumber(dy) or 0
+  local mode = math.max(1, math.min(3, math.floor(tonumber(state.anim_graph_seg_family_mode) or 1)))
+  if mode == 1 then
+    return false
+  end
+  local st = dy >= 0 and math.floor(dy / 14 + 0.5) or -math.floor(-dy / 14 + 0.5)
+  local newc
+  if mode == 2 then
+    local fam = { 1, 2, 3 }
+    local cc0 = anim_graph_seg_family_snap(c0, mode)
+    local idx = 1
+    for i = 1, #fam do
+      if fam[i] == cc0 then
+        idx = i
+        break
+      end
+    end
+    local ni = idx - st
+    while ni < 1 do
+      ni = ni + #fam
+    end
+    while ni > #fam do
+      ni = ni - #fam
+    end
+    newc = fam[ni]
+  else
+    newc = ANIM_GRAPH_CURVE_SQUARE
+  end
+  if newc ~= (curves[si] or 0) then
+    curves[si] = newc
+    return true
+  end
+  return false
+end
+
+function anim_graph_seg_process_family_hotkeys(ctx, curves, si, blends)
+  if not (ctx and curves and si) then
+    return false
+  end
+  local ch = false
+  if anim_graph_seg_family_cycle_x(ctx) then
+    state.anim_graph_seg_family_mode = (math.floor(tonumber(state.anim_graph_seg_family_mode) or 1) % 3) + 1
+    local m = state.anim_graph_seg_family_mode
+    if blends then
+      blends[si] = nil
+    end
+    curves[si] = anim_graph_seg_family_snap(curves[si] or 0, m)
+    ch = true
+  end
+  if anim_graph_curve_hotkey_step(ctx) == 1 then
+    anim_graph_seg_family_advance_tab(curves, blends, si, 1)
+    ch = true
+  end
+  return ch
+end
+
+function anim_graph_auto_lanes_ui(ctx, side_key)
+  local key = anim_graph_auto_blob_key(side_key)
+  local lanes = anim_graph_auto_decode_blob(state[key] or "", side_key)
+  local changed = false
+  local graph_w = 520
+  local label_w = 140
+  local lane_h = 38
+  local function to_px(t, x0, x1)
+    return x0 + math.max(0, math.min(1, t)) * math.max(1, x1 - x0)
+  end
+  for i = 1, #ANIM_AUTO_LANES do
+    local spec = ANIM_AUTO_LANES[i]
+    local lane = lanes[spec.key]
+    if wx_custom_button(ctx, ((lane.enabled and "● " or "○ ") .. spec.label .. "##lane_toggle_" .. side_key .. "_" .. spec.key), label_w - 8, 0, state.wx_slider_style) then
+      lane.enabled = not lane.enabled
+      changed = true
+    end
+    ImGui.SameLine(ctx, 0, 8)
+    ImGui.InvisibleButton(ctx, "##lane_canvas_" .. side_key .. "_" .. spec.key, graph_w - label_w, lane_h)
+    local x0, y0 = ImGui.GetItemRectMin(ctx)
+    local x1, y1 = ImGui.GetItemRectMax(ctx)
+    local dl = ImGui.GetWindowDrawList and ImGui.GetWindowDrawList(ctx)
+    local hovered = ImGui.IsItemHovered and ImGui.IsItemHovered(ctx)
+    local mx, my = 0, 0
+    if ImGui.GetMousePos then
+      mx, my = ImGui.GetMousePos(ctx)
+    end
+    local lmx, lmy = mx, my
+    if dl and ImGui.DrawList_AddRectFilled then
+      ImGui.DrawList_AddRectFilled(dl, x0, y0, x1, y1, lane.enabled and 0x1A1F1AFF or 0x141414FF, 3)
+      if ImGui.DrawList_AddRect then
+        ImGui.DrawList_AddRect(dl, x0, y0, x1, y1, lane.enabled and 0x395C39FF or 0x303030FF, 3)
+      end
+    end
+    local min_v, max_v = spec.min, spec.max
+    local vr = math.max(1e-9, max_v - min_v)
+    local function v_to_py(v)
+      local u = (math.max(min_v, math.min(max_v, v)) - min_v) / vr
+      return y1 - u * (y1 - y0)
+    end
+    local function py_to_v(py)
+      local u = (y1 - py) / math.max(1, (y1 - y0))
+      local v = min_v + math.max(0, math.min(1, u)) * vr
+      if spec.integer then v = math.floor(v + 0.5) end
+      return math.max(min_v, math.min(max_v, v))
+    end
+    local nearest_idx, nearest_d = nil, 9999
+    for pidx = 1, #lane.points do
+      local px = to_px(lane.points[pidx].t or 0, x0, x1)
+      local py = v_to_py(lane.points[pidx].v or min_v)
+      local d = math.sqrt((lmx - px) * (lmx - px) + (lmy - py) * (lmy - py))
+      if d < nearest_d then
+        nearest_d = d
+        nearest_idx = pidx
+      end
+    end
+    local function lane_insert_point_at_mouse()
+      local nt = math.max(0, math.min(1, (lmx - x0) / math.max(1, x1 - x0)))
+      local nv = py_to_v(lmy)
+      local insert_idx = #lane.points + 1
+      for pidx = 2, #lane.points do
+        if nt < (lane.points[pidx].t or 0) then
+          insert_idx = pidx
+          break
+        end
+      end
+      local old_ln = #lane.points
+      table.insert(lane.points, insert_idx, { t = nt, v = nv })
+      table.insert(lane.curves, math.max(1, insert_idx - 1), 0)
+      lane.curve_blends = anim_graph_blends_on_point_insert(lane.curve_blends or {}, insert_idx, old_ln)
+      changed = true
+    end
+    local function lane_segment_at_mouse()
+      if #lane.points < 2 then
+        return nil
+      end
+      local nt = math.max(0, math.min(1, (lmx - x0) / math.max(1, x1 - x0)))
+      local best_i, best_d = nil, math.huge
+      for pidx = 1, #lane.points - 1 do
+        local t0 = lane.points[pidx].t or 0
+        local t1 = lane.points[pidx + 1].t or 1
+        if nt >= math.min(t0, t1) and nt <= math.max(t0, t1) then
+          return pidx
+        end
+        local mid = (t0 + t1) * 0.5
+        local d = math.abs(nt - mid)
+        if d < best_d then
+          best_d = d
+          best_i = pidx
+        end
+      end
+      return best_i
+    end
+    if hovered and lane.enabled and ImGui.IsMouseDoubleClicked and ImGui.IsMouseDoubleClicked(ctx, MOUSE_LEFT) then
+      if not (nearest_idx and nearest_d <= 8) then
+        lane_insert_point_at_mouse()
+      end
+    elseif hovered and lane.enabled and ImGui.IsMouseClicked and ImGui.IsMouseClicked(ctx, MOUSE_LEFT) then
+      local seg_hit = lane_segment_at_mouse()
+      if seg_hit and (not nearest_idx or nearest_d > 8) then
+        lane.curve_blends = lane.curve_blends or {}
+        state.anim_graph_editor_lane_seg_lane = spec.key
+        state.anim_graph_editor_lane_seg_idx = seg_hit
+        state.anim_graph_editor_lane_seg_my0 = lmy
+        state.anim_graph_seg_mode1_bias0 = anim_graph_seg_read_mode1_bias(lane.curve_blends, lane.curves, seg_hit)
+        if ImGui.ResetMouseDragDelta then
+          pcall(ImGui.ResetMouseDragDelta, ctx)
+        end
+        changed = true
+      elseif nearest_idx and nearest_d <= 8 then
+        if overlay_mod_alt(ctx) and #lane.points > 2 and nearest_idx > 1 and nearest_idx < #lane.points then
+          local old_pn = #lane.points
+          table.remove(lane.points, nearest_idx)
+          table.remove(lane.curves, math.max(1, nearest_idx - 1))
+          lane.curve_blends = anim_graph_blends_on_point_remove(lane.curve_blends or {}, nearest_idx, old_pn)
+          changed = true
+        else
+          state.anim_graph_editor_auto_drag_lane = spec.key
+          state.anim_graph_editor_auto_drag_point = nearest_idx
+        end
+      end
+    end
+    if not (ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT)) then
+      state.anim_graph_editor_auto_drag_lane = ""
+      state.anim_graph_editor_auto_drag_point = nil
+      state.anim_graph_editor_lane_seg_lane = ""
+      state.anim_graph_editor_lane_seg_idx = nil
+      state.anim_graph_editor_lane_seg_my0 = nil
+      state.anim_graph_editor_lane_seg_c0 = nil
+      state.anim_graph_seg_mode1_bias0 = nil
+    end
+    if lane.enabled and state.anim_graph_editor_auto_drag_lane == spec.key and state.anim_graph_editor_auto_drag_point and ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT) then
+      local pidx = state.anim_graph_editor_auto_drag_point
+      if lane.points[pidx] then
+        if pidx ~= 1 and pidx ~= #lane.points then
+          local mt = (lane.points[pidx - 1].t or 0) + 0.01
+          local xt = (lane.points[pidx + 1].t or 1) - 0.01
+          lane.points[pidx].t = math.max(mt, math.min(xt, (lmx - x0) / math.max(1, x1 - x0)))
+        end
+        lane.points[pidx].v = py_to_v(lmy)
+        changed = true
+      end
+    end
+    if lane.enabled and state.anim_graph_editor_lane_seg_lane == spec.key and state.anim_graph_editor_lane_seg_idx and ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT) then
+      local si = state.anim_graph_editor_lane_seg_idx
+      lane.curves = lane.curves or {}
+      if si >= 1 and si <= #lane.points - 1 then
+        lane.curve_blends = lane.curve_blends or {}
+        local ddy = 0
+        if ImGui.GetMouseDragDelta then
+          local ok, _, got_dy = pcall(ImGui.GetMouseDragDelta, ctx, MOUSE_LEFT)
+          if ok and type(got_dy) == "number" then
+            ddy = got_dy
+          end
+        else
+          ddy = lmy - (state.anim_graph_editor_lane_seg_my0 or lmy)
+          state.anim_graph_editor_lane_seg_my0 = lmy
+        end
+        if math.abs(ddy) > 0 then
+          local b0 = anim_graph_seg_read_mode1_bias(lane.curve_blends, lane.curves, si)
+          local b = math.max(-1, math.min(1, b0 - ddy * 0.02))
+          local ob = lane.curve_blends[si]
+          if ob ~= b and not (type(ob) == "number" and math.abs(ob - b) < 1e-6) then
+            lane.curve_blends[si] = b
+            lane.curves[si] = anim_graph_mode1_representative_curve(b)
+            changed = true
+          end
+          if ImGui.ResetMouseDragDelta then
+            pcall(ImGui.ResetMouseDragDelta, ctx)
+          end
+        end
+      end
+    end
+    if hovered and lane.enabled and ImGui.IsMouseClicked and ImGui.IsMouseClicked(ctx, MOUSE_RIGHT) then
+      local seg_idx, seg_dist = nil, 9999
+      for pidx = 1, #lane.points - 1 do
+        local ax = to_px(lane.points[pidx].t, x0, x1)
+        local ay = v_to_py(lane.points[pidx].v)
+        local bx = to_px(lane.points[pidx + 1].t, x0, x1)
+        local by = v_to_py(lane.points[pidx + 1].v)
+        local d = anim_graph_curve_seg_pick_dist(lmx, lmy, ax, ay, bx, by, lane.curves[pidx] or 0, 8, lane.curve_blends and lane.curve_blends[pidx])
+        if d < seg_dist then
+          seg_dist = d
+          seg_idx = pidx
+        end
+      end
+      if seg_idx and seg_dist <= 14 and ImGui.OpenPopup then
+        state.anim_graph_editor_popup_seg = seg_idx
+        state.anim_graph_editor_auto_drag_lane = spec.key
+        ImGui.OpenPopup(ctx, "##lane_curve_popup_" .. side_key .. "_" .. spec.key)
+      end
+    end
+    if ImGui.BeginPopup and ImGui.BeginPopup(ctx, "##lane_curve_popup_" .. side_key .. "_" .. spec.key) then
+      local seg = state.anim_graph_editor_popup_seg or 1
+      ImGui.Text(ctx, spec.label .. " segment curve")
+      for ci = 0, ANIM_GRAPH_CURVE_MAX do
+        if ImGui.Selectable(ctx, anim_graph_curve_name(ci), (lane.curves[seg] or 0) == ci) then
+          lane.curves[seg] = ci
+          lane.curve_blends = lane.curve_blends or {}
+          lane.curve_blends[seg] = nil
+          changed = true
+        end
+      end
+      ImGui.EndPopup(ctx)
+    end
+    if dl then
+      for pidx = 1, #lane.points - 1 do
+        local ax = to_px(lane.points[pidx].t, x0, x1)
+        local ay = v_to_py(lane.points[pidx].v)
+        local bx = to_px(lane.points[pidx + 1].t, x0, x1)
+        local by = v_to_py(lane.points[pidx + 1].v)
+        local lb = lane.curve_blends and lane.curve_blends[pidx]
+        anim_draw_curve_segment(dl, ax, ay, bx, by, lane.curves and lane.curves[pidx] or 0, lane.enabled and 0x83C9A4FF or 0x606060FF, 2, lb)
+        anim_draw_segment_time_arrow(dl, ax, ay, bx, by, lane.curves and lane.curves[pidx] or 0, lane.enabled and 0xB8E8C8FF or 0x909090FF, lb)
+      end
+      for pidx = 1, #lane.points do
+        local px = to_px(lane.points[pidx].t, x0, x1)
+        local py = v_to_py(lane.points[pidx].v)
+        if ImGui.DrawList_AddCircleFilled then
+          ImGui.DrawList_AddCircleFilled(dl, px, py, 4.4, lane.enabled and 0xF0F0F0FF or 0x8A8A8AFF)
+        end
+      end
+    end
+  end
+  if changed then
+    state[key] = anim_graph_auto_encode_blob(lanes)
+  end
+  return changed
 end
 
 function anim_graph_editor_ui(ctx)
@@ -6123,15 +7868,21 @@ function anim_graph_editor_ui(ctx)
   local pts = state.anim_graph_editor_points or {}
   local curves = state.anim_graph_editor_curves or {}
   if #pts < 2 then
-    pts, curves = anim_graph_decode_blob(anim_graph_default_blob())
+    local bb
+    pts, curves, bb = anim_graph_decode_blob(anim_graph_default_blob())
     state.anim_graph_editor_points = pts
     state.anim_graph_editor_curves = curves
+    state.anim_graph_editor_blends = bb
   end
+  if type(state.anim_graph_editor_blends) ~= "table" then
+    state.anim_graph_editor_blends = {}
+  end
+  local blends = state.anim_graph_editor_blends
   state.anim_graph_editor_selected = math.max(1, math.min(#pts, state.anim_graph_editor_selected or 1))
 
   local side_label = anim_graph_find_side_label(state.anim_graph_editor_side_key)
   ImGui.Text(ctx, side_label .. " custom path")
-  ImGui.TextColored(ctx, 0x9A9A9AFF, "Left click empty graph to add points, drag points in graph, drag timeline handles to retime.")
+  ImGui.TextColored(ctx, 0x9A9A9AFF, "Double-click empty area to add points; drag points and timeline handles; Alt+click deletes an interior point. Drag a segment (not near nodes) to scrub In Log ↔ Linear ↔ Out Exp smoothly (family 1); X cycles quad/square/log-exp; Tab steps discrete presets in the current family. Right-click segment for the full list. Labels show point index and t; path X is motion in the comp—the arrow follows timeline time.")
   ImGui.Spacing(ctx)
 
   local graph_w = 520
@@ -6149,6 +7900,7 @@ function anim_graph_editor_ui(ctx)
   local ix0, iy0 = gx0 + pad, gy0 + pad
   local ix1, iy1 = gx1 - pad, gy1 - pad
   local iw, ih = math.max(1, ix1 - ix0), math.max(1, iy1 - iy0)
+  local gmx, gmy = mx, my
   local function sx_to_px(v)
     return ix0 + ((math.max(-1, math.min(1, v)) + 1) * 0.5) * iw
   end
@@ -6179,19 +7931,48 @@ function anim_graph_editor_ui(ctx)
   local nearest_idx, nearest_d = nil, 1e9
   for i = 1, #pts do
     local px, py = sx_to_px(pts[i].x or 0), sy_to_py(pts[i].y or 0)
-    local d = math.sqrt((mx - px) * (mx - px) + (my - py) * (my - py))
+    local d = math.sqrt((gmx - px) * (gmx - px) + (gmy - py) * (gmy - py))
     if d < nearest_d then
       nearest_d = d
       nearest_idx = i
     end
   end
   if hovered and ImGui.IsMouseClicked and ImGui.IsMouseClicked(ctx, MOUSE_LEFT) then
-    if nearest_idx and nearest_d <= 10 then
-      state.anim_graph_editor_selected = nearest_idx
-      state.anim_graph_editor_drag_point = nearest_idx
-    else
-      local nx = px_to_sx(mx)
-      local ny = py_to_sy(my)
+    local seg_pick_idx, seg_pick_d = nil, 1e9
+    for si = 1, #pts - 1 do
+      local ax, ay = sx_to_px(pts[si].x), sy_to_py(pts[si].y)
+      local bx, by = sx_to_px(pts[si + 1].x), sy_to_py(pts[si + 1].y)
+      local d = anim_graph_curve_seg_pick_dist(gmx, gmy, ax, ay, bx, by, curves[si] or 0, 10, blends[si])
+      if d < seg_pick_d then
+        seg_pick_d = d
+        seg_pick_idx = si
+      end
+    end
+    if seg_pick_idx and seg_pick_d <= 24 and (not nearest_idx or nearest_d > 8) then
+      state.anim_graph_editor_selected = seg_pick_idx
+      state.anim_graph_editor_seg_drag_seg = seg_pick_idx
+      state.anim_graph_editor_seg_drag_my0 = gmy
+      state.anim_graph_seg_mode1_bias0 = anim_graph_seg_read_mode1_bias(blends, curves, seg_pick_idx)
+      if ImGui.ResetMouseDragDelta then
+        pcall(ImGui.ResetMouseDragDelta, ctx)
+      end
+      changed = true
+    elseif nearest_idx and nearest_d <= 10 then
+      if overlay_mod_alt(ctx) and #pts > 2 and nearest_idx > 1 and nearest_idx < #pts then
+        local old_pn = #pts
+        table.remove(pts, nearest_idx)
+        table.remove(curves, math.max(1, nearest_idx - 1))
+        state.anim_graph_editor_blends = anim_graph_blends_on_point_remove(blends, nearest_idx, old_pn)
+        blends = state.anim_graph_editor_blends
+        state.anim_graph_editor_selected = math.max(1, math.min(#pts, nearest_idx - 1))
+        changed = true
+      else
+        state.anim_graph_editor_selected = nearest_idx
+        state.anim_graph_editor_drag_point = nearest_idx
+      end
+    elseif ImGui.IsMouseDoubleClicked and ImGui.IsMouseDoubleClicked(ctx, MOUSE_LEFT) then
+      local nx = px_to_sx(gmx)
+      local ny = py_to_sy(gmy)
       local nt = math.max(0, math.min(1, (nx + 1) * 0.5))
       local insert_idx = #pts + 1
       for i = 2, #pts do
@@ -6200,8 +7981,11 @@ function anim_graph_editor_ui(ctx)
           break
         end
       end
+      local old_pn = #pts
       table.insert(pts, insert_idx, { x = nx, y = ny, t = nt })
       table.insert(curves, math.max(1, insert_idx - 1), 0)
+      state.anim_graph_editor_blends = anim_graph_blends_on_point_insert(blends, insert_idx, old_pn)
+      blends = state.anim_graph_editor_blends
       for i = 1, #pts - 1 do
         if curves[i] == nil then curves[i] = 0 end
       end
@@ -6212,12 +7996,41 @@ function anim_graph_editor_ui(ctx)
   end
   if not (ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT)) then
     state.anim_graph_editor_drag_point = nil
+    state.anim_graph_editor_seg_drag_seg = nil
+    state.anim_graph_editor_seg_drag_my0 = nil
+    state.anim_graph_seg_mode1_bias0 = nil
   end
   local drag_i = state.anim_graph_editor_drag_point
-  if drag_i and pts[drag_i] and hovered and ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT) then
-    pts[drag_i].x = px_to_sx(mx)
-    pts[drag_i].y = py_to_sy(my)
+  if drag_i and not state.anim_graph_editor_seg_drag_seg and pts[drag_i] and ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT) then
+    pts[drag_i].x = px_to_sx(gmx)
+    pts[drag_i].y = py_to_sy(gmy)
     changed = true
+  end
+  local sdrag = state.anim_graph_editor_seg_drag_seg
+  if sdrag and type(sdrag) == "number" and sdrag >= 1 and sdrag <= #pts - 1 and ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT) then
+    local ddy = 0
+    if ImGui.GetMouseDragDelta then
+      local ok, _, got_dy = pcall(ImGui.GetMouseDragDelta, ctx, MOUSE_LEFT)
+      if ok and type(got_dy) == "number" then
+        ddy = got_dy
+      end
+    else
+      ddy = gmy - (state.anim_graph_editor_seg_drag_my0 or gmy)
+      state.anim_graph_editor_seg_drag_my0 = gmy
+    end
+    if math.abs(ddy) > 0 then
+      local b0 = anim_graph_seg_read_mode1_bias(blends, curves, sdrag)
+      local b = math.max(-1, math.min(1, b0 - ddy * 0.02))
+      local ob = blends[sdrag]
+      if ob ~= b and not (type(ob) == "number" and math.abs(ob - b) < 1e-6) then
+        blends[sdrag] = b
+        curves[sdrag] = anim_graph_mode1_representative_curve(b)
+        changed = true
+      end
+      if ImGui.ResetMouseDragDelta then
+        pcall(ImGui.ResetMouseDragDelta, ctx)
+      end
+    end
   end
 
   if hovered and ImGui.IsMouseClicked and ImGui.IsMouseClicked(ctx, MOUSE_RIGHT) then
@@ -6225,13 +8038,13 @@ function anim_graph_editor_ui(ctx)
     for i = 1, #pts - 1 do
       local ax, ay = sx_to_px(pts[i].x), sy_to_py(pts[i].y)
       local bx, by = sx_to_px(pts[i + 1].x), sy_to_py(pts[i + 1].y)
-      local d = point_to_segment_dist(mx, my, ax, ay, bx, by)
+      local d = anim_graph_curve_seg_pick_dist(gmx, gmy, ax, ay, bx, by, curves[i] or 0, 10, blends[i])
       if d < seg_dist then
         seg_dist = d
         seg_idx = i
       end
     end
-    if seg_idx and seg_dist <= 10 then
+    if seg_idx and seg_dist <= 14 then
       state.anim_graph_editor_popup_seg = seg_idx
       if ImGui.OpenPopup then
         ImGui.OpenPopup(ctx, "##anim_graph_seg_curve_popup")
@@ -6245,6 +8058,7 @@ function anim_graph_editor_ui(ctx)
       local selected = (curves[seg] or 0) == ci
       if ImGui.Selectable(ctx, anim_graph_curve_name(ci), selected) then
         curves[seg] = ci
+        blends[seg] = nil
         changed = true
       end
     end
@@ -6255,10 +8069,10 @@ function anim_graph_editor_ui(ctx)
     for i = 1, #pts - 1 do
       local ax, ay = sx_to_px(pts[i].x), sy_to_py(pts[i].y)
       local bx, by = sx_to_px(pts[i + 1].x), sy_to_py(pts[i + 1].y)
-      local cc = (curves[i] or 0) == ANIM_GRAPH_CURVE_MAX and 0x7DA2FFFF or 0x65D6A0FF
-      if ImGui.DrawList_AddLine then
-        ImGui.DrawList_AddLine(dl, ax, ay, bx, by, cc, 2)
-      end
+      local cc = (curves[i] or 0) == ANIM_GRAPH_CURVE_SQUARE and 0x7DA2FFFF or 0x65D6A0FF
+      local bb = blends[i]
+      anim_draw_curve_segment(dl, ax, ay, bx, by, curves[i] or 0, cc, 2, bb)
+      anim_draw_segment_time_arrow(dl, ax, ay, bx, by, curves[i] or 0, (curves[i] or 0) == ANIM_GRAPH_CURVE_SQUARE and 0xB0C8F0FF or 0xB8F0D8FF, bb)
     end
     for i = 1, #pts do
       local px, py = sx_to_px(pts[i].x), sy_to_py(pts[i].y)
@@ -6267,7 +8081,7 @@ function anim_graph_editor_ui(ctx)
         ImGui.DrawList_AddCircleFilled(dl, px, py, 5.2, col)
       end
       if ImGui.DrawList_AddText then
-        ImGui.DrawList_AddText(dl, px + 6, py - 6, 0xD0D0D0FF, tostring(i - 1))
+        ImGui.DrawList_AddText(dl, px + 6, py - 6, 0xD0D0D0FF, string.format("%d  t=%.2f", i - 1, pts[i].t or 0))
       end
     end
   end
@@ -6283,6 +8097,7 @@ function anim_graph_editor_ui(ctx)
   local lx0, lx1 = tx0 + tl_pad, tx1 - tl_pad
   local ly = ty0 + (ty1 - ty0) * 0.52
   local lrange = math.max(1, lx1 - lx0)
+  local tmx, tmy = mx, my
   local function t_to_px(v)
     return lx0 + math.max(0, math.min(1, v)) * lrange
   end
@@ -6299,25 +8114,35 @@ function anim_graph_editor_ui(ctx)
   local nearest_t_idx, nearest_t_d = nil, 1e9
   for i = 1, #pts do
     local px = t_to_px(pts[i].t or 0)
-    local d = math.abs(mx - px) + math.abs(my - ly)
+    local d = math.abs(tmx - px) + math.abs(tmy - ly)
     if d < nearest_t_d then
       nearest_t_d = d
       nearest_t_idx = i
     end
   end
   if thover and ImGui.IsMouseClicked and ImGui.IsMouseClicked(ctx, MOUSE_LEFT) and nearest_t_idx and nearest_t_d < 14 then
-    state.anim_graph_editor_selected = nearest_t_idx
-    state.anim_graph_editor_drag_t = nearest_t_idx
+    if overlay_mod_alt(ctx) and #pts > 2 and nearest_t_idx > 1 and nearest_t_idx < #pts then
+      local old_pn = #pts
+      table.remove(pts, nearest_t_idx)
+      table.remove(curves, math.max(1, nearest_t_idx - 1))
+      state.anim_graph_editor_blends = anim_graph_blends_on_point_remove(blends, nearest_t_idx, old_pn)
+      blends = state.anim_graph_editor_blends
+      state.anim_graph_editor_selected = math.max(1, math.min(#pts, nearest_t_idx - 1))
+      changed = true
+    else
+      state.anim_graph_editor_selected = nearest_t_idx
+      state.anim_graph_editor_drag_t = nearest_t_idx
+    end
   end
   if not (ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT)) then
     state.anim_graph_editor_drag_t = nil
   end
   local drag_ti = state.anim_graph_editor_drag_t
-  if drag_ti and pts[drag_ti] and thover and ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT) then
+  if drag_ti and pts[drag_ti] and ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT) then
     if drag_ti ~= 1 and drag_ti ~= #pts then
       local min_t = (pts[drag_ti - 1].t or 0) + 0.01
       local max_t = (pts[drag_ti + 1].t or 1) - 0.01
-      pts[drag_ti].t = math.max(min_t, math.min(max_t, px_to_t(mx)))
+      pts[drag_ti].t = math.max(min_t, math.min(max_t, px_to_t(tmx)))
       changed = true
     end
   end
@@ -6335,6 +8160,11 @@ function anim_graph_editor_ui(ctx)
   end
 
   ImGui.Spacing(ctx)
+  ImGui.TextColored(ctx, 0x9A9A9AFF, "Custom look automation lanes (click lane title to enable/disable)")
+  if anim_graph_auto_lanes_ui(ctx, state.anim_graph_editor_side_key or "in") then
+    changed = true
+  end
+  ImGui.Spacing(ctx)
   local sel = state.anim_graph_editor_selected or 1
   if pts[sel] then
     ImGui.Text(ctx, string.format("Point %d  x %.2f  y %.2f  t %.2f", sel - 1, pts[sel].x or 0, pts[sel].y or 0, pts[sel].t or 0))
@@ -6343,8 +8173,11 @@ function anim_graph_editor_ui(ctx)
     if wx_custom_button(ctx, "Delete selected point", 180, 0, state.wx_slider_style) then
       local si = state.anim_graph_editor_selected or 1
       if si > 1 and si < #pts then
+        local old_pn = #pts
         table.remove(pts, si)
         table.remove(curves, math.max(1, si - 1))
+        state.anim_graph_editor_blends = anim_graph_blends_on_point_remove(blends, si, old_pn)
+        blends = state.anim_graph_editor_blends
         for i = 1, #pts - 1 do
           if curves[i] == nil then curves[i] = 0 end
         end
@@ -6355,10 +8188,12 @@ function anim_graph_editor_ui(ctx)
     ImGui.SameLine(ctx, 0, 8)
   end
   if wx_custom_button(ctx, "Reset path", 120, 0, state.wx_slider_style) then
-    local rp, rc = anim_graph_decode_blob(anim_graph_default_blob())
+    local rp, rc, rb = anim_graph_decode_blob(anim_graph_default_blob())
     state.anim_graph_editor_points = rp
     state.anim_graph_editor_curves = rc
+    state.anim_graph_editor_blends = rb
     pts, curves = rp, rc
+    blends = rb
     state.anim_graph_editor_selected = 1
     changed = true
   end
@@ -6378,12 +8213,18 @@ end
 
 function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   local typ_i = math.floor(tonumber(typ) or 0)
+  local custom_like = (typ_i > ANIM_TYPE_MAX) or (typ_i == ANIM_KIND.CUSTOM)
   local uses_motion = anim_type_uses_motion(typ)
   local uses_wiggle = anim_type_uses_wiggle(typ)
   local uses_bounce = anim_uses_bounce(typ, curve)
   local uses_dupes = anim_type_uses_duplicates(typ)
   local uses_blur = anim_type_uses_blur(typ)
-  local uses_dir = typ_i >= ANIM_KIND.CUSTOM
+  local uses_dir = custom_like or typ_i == ANIM_KIND.WIPE_REVEAL or typ_i == ANIM_KIND.SQUASH or typ_i == ANIM_KIND.STRETCH
+  local auto_lanes = uses_dir and anim_graph_auto_decode_blob(state[anim_graph_auto_blob_key(side_key)] or "", side_key) or nil
+  local function lane_on(k)
+    local lane = auto_lanes and auto_lanes[k]
+    return lane and lane.enabled and true or false
+  end
   local twist_key = (side_key == "phrase_out") and "anim_phrase_out_twist" or ("anim_" .. side_key .. "_twist")
   if
     not (uses_motion or uses_wiggle or uses_bounce or uses_dupes or uses_dir or uses_blur or typ_i == 0)
@@ -6408,7 +8249,9 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   end
   if uses_motion then
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("motion")) end
     local rv, v = anim_pct_slider(ctx, "##" .. side_key .. "_motion", "motion", state["anim_" .. side_key .. "_motion"], 300, 12)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv then
       state["anim_" .. side_key .. "_motion"] = v
       changed = true
@@ -6416,21 +8259,27 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   end
   if uses_wiggle then
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("wiggle")) end
     local rv, v = anim_pct_slider(ctx, "##" .. side_key .. "_wiggle", "wiggle", state["anim_" .. side_key .. "_wiggle"], 300, 12)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv then
       state["anim_" .. side_key .. "_wiggle"] = v
       changed = true
     end
   end
-  if typ_i >= ANIM_KIND.CUSTOM then
+  if custom_like then
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("scale")) end
     local rv_s, vs = anim_signed_pct_slider(ctx, "##" .. side_key .. "_scale", "scale", state["anim_" .. side_key .. "_scale"], -100, 200, 12)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv_s then
       state["anim_" .. side_key .. "_scale"] = vs
       changed = true
     end
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("fade")) end
     local rv_f, vf = anim_pct_slider(ctx, "##" .. side_key .. "_fade", "fade", state["anim_" .. side_key .. "_fade"], 100, 10)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv_f then
       state["anim_" .. side_key .. "_fade"] = vf
       changed = true
@@ -6438,7 +8287,9 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   end
   if uses_blur then
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("blur")) end
     local rv_b, vb = anim_pct_slider(ctx, "##" .. side_key .. "_blur", "blur", state["anim_" .. side_key .. "_blur"], 300, 10)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv_b then
       state["anim_" .. side_key .. "_blur"] = vb
       changed = true
@@ -6446,7 +8297,9 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   end
   if uses_bounce then
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("bounce")) end
     local rv, v = anim_pct_slider(ctx, "##" .. side_key .. "_bounce", "bounce", state["anim_" .. side_key .. "_bounce"], 200, 12)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv then
       state["anim_" .. side_key .. "_bounce"] = v
       changed = true
@@ -6454,14 +8307,18 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   end
   if uses_dupes then
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("dupes")) end
     local dupes = math.max(1, math.min(ANIM_MAX_DUPES, math.floor(tonumber(state["anim_" .. side_key .. "_dupes"]) or 3)))
     local rv_d, dupes2 = wx_custom_slider_int(ctx, "##" .. side_key .. "_dupes", "dupes", dupes, 1, ANIM_MAX_DUPES, "%d", anim_combo_w(ctx, 10, 92), state.wx_slider_style, nil, nil, nil, true)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv_d then
       state["anim_" .. side_key .. "_dupes"] = math.max(1, math.min(ANIM_MAX_DUPES, math.floor(dupes2 or dupes)))
       changed = true
     end
     same()
+    if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("ghost")) end
     local rv, v = anim_pct_slider(ctx, "##" .. side_key .. "_ghost", "ghost", state["anim_" .. side_key .. "_ghost"], 200, 11)
+    if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
     if rv then
       state["anim_" .. side_key .. "_ghost"] = v
       changed = true
@@ -6481,9 +8338,11 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
     end
   end
   same2()
+  if ImGui.BeginDisabled then ImGui.BeginDisabled(ctx, lane_on("twist")) end
   local tw = math.floor((tonumber(state[twist_key]) or 0) + 0.5)
   local rv_tw, tw2 =
     wx_degree_knob_int(ctx, "##" .. side_key .. "_twist", "twist", tw, -720, 720, "%d deg", anim_combo_w(ctx, 10, 96), state.wx_slider_style, 0)
+  if ImGui.EndDisabled then ImGui.EndDisabled(ctx) end
   if rv_tw then
     state[twist_key] = math.max(-720, math.min(720, tonumber(tw2) or tw))
     changed = true
@@ -6498,7 +8357,7 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
     end
     same2()
     if ImGui.BeginDisabled then
-      ImGui.BeginDisabled(ctx, state[use_graph_key] and true or false)
+      ImGui.BeginDisabled(ctx, (state[use_graph_key] and true or false) or lane_on("dir"))
     end
     local dir = math.floor((tonumber(state["anim_" .. side_key .. "_dir"]) or 90) + 0.5)
     local rv_dir, dir2 =
@@ -6579,48 +8438,63 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   return true, changed
 end
 
---- One row index `li` (1..6): size + randomize on one line; moving Randomize respawns that row’s jitter only.
-local function ui_ml_row_controls(ctx, item, li)
-  ImGui.PushID(ctx, li * 137 + 8000)
-  if ImGui.AlignTextToFramePadding then
-    ImGui.AlignTextToFramePadding(ctx)
-  end
-  ImGui.Text(ctx, string.format("Row %d", li))
-  ImGui.SameLine(ctx, 0, 5)
-  local changed = false
-  local sw = ml_row_slider_w(ctx)
-  if ImGui.PushItemWidth then
-    ImGui.PushItemWidth(ctx, sw)
-  end
-  local pct = math.floor((state.ml_s[li] or 1) * 100 + 0.5)
-  local rp = math.floor((state.ml_r[li] or 0) * 100 + 0.5)
-  local rv2, pct2, rv3, rp2 = wx_custom_slider_int(ctx, "##mlsz" .. li, "Size", pct, 12, 300, "%d%%", sw * 2.1, state.wx_slider_style, rp, 100, "± %d%%")
-  if rv2 then
-    state.ml_s[li] = math.max(0.12, math.min(3, pct2 / 100))
-    changed = true
-  end
-  if rv3 then
-    state.ml_r[li] = math.max(0, math.min(1, rp2 / 100))
-    state.ml_jitter[li] = math.random() * 2 - 1
-    persist_ml_jitter()
-    changed = true
-  end
-  if ImGui.SetItemTooltip then
-    ImGui.SetItemTooltip(ctx, "Size for this row as % of Video Processor fontPx. ± is random span.")
-  end
-  ImGui.PopID(ctx)
-  if changed then
-    refresh_preview(item)
-  end
-end
+do
+  local ctx = ImGui.CreateContext(WINDOW_TITLE)
 
-local ctx = ImGui.CreateContext(WINDOW_TITLE)
+  --- One row index `li` (1..6): size + randomize on one line; moving Randomize respawns that row’s jitter only.
+  --- Optional `slot_w`: total width for the slider when laid out in adaptive multi-column flow.
+  local function ui_ml_row_controls(ctx, item, li, slot_w)
+    ImGui.PushID(ctx, li * 137 + 8000)
+    if ImGui.AlignTextToFramePadding then
+      ImGui.AlignTextToFramePadding(ctx)
+    end
+    local row_label = string.format("Row %d", li)
+    local label_w = wx_text_size(ctx, row_label)
+    local label_gap = 5
+    ImGui.Text(ctx, row_label)
+    ImGui.SameLine(ctx, 0, label_gap)
+    local changed = false
+    local default_total = ml_row_slider_w(ctx) * 2.1
+    local slot_total = tonumber(slot_w)
+    local slider_w = slot_total and math.max(1, math.floor(slot_total - label_w - label_gap + 0.5)) or default_total
+    local sw = slider_w / 2.1
+    local _iw_pushed = false
+    if ImGui.PushItemWidth then
+      ImGui.PushItemWidth(ctx, sw)
+      _iw_pushed = true
+    end
+    local pct = math.floor((state.ml_s[li] or 1) * 100 + 0.5)
+    local rp = math.floor((state.ml_r[li] or 0) * 100 + 0.5)
+    local rv2, pct2, rv3, rp2 = wx_custom_slider_int(ctx, "##mlsz" .. li, "Size", pct, 12, 300, "%d%%", slider_w, state.wx_slider_style, rp, 100, "± %d%%")
+    if rv2 then
+      state.ml_s[li] = math.max(0.12, math.min(3, pct2 / 100))
+      changed = true
+    end
+    if rv3 then
+      state.ml_r[li] = math.max(0, math.min(1, rp2 / 100))
+      state.ml_jitter[li] = math.random() * 2 - 1
+      persist_ml_jitter()
+      changed = true
+    end
+    if ImGui.SetItemTooltip then
+      ImGui.SetItemTooltip(ctx, "Size for this row as % of Video Processor fontPx. ± is random span.")
+    end
+    if _iw_pushed and ImGui.PopItemWidth then
+      ImGui.PopItemWidth(ctx)
+    end
+    ImGui.PopID(ctx)
+    if changed then
+      refresh_preview(item)
+      overlay_request_autosave()
+    end
+  end
 
-local function loop()
+  local function loop()
   local flags = ImGui.WindowFlags_NoCollapse
   ImGui.SetNextWindowSize(ctx, 620, 640, ImGui.Cond_FirstUseEver)
   local visible, open = ImGui.Begin(ctx, WINDOW_TITLE, true, flags)
   if visible then
+    wx_bridge_transport_spacebar(ctx)
     local item = nil
     if r.CountSelectedMediaItems(0) == 1 then
       item = r.GetSelectedMediaItem(0, 0)
@@ -6630,6 +8504,8 @@ local function loop()
     if item then
       take, words = W.find_take_and_wx_words(item)
     end
+
+    anim_graph_update_live_vp_coalesce()
 
     wx_draw_hint_row_with_gear(ctx, "")
     ImGui.Separator(ctx)
@@ -6647,6 +8523,7 @@ local function loop()
     end
     if key ~= state.overlay_source_key then
       state.overlay_source_key = key
+      state.overlay_autosave_sig_saved = nil
       if words and #words > 0 then
         local same_item = (guid ~= "" and guid == state.tracked_item_guid)
         if state.preset_idx == 3 and same_item and (state.ml_word_n or 0) > 0 then
@@ -6673,11 +8550,6 @@ local function loop()
     end
 
     if item and words and #words > 0 then
-      local rv_float, v_float = ImGui.Checkbox(ctx, "Float words panel", state.word_grid_floating)
-      if rv_float then
-        state.word_grid_floating = v_float and true or false
-        r.SetExtState(SECTION, "WORD_GRID_FLOAT", state.word_grid_floating and "1" or "0", true)
-      end
       if not state.word_grid_floating then
         word_grid_ui(ctx, item, words)
       end
@@ -6716,7 +8588,10 @@ local function loop()
           if r.MarkProjectDirty then
             r.MarkProjectDirty(0)
           end
-          state.status = "Layout saved on item (P_EXT) + bridge extstate (phrases/rows/scales)."
+          ml_sync_editor_text(words)
+          state.overlay_autosave_sig_saved = overlay_autosave_state_sig(words)
+          state.status =
+            "Layout saved on item (P_EXT) + bridge extstate — edits to words and settings also autosave here when subtitle parses."
           state.status_err = false
         else
           state.status = "Could not write extended state on this item (REAPER too old?)."
@@ -6810,6 +8685,86 @@ local function loop()
 
     font_selector_ui(ctx, item)
 
+    ImGui.Spacing(ctx)
+    separator_text(ctx, "Video ratio guides")
+    local changed_guides = false
+    local guide_flags = 0
+    if ImGui.TableFlags_SizingStretchProp then
+      guide_flags = guide_flags | ImGui.TableFlags_SizingStretchProp
+    end
+    if ImGui.BeginTable and ImGui.BeginTable(ctx, "##video_ratio_guides", 3, guide_flags) then
+      for i, guide in ipairs(VIDEO_RATIO_GUIDES) do
+        if (i - 1) % 3 == 0 then
+          ImGui.TableNextRow(ctx)
+        end
+        ImGui.TableNextColumn(ctx)
+        local rv_g, on_g = ImGui.Checkbox(ctx, guide.label .. "##video_guide_" .. guide.id, state.video_guides[guide.id] and true or false)
+        if rv_g then
+          state.video_guides[guide.id] = on_g and true or false
+          r.SetExtState(SECTION, guide.key, state.video_guides[guide.id] and "1" or "0", true)
+          changed_guides = true
+        end
+      end
+      ImGui.EndTable(ctx)
+    else
+      for i, guide in ipairs(VIDEO_RATIO_GUIDES) do
+        if i > 1 then
+          ImGui.SameLine(ctx, 0, 10)
+        end
+        local rv_g, on_g = ImGui.Checkbox(ctx, guide.label .. "##video_guide_fallback_" .. guide.id, state.video_guides[guide.id] and true or false)
+        if rv_g then
+          state.video_guides[guide.id] = on_g and true or false
+          r.SetExtState(SECTION, guide.key, state.video_guides[guide.id] and "1" or "0", true)
+          changed_guides = true
+        end
+      end
+    end
+    if changed_guides then
+      state._last_vp_body = nil
+      refresh_preview(item)
+      overlay_request_autosave()
+    end
+    ImGui.TextColored(ctx, 0x777777FF, "Guides are drawn as colored borders in the Video Processor; multiple ratios can be enabled.")
+
+    ImGui.Spacing(ctx)
+    separator_text(ctx, "Image post FX")
+    local changed_post = false
+    local rv_post, post_on = ImGui.Checkbox(ctx, "Wave-warp keyed text image", state.img_post_wave and true or false)
+    if rv_post then
+      state.img_post_wave = post_on and true or false
+      r.SetExtState(SECTION, "IMG_POST_WAVE", state.img_post_wave and "1" or "0", true)
+      changed_post = true
+    end
+    if state.img_post_wave then
+      local rv_amp, amp2 = ImGui.DragDouble(ctx, "Wave amp px##img_post_wave_amp", state.img_post_wave_amp or 24, 0.5, 0, 240, "%.1f")
+      if rv_amp then
+        state.img_post_wave_amp = math.max(0, math.min(240, amp2 or 24))
+        r.SetExtState(SECTION, "IMG_POST_WAVE_AMP", string.format("%.17g", state.img_post_wave_amp), true)
+        changed_post = true
+      end
+      local rv_len, len2 = ImGui.DragDouble(ctx, "Wave length px##img_post_wave_len", state.img_post_wave_len or 90, 1, 8, 2000, "%.1f")
+      if rv_len then
+        state.img_post_wave_len = math.max(8, math.min(2000, len2 or 90))
+        r.SetExtState(SECTION, "IMG_POST_WAVE_LEN", string.format("%.17g", state.img_post_wave_len), true)
+        changed_post = true
+      end
+      local rv_speed, speed2 = ImGui.DragDouble(ctx, "Wave speed##img_post_wave_speed", state.img_post_wave_speed or 6, 0.05, -20, 20, "%.2f")
+      if rv_speed then
+        state.img_post_wave_speed = math.max(-20, math.min(20, speed2 or 6))
+        r.SetExtState(SECTION, "IMG_POST_WAVE_SPEED", string.format("%.17g", state.img_post_wave_speed), true)
+        changed_post = true
+      end
+    end
+    if changed_post then
+      state._last_vp_body = nil
+      refresh_preview(item)
+      overlay_request_autosave()
+    end
+    ImGui.TextColored(ctx, 0x777777FF, "Test pass: renders text to a green-key buffer, removes the key to alpha, then wave-warps it over the video.")
+
+    ImGui.Spacing(ctx)
+    separator_text(ctx, "Animation")
+    local changed_anim = false
     if ImGui.BeginDisabled and state.preset_idx == 0 then
       ImGui.BeginDisabled(ctx, true)
     end
@@ -6818,6 +8773,7 @@ local function loop()
       ImGui.EndDisabled(ctx)
     end
     if rv then
+      changed_anim = true
       refresh_preview(item)
     end
     if state.preset_idx ~= 0 then
@@ -6827,10 +8783,7 @@ local function loop()
         "When off: Line Full shows whole lines; Line Grow holds one static line. When on: Full grows like karaoke; Grow keeps grow. Triple-stack + karaoke: each row grows word-by-word at marker times; lower rows stay dim until the row above has finished, then brighten."
       )
     end
-
     ImGui.Spacing(ctx)
-    separator_text(ctx, "Animation")
-    local changed_anim = false
     local anim_dirty = anim_preset_is_dirty()
     local anim_preset_idx = 0
     for i = 1, #state.anim_preset_names do
@@ -6954,11 +8907,12 @@ local function loop()
       rv, state.anim_in_type = wx_custom_combo(ctx, "##entry_type", "", state.anim_in_type or 0, anim_type_combo_str(), anim_combo_w(ctx, 12, 118), state.wx_slider_style)
       if rv then
         state.anim_in_type = math.max(0, math.min(anim_type_ui_max(), state.anim_in_type or 0))
+        if state.anim_in_type == ANIM_KIND.BLUR and (tonumber(state.anim_in_blur) or 0) < 0.05 then
+          state.anim_in_blur = 1
+        end
         local custom_name = anim_custom_type_name_for_id(state.anim_in_type)
         if custom_name then
           anim_custom_type_apply_named("in", custom_name)
-        elseif state.anim_in_type == ANIM_KIND.BLUR and (tonumber(state.anim_in_blur) or 0) <= 0 then
-          state.anim_in_blur = 1
         end
         changed_anim = true
       end
@@ -7004,11 +8958,12 @@ local function loop()
       rv, state.anim_out_type = wx_custom_combo(ctx, "##exit_type", "", state.anim_out_type or 0, anim_type_combo_str(), anim_combo_w(ctx, 12, 118), state.wx_slider_style)
       if rv then
         state.anim_out_type = math.max(0, math.min(anim_type_ui_max(), state.anim_out_type or 0))
+        if state.anim_out_type == ANIM_KIND.BLUR and (tonumber(state.anim_out_blur) or 0) < 0.05 then
+          state.anim_out_blur = 1
+        end
         local custom_name = anim_custom_type_name_for_id(state.anim_out_type)
         if custom_name then
           anim_custom_type_apply_named("out", custom_name)
-        elseif state.anim_out_type == ANIM_KIND.BLUR and (tonumber(state.anim_out_blur) or 0) <= 0 then
-          state.anim_out_blur = 1
         end
         changed_anim = true
       end
@@ -7057,11 +9012,12 @@ local function loop()
       rv, state.anim_phrase_out_type = wx_custom_combo(ctx, "##phrase_exit_type", "", state.anim_phrase_out_type or state.anim_out_type or 0, anim_type_combo_str(), anim_combo_w(ctx, 12, 118), state.wx_slider_style)
       if rv then
         state.anim_phrase_out_type = math.max(0, math.min(anim_type_ui_max(), state.anim_phrase_out_type or 0))
+        if state.anim_phrase_out_type == ANIM_KIND.BLUR and (tonumber(state.anim_phrase_out_blur) or 0) < 0.05 then
+          state.anim_phrase_out_blur = 1
+        end
         local custom_name = anim_custom_type_name_for_id(state.anim_phrase_out_type)
         if custom_name then
           anim_custom_type_apply_named("phrase_out", custom_name)
-        elseif state.anim_phrase_out_type == ANIM_KIND.BLUR and (tonumber(state.anim_phrase_out_blur) or 0) <= 0 then
-          state.anim_phrase_out_blur = 1
         end
         changed_anim = true
       end
@@ -7100,6 +9056,7 @@ local function loop()
     if changed_anim then
       persist_anim_settings_extstate()
       refresh_preview(item)
+      overlay_request_autosave()
     end
 
     --[[ Subtitle draft sliders — hidden; word grid + markers drive layout for triple-stack; re-enable if non-triple presets need tuning in UI.
@@ -7218,29 +9175,31 @@ local function loop()
         open_flow = ImGui.TreeNode(ctx, "Flow & wrapping###ml_flow")
       end
       if open_flow then
-        local _mw_pushed = false
-        if ImGui.PushItemWidth then
-          ImGui.PushItemWidth(ctx, ml_stack_param_item_w(ctx))
-          _mw_pushed = true
-        end
-        local rv_mr, mr2 = wx_custom_slider_int(ctx, "##mlmr_wx", "Max rows/phrase", state.ml_max_rows, 1, 6, "%d", nil, state.wx_slider_style, nil, nil, nil, true)
+        -- Fit 2–4 controls per row depending on window width (each needs ~190px+ for labels + readout).
+        ml_layout_flow_start(ctx, 196)
+        local iw
+        iw = ml_layout_flow_next_cell(ctx)
+        local rv_mr, mr2 = wx_custom_slider_int(ctx, "##mlmr_wx", "Max rows/phrase", state.ml_max_rows, 1, 6, "%d", iw, state.wx_slider_style, nil, nil, nil, true)
         if rv_mr then
           state.ml_max_rows = math.max(1, math.min(6, mr2))
           changed_layout = true
         end
         local gap_pct = math.floor((state.ml_line_gap or 0.1) * 100 + 0.5)
-        local rv_g, gp2 = wx_custom_slider_int(ctx, "##mlgap", "Line gap (% fontPx)", gap_pct, -95, 50, "%d", nil, state.wx_slider_style)
+        iw = ml_layout_flow_next_cell(ctx)
+        local rv_g, gp2 = wx_custom_slider_int(ctx, "##mlgap", "Line gap (% fontPx)", gap_pct, -95, 50, "%d", iw, state.wx_slider_style)
         if rv_g then
           state.ml_line_gap = math.max(-0.95, math.min(0.5, gp2 / 100))
           changed_layout = true
         end
         local valign_items = "Top\0Middle\0Bottom\0"
-        local rv_va, va2 = wx_custom_combo(ctx, "##mlva", "Row V-align", state.ml_row_v_align or 0, valign_items, nil, state.wx_slider_style)
+        iw = ml_layout_flow_next_cell(ctx)
+        local rv_va, va2 = wx_custom_combo(ctx, "##mlva", "Row V-align", state.ml_row_v_align or 0, valign_items, iw, state.wx_slider_style)
         if rv_va then
           state.ml_row_v_align = math.max(0, math.min(2, va2 or 0))
           changed_layout = true
         end
-        local rv, ch1, rv2, ch2 = wx_custom_slider_int(ctx, "##mlch", "Max chars/row (0=off)", state.ml_row_chars, 0, 200, "%d", nil, state.wx_slider_style, state.ml_row_chars_rand, 80, "± %d")
+        iw = ml_layout_flow_next_cell(ctx)
+        local rv, ch1, rv2, ch2 = wx_custom_slider_int(ctx, "##mlch", "Max chars/row (0=off)", state.ml_row_chars, 0, 200, "%d", iw, state.wx_slider_style, state.ml_row_chars_rand, 80, "± %d")
         if rv then
           state.ml_row_chars = math.max(0, math.min(200, ch1))
           bump_ml_chars_seed()
@@ -7251,23 +9210,17 @@ local function loop()
           bump_ml_chars_seed()
           changed_layout = true
         end
-        if _mw_pushed and ImGui.PopItemWidth then
-          ImGui.PopItemWidth(ctx)
-        end
         ImGui.TreePop(ctx)
       end
 
       local open_indent = ImGui.TreeNode(ctx, "Indent/stagger###ml_indent")
       if open_indent then
-        local _ind_pushed = false
-        if ImGui.PushItemWidth then
-          ImGui.PushItemWidth(ctx, ml_stack_param_item_w(ctx))
-          _ind_pushed = true
-        end
+        ml_layout_flow_start(ctx, 220)
+        local iw = ml_layout_flow_next_cell(ctx)
         local step_pct = math.floor((state.ml_indent_step or 0) * 100 + 0.5)
         local ir_pct = math.floor((state.ml_indent_rand or 0) * 100 + 0.5)
         ir_pct = math.max(0, math.min(25, ir_pct))
-        local rv_is, sp2, rv_ir, ir2 = wx_custom_slider_int(ctx, "##mlinds", "Indent step (%×row idx)", step_pct, 0, 50, "%d%%", nil, state.wx_slider_style, ir_pct, 25, "± %d%%")
+        local rv_is, sp2, rv_ir, ir2 = wx_custom_slider_int(ctx, "##mlinds", "Indent step (%×row idx)", step_pct, 0, 50, "%d%%", iw, state.wx_slider_style, ir_pct, 25, "± %d%%")
         if rv_is then
           state.ml_indent_step = math.max(0, math.min(0.5, sp2 / 100))
           bump_ml_indent_seed()
@@ -7278,22 +9231,22 @@ local function loop()
           bump_ml_indent_seed()
           changed_layout = true
         end
-        if _ind_pushed and ImGui.PopItemWidth then
-          ImGui.PopItemWidth(ctx)
-        end
         ImGui.TreePop(ctx)
       end
 
       local open_rows = ImGui.TreeNode(ctx, "Per-row size/random###ml_rows")
       if open_rows then
+        ml_layout_flow_start(ctx, math.max(260, math.floor(ml_row_slider_w(ctx) * 2.05)))
         for li = 1, 6 do
-          ui_ml_row_controls(ctx, item, li)
+          local iw = ml_layout_flow_next_cell(ctx)
+          ui_ml_row_controls(ctx, item, li, iw)
         end
         ImGui.TreePop(ctx)
       end
 
       if changed_layout then
         refresh_preview(item)
+        overlay_request_autosave()
       end
 
       ImGui.Spacing(ctx)
@@ -7306,6 +9259,23 @@ local function loop()
 
     ImGui.Separator(ctx)
     refresh_preview(item)
+    local autosave_force = state.overlay_autosave_force
+    state.overlay_autosave_force = false
+    if item and words and #words > 0 then
+      ml_sync_editor_text(words)
+      local et_ok = editor_text_parse_ok(words, state.editor_text or "")
+      if et_ok and auto_persist_layout then
+        local sig = overlay_autosave_state_sig(words)
+        if autosave_force or sig ~= (state.overlay_autosave_sig_saved or "") then
+          auto_persist_layout(item, words, ctx)
+        end
+      elseif autosave_force then
+        state.overlay_autosave_force = true
+      end
+    elseif autosave_force then
+      state.overlay_autosave_force = true
+    end
+
     state.prev_words_count = (words and #words) or 0
     if item and words and #words > 0 then
       ImGui.Text(
@@ -7323,15 +9293,19 @@ local function loop()
 
     rv, state.live_gui_vp = ImGui.Checkbox(
       ctx,
-      "Live: update Video Processor while tweaking (no undo per tweak; subtitle saved to extstate for marker-sync script)",
+      "Live VP: update Video Processor when you release a slider/knob (no undo per tweak; uncheck if chunk writes glitch)",
       state.live_gui_vp
     )
     if rv then
       state._last_vp_body = nil
       r.SetExtState(SECTION, "LIVE_GUI_VP", state.live_gui_vp and "1" or "0", true)
+      overlay_request_autosave()
     end
     if state.live_gui_vp and item and words and #words > 0 and state.preview_parse_err == "" and state.preview_segs > 0 and live_vp_safe_for_chunk_write(ctx) then
-      write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
+      local ok_live = write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
+      if ok_live and state.anim_graph_vp_defer_flush then
+        state.anim_graph_vp_defer_flush = false
+      end
     end
 
     ImGui.Separator(ctx)
@@ -7349,6 +9323,7 @@ local function loop()
     ImGui.SameLine(ctx)
     if wx_custom_button(ctx, "Save settings", 120, 0, state.wx_slider_style) then
       save_settings()
+      overlay_request_autosave()
     end
     ImGui.SameLine(ctx)
     if wx_custom_button(ctx, "Close", 80, 0, state.wx_slider_style) then
@@ -7358,6 +9333,7 @@ local function loop()
     if anim_graph_editor_ui(ctx) then
       persist_anim_settings_extstate()
       refresh_preview(item)
+      overlay_request_autosave()
     end
     wx_draw_settings_modal(ctx)
     ImGui.End(ctx)
@@ -7366,6 +9342,7 @@ local function loop()
   if open and not state.should_close then
     r.defer(loop)
   end
-end
+  end
 
-r.defer(loop)
+  r.defer(loop)
+end

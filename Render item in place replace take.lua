@@ -1,5 +1,5 @@
 -- @description Render item in place (replace active take with rendered audio)
--- @version 1.13
+-- @version 1.15
 -- @author Bryan
 -- @about
 --   For each selected media item, runs REAPER's built-in "Item: render items to new take"
@@ -506,6 +506,7 @@ local function replace_with_rendered_take_only(item)
   local original_active_idx = find_active_take_index(item)
   local original_item_pos = r.GetMediaItemInfo_Value(item, "D_POSITION")
   local original_item_len = r.GetMediaItemInfo_Value(item, "D_LENGTH")
+  local original_snapoffset = r.GetMediaItemInfo_Value(item, "D_SNAPOFFSET") or 0
   local original_startoffs = r.GetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS") or 0
   local original_playrate = r.GetMediaItemTakeInfo_Value(original_active_take, "D_PLAYRATE") or 1.0
   original_playrate = math.abs(original_playrate)
@@ -514,6 +515,9 @@ local function replace_with_rendered_take_only(item)
   local render_summary = build_render_adjustment_summary(original_active_take)
   save_item_snapshot(item, render_summary)
 
+  -- Left edge of the item as used for the render command (after optional handle padding).
+  local render_ref_left = original_item_pos
+
   local function restore_original_item_bounds()
     if original_item_pos ~= nil then
       r.SetMediaItemInfo_Value(item, "D_POSITION", original_item_pos)
@@ -521,20 +525,31 @@ local function replace_with_rendered_take_only(item)
     if original_item_len ~= nil then
       r.SetMediaItemInfo_Value(item, "D_LENGTH", original_item_len)
     end
+    r.SetMediaItemInfo_Value(item, "D_SNAPOFFSET", original_snapoffset)
   end
 
-  local function source_pos_at_project_time(take, item_pos, project_time)
+  -- Render-to-new-take PCM is already time-aligned with the item timeline; mapping file seconds
+  -- to project seconds must not multiply by the *pre-render* take playrate (if REAPER copied it
+  -- onto the new take), or the left handle trim is under-counted and content shifts left.
+  local function source_pos_baked_render_take(take, item_pos, project_time)
     if not take then return nil end
     local startoffs = r.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS") or 0
-    local playrate = r.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE") or 1.0
-    playrate = math.abs(playrate)
-    if playrate == 0 then playrate = 1.0 end
-    return startoffs + ((project_time - item_pos) * playrate)
+    return startoffs + (project_time - item_pos)
+  end
+
+  local function normalize_take_after_baked_replace(take)
+    if not take then return end
+    r.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", 1.0)
+    r.SetMediaItemTakeInfo_Value(take, "D_PITCH", 0.0)
+    r.SetMediaItemTakeInfo_Value(take, "B_PPITCH", 0.0)
   end
 
   if HANDLE_PADDING_SECONDS > 0 then
-    r.SetMediaItemInfo_Value(item, "D_POSITION", original_item_pos - HANDLE_PADDING_SECONDS)
+    render_ref_left = original_item_pos - HANDLE_PADDING_SECONDS
+    r.SetMediaItemInfo_Value(item, "D_POSITION", render_ref_left)
     r.SetMediaItemInfo_Value(item, "D_LENGTH", original_item_len + (HANDLE_PADDING_SECONDS * 2.0))
+    -- Keep snap relative to the same audible point after extending the left edge into pre-roll.
+    r.SetMediaItemInfo_Value(item, "D_SNAPOFFSET", original_snapoffset + HANDLE_PADDING_SECONDS)
     r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs - pre_source_delta)
   end
 
@@ -550,6 +565,14 @@ local function replace_with_rendered_take_only(item)
   r.SetMediaItemSelected(item, true)
 
   r.Main_OnCommand(CMD_RENDER_ITEMS_NEW_TAKE, 0)
+  r.UpdateArrange()
+
+  -- Actual item left edge after render (prefer over our pre-render intent; avoids trim error if
+  -- REAPER adjusts position). Fallback keeps handle-padding math consistent.
+  local item_left_at_render = r.GetMediaItemInfo_Value(item, "D_POSITION")
+  if item_left_at_render == nil then
+    item_left_at_render = render_ref_left
+  end
 
   local n_after = r.GetMediaItemNumTakes(item)
   if n_after <= n_before then
@@ -589,8 +612,8 @@ local function replace_with_rendered_take_only(item)
       r.SetMediaItemTakeInfo_Value(original_active_take, "D_STARTOFFS", original_startoffs)
       return false, "rendered item has no active take"
     end
-    local rendered_item_pos = r.GetMediaItemInfo_Value(rendered_item, "D_POSITION") or original_item_pos
-    local target_startoffs = source_pos_at_project_time(rendered_take, rendered_item_pos, original_item_pos)
+    local rendered_item_pos = r.GetMediaItemInfo_Value(rendered_item, "D_POSITION") or item_left_at_render
+    local target_startoffs = source_pos_baked_render_take(rendered_take, rendered_item_pos, original_item_pos)
     local ok_src, err_src = copy_take_source_to_take(rendered_take, target_take)
     if not ok_src then
       restore_original_item_bounds()
@@ -607,6 +630,7 @@ local function replace_with_rendered_take_only(item)
     if target_startoffs ~= nil then
       r.SetMediaItemTakeInfo_Value(target_take, "D_STARTOFFS", target_startoffs)
     end
+    normalize_take_after_baked_replace(target_take)
     r.SetActiveTake(target_take)
     add_render_summary_marker(target_take, render_summary)
     return true, nil
@@ -653,19 +677,18 @@ local function replace_with_rendered_take_only(item)
     return false, "rendered take missing before replace"
   end
   local rendered_take = r.GetMediaItemTake(item, rendered_idx)
-  local rendered_item_pos = r.GetMediaItemInfo_Value(item, "D_POSITION") or original_item_pos
-  local target_startoffs = source_pos_at_project_time(rendered_take, rendered_item_pos, original_item_pos)
+  local target_startoffs = source_pos_baked_render_take(rendered_take, item_left_at_render, original_item_pos)
   local ok_src, err_src = copy_take_source_to_take(rendered_take, target_take)
   if not ok_src then
     -- Last-resort fallback: keep rendered take, remove original active take.
     local ok_swap, err_swap = replace_by_swapping_to_rendered_take(item, original_active_guid, rendered_guid)
     if ok_swap then
       local swapped_take = r.GetActiveTake(item)
-      local swapped_item_pos = r.GetMediaItemInfo_Value(item, "D_POSITION") or original_item_pos
-      local swapped_startoffs = source_pos_at_project_time(swapped_take, swapped_item_pos, original_item_pos)
+      local swapped_startoffs = source_pos_baked_render_take(swapped_take, item_left_at_render, original_item_pos)
       restore_original_item_bounds()
       if swapped_take and swapped_startoffs ~= nil then
         r.SetMediaItemTakeInfo_Value(swapped_take, "D_STARTOFFS", swapped_startoffs)
+        normalize_take_after_baked_replace(swapped_take)
       end
       add_render_summary_marker(r.GetActiveTake(item), render_summary)
       return true, nil
@@ -685,6 +708,7 @@ local function replace_with_rendered_take_only(item)
   if target_startoffs ~= nil then
     r.SetMediaItemTakeInfo_Value(target_take, "D_STARTOFFS", target_startoffs)
   end
+  normalize_take_after_baked_replace(target_take)
   r.SetActiveTake(target_take)
   add_render_summary_marker(target_take, render_summary)
 

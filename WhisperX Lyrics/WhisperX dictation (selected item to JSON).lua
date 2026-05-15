@@ -1,5 +1,5 @@
 -- @description WhisperX dictation: transcribe selected item (JSON + in-project lyrics)
--- @version 1.10
+-- @version 1.11
 -- @author Bryan
 -- @about
 --   Runs WhisperX via ../.venv_whisperx, writes .whisperx.json plus sidecars
@@ -292,6 +292,55 @@ local function read_all_utf8(path)
   return data
 end
 
+--- Lua #s and s:sub(i,j) count bytes. Truncating Japanese (3-byte UTF-8) at a byte boundary
+--- leaves invalid tails (e.g. E3 81) — ReaImGui then shows mojibake or blank glyphs.
+local function utf8_safe_truncate_bytes(s, max_bytes)
+  if type(s) ~= "string" or max_bytes <= 0 then
+    return ""
+  end
+  if #s <= max_bytes then
+    return s
+  end
+  s = s:sub(1, max_bytes)
+  if utf8 and utf8.len then
+    while #s > 0 do
+      local ok = pcall(utf8.len, s)
+      if ok then
+        return s
+      end
+      s = s:sub(1, -2)
+    end
+    return ""
+  end
+  while #s > 0 do
+    local b = s:byte(#s)
+    if b >= 0x80 and b < 0xC0 then
+      s = s:sub(1, -2)
+    elseif b >= 0xC0 and b < 0xE0 then
+      if #s < 2 then
+        s = s:sub(1, -2)
+      else
+        return s
+      end
+    elseif b >= 0xE0 and b < 0xF0 then
+      if #s < 3 then
+        s = s:sub(1, -2)
+      else
+        return s
+      end
+    elseif b >= 0xF0 and b < 0xF8 then
+      if #s < 4 then
+        s = s:sub(1, -2)
+      else
+        return s
+      end
+    else
+      return s
+    end
+  end
+  return ""
+end
+
 local function apply_transcript_to_item(item, take, tsv_path, plain_path)
   if not item or not take then
     return
@@ -354,7 +403,7 @@ local function apply_transcript_to_item(item, take, tsv_path, plain_path)
         word = word:gsub("[\r\n]", " ")
         word = word:gsub("|", "\239\189\156")
         if #word > 180 then
-          word = word:sub(1, 180) .. "…"
+          word = utf8_safe_truncate_bytes(word, 180) .. "…"
         end
         if pos then
           r.SetTakeMarker(take, -1, word, pos)
