@@ -7,6 +7,11 @@ Typical Mac / no-GPU:
 
 CUDA (Linux/Windows):
   python reaper_whisperx_transcribe.py --input vocal.wav --output out.json --device cuda --compute_type float16
+
+Tuning (no post-hoc timing hacks — these map to WhisperX / faster-whisper):
+  Word timings are forced-aligned inside each Whisper *segment*. Very long segments (default VAD chunks up to ~30s)
+  stress CTC alignment; Japanese lyrics often improve with a smaller --chunk-size (e.g. 10–18) and/or silero VAD.
+  See whisperx.load_model(... vad_options=..., asr_options=...) in WhisperX’s whisperx/asr.py.
 """
 
 from __future__ import annotations
@@ -154,8 +159,6 @@ def _merge_latin_letter_runs_in_words(
     return out
 
 
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="WhisperX → JSON (segments + words)")
     ap.add_argument("--input", required=True, help="Path to WAV/MP3/etc.")
@@ -195,6 +198,46 @@ def main() -> int:
         "--done_flag",
         default=None,
         help="Optional path: write exit code (0/1/2) on process exit (atexit) so REAPER can poll.",
+    )
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help="VAD merge chunk length (seconds). Smaller ⇒ shorter Whisper segments ⇒ less stress on JA wav2vec alignment (often try 10–18 vs default ~30). Also forwarded to vad_options.",
+    )
+    ap.add_argument(
+        "--vad-method",
+        choices=("pyannote", "silero"),
+        default="pyannote",
+        help="VAD backend for splitting audio before ASR (silero avoids pyannote’s HF model download when pyannote is unused elsewhere).",
+    )
+    ap.add_argument(
+        "--vad-onset",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Optional VAD onset (WhisperX default ~0.5). Lower tends to lengthen detected speech spans.",
+    )
+    ap.add_argument(
+        "--vad-offset",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Optional VAD offset (WhisperX default ~0.363).",
+    )
+    ap.add_argument(
+        "--beam-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Optional faster-whisper beam_size (WhisperX default 5). Changes decoding quality/speed; indirect effect on segments.",
+    )
+    ap.add_argument(
+        "--align-model",
+        default=None,
+        metavar="HF_MODEL_ID",
+        help="Optional Hugging Face wav2vec2 checkpoint for forced alignment (overrides WhisperX default for that language).",
     )
     args = ap.parse_args()
 
@@ -286,6 +329,31 @@ def main() -> int:
     compute_type = args.compute_type
     batch_size = max(1, int(args.batch_size))
 
+    vad_options: dict[str, Any] = {}
+    if args.chunk_size is not None:
+        cz = max(4, min(int(args.chunk_size), 120))
+        vad_options["chunk_size"] = cz
+    if args.vad_onset is not None:
+        vad_options["vad_onset"] = float(args.vad_onset)
+    if args.vad_offset is not None:
+        vad_options["vad_offset"] = float(args.vad_offset)
+
+    asr_options: dict[str, Any] | None = None
+    if args.beam_size is not None:
+        bs = max(1, min(int(args.beam_size), 50))
+        asr_options = {"beam_size": bs}
+
+    vad_method = (args.vad_method or "pyannote").strip().lower()
+    if vad_method not in ("pyannote", "silero"):
+        vad_method = "pyannote"
+
+    dlog(
+        "pipeline tuning: "
+        f"vad_method={vad_method!r} vad_options={vad_options!r} "
+        f"transcribe_chunk_size={args.chunk_size!r} asr_options={asr_options!r} "
+        f"align_model={args.align_model!r}"
+    )
+
     report_progress(10, "loading audio")
     dlog("loading audio…")
     audio = whisperx.load_audio(args.input)
@@ -296,14 +364,25 @@ def main() -> int:
     )
     pulse_stop, pulse_th = start_progress_pulse(22, "loading ASR model")
     try:
-        asr_model = whisperx.load_model(args.model, device, language=args.language, compute_type=compute_type)
+        asr_model = whisperx.load_model(
+            args.model,
+            device,
+            language=args.language,
+            compute_type=compute_type,
+            vad_method=vad_method,
+            vad_options=vad_options if vad_options else None,
+            asr_options=asr_options,
+        )
     finally:
         stop_progress_pulse(pulse_stop, pulse_th)
 
     pulse_stop, pulse_th = start_progress_pulse(32, "transcribing")
     try:
         report_progress(32, "transcribing")
-        result = asr_model.transcribe(audio, batch_size=batch_size, language=args.language)
+        transcribe_kw: dict[str, Any] = dict(batch_size=batch_size, language=args.language)
+        if args.chunk_size is not None:
+            transcribe_kw["chunk_size"] = max(4, min(int(args.chunk_size), 120))
+        result = asr_model.transcribe(audio, **transcribe_kw)
     finally:
         stop_progress_pulse(pulse_stop, pulse_th)
 
@@ -328,7 +407,10 @@ def main() -> int:
     report_progress(58, "loading align model")
     pulse_stop, pulse_th = start_progress_pulse(58, "loading align model")
     try:
-        align_model, align_meta = whisperx.load_align_model(language_code=lang, device=device)
+        align_kw: dict[str, Any] = {"language_code": lang, "device": device}
+        if args.align_model and str(args.align_model).strip():
+            align_kw["model_name"] = str(args.align_model).strip()
+        align_model, align_meta = whisperx.load_align_model(**align_kw)
     finally:
         stop_progress_pulse(pulse_stop, pulse_th)
 
@@ -390,11 +472,25 @@ def main() -> int:
     if merged_drop:
         dlog(f"merged per-letter Latin tokens into words: net −{merged_drop} rows (fewer take markers)")
 
+    pipeline_opts: dict[str, Any] = {
+        "vad_method": vad_method,
+        "interpolate_method": args.interpolate_method,
+    }
+    if vad_options:
+        pipeline_opts["vad_options"] = dict(vad_options)
+    if args.chunk_size is not None:
+        pipeline_opts["chunk_size_seconds"] = max(4, min(int(args.chunk_size), 120))
+    if asr_options:
+        pipeline_opts["asr_options"] = dict(asr_options)
+    if args.align_model and str(args.align_model).strip():
+        pipeline_opts["align_model"] = str(args.align_model).strip()
+
     payload: dict[str, Any] = {
         "language": lang,
         "model": args.model,
         "source_file": args.input,
         "segments": serialized,
+        "pipeline_options": pipeline_opts,
     }
 
     report_progress(86, "writing JSON and sidecars")

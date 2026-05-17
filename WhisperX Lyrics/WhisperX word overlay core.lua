@@ -1,5 +1,5 @@
 -- WhisperX word overlay — shared core (loaded by action scripts; not a ReaPack action).
--- @version 1.66
+-- @version 1.68
 
 local r = reaper
 
@@ -520,8 +520,11 @@ local ANIM_GRAPH_CURVE_OUT_QUAD = 2
 local ANIM_GRAPH_CURVE_INOUT_QUAD = 3
 local ANIM_GRAPH_CURVE_SQUARE = 4
 local ANIM_GRAPH_CURVE_IN_LOG = 5
-local ANIM_GRAPH_CURVE_OUT_EXP = 6
-local ANIM_GRAPH_CURVE_LAST = ANIM_GRAPH_CURVE_OUT_EXP
+local ANIM_GRAPH_CURVE_IN_EXP = 6
+local ANIM_GRAPH_CURVE_LAST = ANIM_GRAPH_CURVE_IN_EXP
+--- Path graph only: stronger ease-in log / exp than old 9 / ln(1000) (still 0→1 at u=1).
+local ANIM_GRAPH_LOG_K = 99
+local ANIM_GRAPH_EXP_A = 13.815511 -- ln(1e6)
 
 local function anim_curve_expr(curve_id, v, bounce)
   curve_id = math.floor(tonumber(curve_id) or 0)
@@ -593,30 +596,90 @@ local function anim_graph_curve_expr(curve_id, uvar)
     return "((" .. uvar .. " < 1) ? 0 : 1)"
   end
   if curve_id == ANIM_GRAPH_CURVE_IN_LOG then
-    return "(log(1+9*" .. uvar .. ")/2.302585)"
+    return "(log(1+" .. tostring(ANIM_GRAPH_LOG_K) .. "*" .. uvar .. ")/log(" .. tostring(ANIM_GRAPH_LOG_K + 1) .. "))"
   end
-  if curve_id == ANIM_GRAPH_CURVE_OUT_EXP then
-    return "((" .. uvar .. " >= 1) ? (1) : (1-(exp(6.907755*(1-" .. uvar .. "))-1)/999))"
+  if curve_id == ANIM_GRAPH_CURVE_IN_EXP then
+    local exp_d = math.exp(ANIM_GRAPH_EXP_A) - 1
+    return "((("
+      .. uvar
+      .. " <= 0) ? (0) : (("
+      .. uvar
+      .. " >= 1) ? (1) : ((exp("
+      .. fmt_eel_num(ANIM_GRAPH_EXP_A)
+      .. "*"
+      .. uvar
+      .. ")-1)/"
+      .. fmt_eel_num(exp_d)
+      .. "))))"
   end
   return uvar
 end
 
---- Smooth In Log ↔ Linear ↔ Out Exp: b=-1 full log, 0 linear, +1 full exp (constants baked for EEL).
+--- In Log ↔ Linear ↔ In Exp: smooththrough-weighted (smoothstep on |b|, zero slope through linear at b=0). Baked coeffs for codegen.
 local function anim_graph_curve_mode1_blend_eel(uvar, b)
   b = math.max(-1, math.min(1, tonumber(b) or 0))
-  local ylog = "(log(1+9*" .. uvar .. ")/2.302585)"
+  local exp_d = math.exp(ANIM_GRAPH_EXP_A) - 1
+  local ylog = "(log(1+" .. tostring(ANIM_GRAPH_LOG_K) .. "*" .. uvar .. ")/log(" .. tostring(ANIM_GRAPH_LOG_K + 1) .. "))"
   local ylin = uvar
-  local yexp = "(((" .. uvar .. " >= 1) ? (1) : (1-(exp(6.907755*(1-" .. uvar .. "))-1)/999)))"
-  if b <= 0 then
-    local t = -b
-    return "(" .. ylin .. "+(" .. ylog .. "-" .. ylin .. ")*" .. fmt_eel_num(t) .. ")"
+  local y_in_exp = "((("
+    .. uvar
+    .. " <= 0) ? (0) : (("
+    .. uvar
+    .. " >= 1) ? (1) : ((exp("
+    .. fmt_eel_num(ANIM_GRAPH_EXP_A)
+    .. "*"
+    .. uvar
+    .. ")-1)/"
+    .. fmt_eel_num(exp_d)
+    .. "))))"
+  local sn = (b <= 0) and math.min(1, -b) or 0
+  local sp = (b >= 0) and math.min(1, b) or 0
+  local function smooth01(s)
+    if s <= 0 then
+      return 0
+    end
+    if s >= 1 then
+      return 1
+    end
+    return s * s * (3 - 2 * s)
   end
-  return "(" .. ylin .. "+(" .. yexp .. "-" .. ylin .. ")*" .. fmt_eel_num(b) .. ")"
+  local w_log = smooth01(sn)
+  local w_exp = smooth01(sp)
+  local w_lin = math.max(0, 1 - w_log - w_exp)
+  return "("
+    .. fmt_eel_num(w_log)
+    .. "*"
+    .. ylog
+    .. "+"
+    .. fmt_eel_num(w_lin)
+    .. "*"
+    .. "("
+    .. ylin
+    .. ")+"
+    .. fmt_eel_num(w_exp)
+    .. "*"
+    .. y_in_exp
+    .. ")"
+end
+
+local function anim_graph_curve_blend_linear_chosen_eel(curve_id, uvar, strength)
+  curve_id = math.floor(tonumber(curve_id) or 0)
+  local sm = math.max(0, math.min(1, math.abs(tonumber(strength) or 0)))
+  local yc = anim_graph_curve_expr(curve_id, uvar)
+  return "(" .. uvar .. "+(" .. yc .. "-" .. uvar .. ")*" .. fmt_eel_num(sm) .. ")"
 end
 
 local function anim_graph_seg_ease_expr(curve_id, uvar, seg_blend)
+  curve_id = math.floor(tonumber(curve_id) or 0)
   if type(seg_blend) == "number" and seg_blend == seg_blend then
-    return anim_graph_curve_mode1_blend_eel(uvar, seg_blend)
+    if
+      curve_id == ANIM_GRAPH_CURVE_LINEAR
+      or curve_id == ANIM_GRAPH_CURVE_IN_LOG
+      or curve_id == ANIM_GRAPH_CURVE_IN_EXP
+    then
+      return anim_graph_curve_mode1_blend_eel(uvar, seg_blend)
+    end
+    return anim_graph_curve_blend_linear_chosen_eel(curve_id, uvar, seg_blend)
   end
   return anim_graph_curve_expr(curve_id, uvar)
 end
@@ -678,6 +741,13 @@ local function parse_anim_graph_blob(blob)
         end
       end
       bi = bi + 1
+    end
+  end
+  for i = 1, #points - 1 do
+    local cid = curves[i]
+    local sb = seg_blends[i]
+    if cid == ANIM_GRAPH_CURVE_IN_LOG and type(sb) == "number" and sb > 0 and sb <= 1 then
+      seg_blends[i] = -sb
     end
   end
   return { points = points, curves = curves, seg_blends = seg_blends }
@@ -929,7 +999,30 @@ local function append_anim_graph_path_eel(lines, pfx, tvar, graph)
   return true
 end
 
-local function append_anim_ops(lines, pfx, typ, evar, ivar, is_entry, ampvar, bouncevar, motionvar, wigglevar, ghostvar, dupesvar, dirx, diry, scalevar, fadevar, blurvar, graph, dirdegvar, wipe_mask_offset)
+local function append_anim_ops(
+  lines,
+  pfx,
+  typ,
+  evar,
+  ivar,
+  is_entry,
+  ampvar,
+  bouncevar,
+  motionvar,
+  wigglevar,
+  ghostvar,
+  dupesvar,
+  dirx,
+  diry,
+  scalevar,
+  fadevar,
+  blurvar,
+  graph,
+  dirdegvar,
+  wipe_mask_offset,
+  graph_path_t_in_override,
+  graph_path_t_out_override
+)
   if typ == ANIM_TYPE_NONE then
     return
   end
@@ -1254,7 +1347,15 @@ local function append_anim_ops(lines, pfx, typ, evar, ivar, is_entry, ampvar, bo
       px = fmt_eel_num(-(tonumber(diry) or 1))
       py = fmt_eel_num(tonumber(dirx) or 0)
     end
-    local has_graph = append_anim_graph_path_eel(lines, pfx, t, graph)
+    local path_t_expr = t
+    if is_entry then
+      if type(graph_path_t_in_override) == "string" and graph_path_t_in_override ~= "" then
+        path_t_expr = graph_path_t_in_override
+      end
+    elseif type(graph_path_t_out_override) == "string" and graph_path_t_out_override ~= "" then
+      path_t_expr = graph_path_t_out_override
+    end
+    local has_graph = append_anim_graph_path_eel(lines, pfx, path_t_expr, graph)
     if has_graph then
       lines[#lines + 1] = string.format("  %sdx+=project_w*0.22*%spgx*%s*%s;", pfx, pfx, ampvar, motionvar)
       lines[#lines + 1] = string.format("  %sdy+=project_h*0.22*%spgy*%s*%s;", pfx, pfx, ampvar, motionvar)
@@ -1369,6 +1470,28 @@ local function append_anim_eel(lines, pfx, t0_expr, t1_expr, anim)
   local out_graph = (anim.out_use_graph and true or false) and parse_anim_graph_blob(anim.out_graph) or nil
   local in_auto = parse_anim_auto_blob(anim.in_auto_blob)
   local out_auto = parse_anim_auto_blob(anim.out_auto_blob)
+  local gwu_var = pfx .. "gwu"
+  local in_use_path_word =
+    (anim.in_graph_word_span and true or false)
+    and (anim.in_use_graph and true or false)
+    and in_graph ~= nil
+    and in_type == ANIM_TYPE_CUSTOM
+  local out_use_path_word =
+    (anim.out_graph_word_span and true or false)
+    and (anim.out_use_graph and true or false)
+    and out_graph ~= nil
+    and out_type == ANIM_TYPE_CUSTOM
+  if in_use_path_word or out_use_path_word then
+    lines[#lines + 1] = string.format(
+      "  %s=max(0,min(1,(src-(%s))/max(1e-11,(%s)-(%s))));",
+      gwu_var,
+      t0_expr,
+      t1_expr,
+      t0_expr
+    )
+  end
+  local graph_t_in_ov = (in_use_path_word and gwu_var) or nil
+  local graph_t_out_ov = (out_use_path_word and gwu_var) or nil
   do
     local init = {
       string.format("  %sa=1; %ss=1; %ssx=1; %ssy=1; %sdx=0; %sdy=0; %sb=0; %sr=0; %smk=0; %sm=1; %smx=1; %smy=0; %smo=0;", pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx)
@@ -1410,7 +1533,30 @@ local function append_anim_eel(lines, pfx, t0_expr, t1_expr, anim)
     local dp = append_anim_auto_lane_eval(lines, pfx, "dupes", iv, in_auto.dupes, in_dupes)
     local dirv = append_anim_auto_lane_eval(lines, pfx, "dir", iv, in_auto.dir, fmt_eel_num(math.deg(in_dir)))
     local twv = append_anim_auto_lane_eval(lines, pfx, "twist", iv, in_auto.twist, fmt_eel_num(twist_in))
-    append_anim_ops(lines, pfx, in_type, e, iv, true, amp, bnc, mv, wv, gh, dp, math.cos(in_dir), math.sin(in_dir), sv, fv, bv, in_graph, dirv, wipe_mask_offset)
+    append_anim_ops(
+      lines,
+      pfx,
+      in_type,
+      e,
+      iv,
+      true,
+      amp,
+      bnc,
+      mv,
+      wv,
+      gh,
+      dp,
+      math.cos(in_dir),
+      math.sin(in_dir),
+      sv,
+      fv,
+      bv,
+      in_graph,
+      dirv,
+      wipe_mask_offset,
+      graph_t_in_ov,
+      graph_t_out_ov
+    )
     if math.abs(twist_in) > 1e-8 or (in_auto.twist and in_auto.twist.enabled) then
       lines[#lines + 1] = string.format("  %sr+=(%s*0.017453292519943295)*%s;", pfx, twv, iv)
     end
@@ -1453,7 +1599,30 @@ local function append_anim_eel(lines, pfx, t0_expr, t1_expr, anim)
     local dp = append_anim_auto_lane_eval(lines, pfx, "dupes", iv, out_auto.dupes, out_dupes)
     local dirv = append_anim_auto_lane_eval(lines, pfx, "dir", iv, out_auto.dir, fmt_eel_num(math.deg(out_dir)))
     local twv = append_anim_auto_lane_eval(lines, pfx, "twist", iv, out_auto.twist, fmt_eel_num(twist_out))
-    append_anim_ops(lines, pfx, out_type, e, iv, false, amp, bnc, mv, wv, gh, dp, math.cos(out_dir), math.sin(out_dir), sv, fv, bv, out_graph, dirv, wipe_mask_offset)
+    append_anim_ops(
+      lines,
+      pfx,
+      out_type,
+      e,
+      iv,
+      false,
+      amp,
+      bnc,
+      mv,
+      wv,
+      gh,
+      dp,
+      math.cos(out_dir),
+      math.sin(out_dir),
+      sv,
+      fv,
+      bv,
+      out_graph,
+      dirv,
+      wipe_mask_offset,
+      graph_t_in_ov,
+      graph_t_out_ov
+    )
     if math.abs(twist_out) > 1e-8 or (out_auto.twist and out_auto.twist.enabled) then
       lines[#lines + 1] = string.format("  %sr+=(%s*0.017453292519943295)*%s;", pfx, twv, iv)
     end
@@ -1541,7 +1710,133 @@ local function word_style_for(display_opts, wi)
     shadow_alpha = math.max(0, math.min(1, tonumber(st.shadow_alpha) or 0.55)),
     underline_thick = math.max(1, math.min(12, tonumber(st.underline_thick) or 1)),
     underline_offset = math.max(-8, math.min(16, tonumber(st.underline_offset) or 1)),
+    outline_thickness = math.max(1, math.min(12, math.floor(tonumber(st.outline_thickness) or 2))),
+    outline_gap = math.max(0, math.min(24, math.floor(tonumber(st.outline_gap) or 0))),
+    outline_color = (function()
+      local c = tonumber(st.outline_color)
+      if not c then
+        return 0
+      end
+      return math.max(0, math.min(0xFFFFFF, math.floor(c)))
+    end)(),
   }
+end
+
+--- Integer-pixel halo: per layer R = 1 + gap + layer, eight symmetric str_draws (cardinals + diagonals).
+local function append_word_outline_halo_eel(add, text_expr, x_expr, y_expr, alpha_expr, or_, og, ob, gap_px, thick_px)
+  gap_px = math.max(0, math.min(24, math.floor(tonumber(gap_px) or 0)))
+  thick_px = math.max(1, math.min(12, math.floor(tonumber(thick_px) or 2)))
+  local chunks = {}
+  chunks[#chunks + 1] = string.format("gfx_set(%s,%s,%s,0.72*%s);", or_, og, ob, alpha_expr)
+  for t = 0, thick_px - 1 do
+    local R = 1 + gap_px + t
+    chunks[#chunks + 1] = string.format(
+      "gfx_str_draw(%s,(%s)-%d,%s); gfx_str_draw(%s,(%s)+%d,%s); gfx_str_draw(%s,%s,(%s)-%d); gfx_str_draw(%s,%s,(%s)+%d);",
+      text_expr,
+      x_expr,
+      R,
+      y_expr,
+      text_expr,
+      x_expr,
+      R,
+      y_expr,
+      text_expr,
+      x_expr,
+      y_expr,
+      R,
+      text_expr,
+      x_expr,
+      y_expr,
+      R
+    )
+    chunks[#chunks + 1] = string.format(
+      "gfx_str_draw(%s,(%s)-%d,(%s)-%d); gfx_str_draw(%s,(%s)-%d,(%s)+%d); gfx_str_draw(%s,(%s)+%d,(%s)-%d); gfx_str_draw(%s,(%s)+%d,(%s)+%d);",
+      text_expr,
+      x_expr,
+      R,
+      y_expr,
+      R,
+      text_expr,
+      x_expr,
+      R,
+      y_expr,
+      R,
+      text_expr,
+      x_expr,
+      R,
+      y_expr,
+      R,
+      text_expr,
+      x_expr,
+      R,
+      y_expr,
+      R
+    )
+  end
+  add(table.concat(chunks, " "))
+end
+
+--- One step of 8-connected binary dilation: additive blit of `src` plus 8 shifted copies into `dst`.
+local function append_outline_dilate_step_eel(lines, src, dst)
+  lines[#lines + 1] = string.format("  gfx_dest=%s; gfx_mode=0; gfx_set(0,0,0,0); gfx_fillrect(0,0,wxov_ps,wxov_ps); gfx_mode=1; gfx_a=1;", dst)
+  local offs = { { 0, 0 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
+  for i = 1, #offs do
+    local o = offs[i]
+    lines[#lines + 1] = string.format(
+      "  gfx_blit(%s,1,%d,%d,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps);",
+      src,
+      o[1],
+      o[2]
+    )
+  end
+  lines[#lines + 1] = "  gfx_mode=0; gfx_a=1;"
+end
+
+--- After chroma on wxov_spin (white glyph on transparent), build true outline ring (dilate − inner) and premult fill, composite back into wxov_spin.
+local function append_outline_mask_post_eel(lines, or_, og, ob, tr, tg, tb, gap_px, thick_px)
+  gap_px = math.max(0, math.min(24, math.floor(tonumber(gap_px) or 0)))
+  thick_px = math.max(1, math.min(12, math.floor(tonumber(thick_px) or 1)))
+  lines[#lines + 1] = "  wxov_ol0=max(0,floor(wxov_ol0+0.5))<1 ? gfx_img_alloc(wxov_ps,wxov_ps,1) : gfx_img_resize(wxov_ol0,wxov_ps,wxov_ps,1);"
+  lines[#lines + 1] = "  wxov_ol1=max(0,floor(wxov_ol1+0.5))<1 ? gfx_img_alloc(wxov_ps,wxov_ps,1) : gfx_img_resize(wxov_ol1,wxov_ps,wxov_ps,1);"
+  lines[#lines + 1] = "  wxov_ol2=max(0,floor(wxov_ol2+0.5))<1 ? gfx_img_alloc(wxov_ps,wxov_ps,1) : gfx_img_resize(wxov_ol2,wxov_ps,wxov_ps,1);"
+  lines[#lines + 1] = "  wxov_ol3=max(0,floor(wxov_ol3+0.5))<1 ? gfx_img_alloc(wxov_ps,wxov_ps,1) : gfx_img_resize(wxov_ol3,wxov_ps,wxov_ps,1);"
+  lines[#lines + 1] = "  gfx_dest=wxov_ol0; gfx_mode=0; gfx_set(0,0,0,0); gfx_fillrect(0,0,wxov_ps,wxov_ps); gfx_blit(wxov_spin,1,0,0,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps);"
+  lines[#lines + 1] = "  gfx_dest=wxov_ol3; gfx_mode=0; gfx_set(0,0,0,0); gfx_fillrect(0,0,wxov_ps,wxov_ps); gfx_blit(wxov_ol0,1,0,0,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps);"
+  local cur, nxt = "wxov_ol0", "wxov_ol1"
+  for _ = 1, gap_px do
+    append_outline_dilate_step_eel(lines, cur, nxt)
+    cur, nxt = nxt, cur
+  end
+  lines[#lines + 1] = string.format(
+    "  gfx_dest=wxov_ol2; gfx_mode=0; gfx_set(0,0,0,0); gfx_fillrect(0,0,wxov_ps,wxov_ps); gfx_blit(%s,1,0,0,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps);",
+    cur
+  )
+  for _ = 1, thick_px do
+    append_outline_dilate_step_eel(lines, cur, nxt)
+    cur, nxt = nxt, cur
+  end
+  local mbig = cur
+  local ring_code = string.format(
+    "a=max(0,sa-s2a); (a<0.5)?(r=0;g=0;b=0;a=0;):(r=min(255,%s*a); g=min(255,%s*a); b=min(255,%s*a););",
+    or_,
+    og,
+    ob
+  )
+  lines[#lines + 1] = "  gfx_dest=wxov_spin; gfx_mode=0; gfx_set(0,0,0,0); gfx_fillrect(0,0,wxov_ps,wxov_ps);"
+  lines[#lines + 1] = '  gfx_evalrect(0,0,wxov_ps,wxov_ps,"'
+    .. ring_code
+    .. '",0,'
+    .. mbig
+    .. ',"",wxov_ol2);'
+  local fill_code = string.format(
+    "a=sa; r=min(255,%s*a); g=min(255,%s*a); b=min(255,%s*a);",
+    tr,
+    tg,
+    tb
+  )
+  lines[#lines + 1] = "  gfx_dest=wxov_ol0; gfx_mode=0; gfx_set(0,0,0,0); gfx_fillrect(0,0,wxov_ps,wxov_ps); gfx_blit(wxov_ol3,1,0,0,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps);"
+  lines[#lines + 1] = '  gfx_evalrect(0,0,wxov_ps,wxov_ps,"' .. fill_code .. '",0);'
+  lines[#lines + 1] = "  gfx_dest=wxov_spin; gfx_mode=0x10000; gfx_a=1; gfx_blit(wxov_ol0,1,0,0,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps); gfx_mode=0; gfx_a=1;"
 end
 
 local function word_style_font_expr(fontn, st)
@@ -1602,8 +1897,15 @@ end
 local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr, h_expr, alpha_expr, st, anim_pfx, rot_var, image_mask_fx)
   st = st or {}
   local flags = math.max(0, math.floor(tonumber(st.flags) or 0))
+  local outline_on = (flags & WSTYLE_OUTLINE) ~= 0
+  --- Morphological ring outline needs the green-screen spin buffer; skip offset str_draw "halo" in that path.
+  local outline_mask_path = outline_on and anim_pfx and anim_pfx ~= ""
   local tr, tg, tb = rgb_eel_parts(st.text_color or 0xFFFFFF)
   local hr, hg, hb = rgb_eel_parts(st.highlight_color or 0xFFD34D)
+  local othick = math.max(1, math.min(12, math.floor(tonumber(st.outline_thickness) or 2)))
+  local ogap = math.max(0, math.min(24, math.floor(tonumber(st.outline_gap) or 0)))
+  local or_, og, ob = rgb_eel_parts(tonumber(st.outline_color) or 0)
+  local ps_extra = (outline_mask_path and (8 + 2 * (ogap + othick))) or 0
   local shadow_dx = fmt_eel_num(st.shadow_dx or 2)
   local shadow_dy = fmt_eel_num(st.shadow_dy or 2)
   local shadow_alpha = fmt_eel_num(st.shadow_alpha or 0.55)
@@ -1618,7 +1920,7 @@ local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr,
   local function add(s)
     fr[#fr + 1] = s
   end
-  if anim_pfx and anim_pfx ~= "" then
+  if anim_pfx and anim_pfx ~= "" and not outline_mask_path then
     local blur = anim_pfx .. "b"
     add(string.format(
       "(%s > 0.001) ? (gfx_set(%s,%s,%s,0.11*%s); gfx_str_draw(%s,%s-%s,%s); gfx_str_draw(%s,%s+%s,%s); gfx_str_draw(%s,%s,%s-%s); gfx_str_draw(%s,%s,%s+%s); gfx_str_draw(%s,%s-%s*0.707,%s-%s*0.707); gfx_str_draw(%s,%s+%s*0.707,%s-%s*0.707); gfx_str_draw(%s,%s-%s*0.707,%s+%s*0.707); gfx_str_draw(%s,%s+%s*0.707,%s+%s*0.707));",
@@ -1684,7 +1986,7 @@ local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr,
       ))
     end
   end
-  if (flags & WSTYLE_HIGHLIGHT) ~= 0 then
+  if (flags & WSTYLE_HIGHLIGHT) ~= 0 and not outline_mask_path then
     add(string.format(
       "gfx_set(%s,%s,%s,0.38*%s); gfx_fillrect(%s-3,%s-2,%s+6,%s+4);",
       hr,
@@ -1697,7 +1999,7 @@ local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr,
       h_expr
     ))
   end
-  if (flags & WSTYLE_SHADOW) ~= 0 then
+  if (flags & WSTYLE_SHADOW) ~= 0 and not outline_mask_path then
     add(string.format(
       "gfx_set(0,0,0,%s*%s); gfx_str_draw(%s,%s+%s,%s+%s);",
       shadow_alpha,
@@ -1722,23 +2024,30 @@ local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr,
       y_expr
     ))
   end
-  if (flags & WSTYLE_OUTLINE) ~= 0 then
-    add(string.format(
-      "gfx_set(0,0,0,0.72*%s); gfx_str_draw(%s,%s-1,%s); gfx_str_draw(%s,%s+1,%s); gfx_str_draw(%s,%s,%s-1); gfx_str_draw(%s,%s,%s+1);",
-      alpha_expr,
-      text_expr,
-      x_expr,
-      y_expr,
-      text_expr,
-      x_expr,
-      y_expr,
-      text_expr,
-      x_expr,
-      y_expr,
-      text_expr,
-      x_expr,
-      y_expr
-    ))
+  if outline_on and not outline_mask_path then
+    if othick <= 1 and ogap == 0 then
+      add(string.format(
+        "gfx_set(%s,%s,%s,0.72*%s); gfx_str_draw(%s,(%s)-1,%s); gfx_str_draw(%s,(%s)+1,%s); gfx_str_draw(%s,%s,(%s)-1); gfx_str_draw(%s,%s,(%s)+1);",
+        or_,
+        og,
+        ob,
+        alpha_expr,
+        text_expr,
+        x_expr,
+        y_expr,
+        text_expr,
+        x_expr,
+        y_expr,
+        text_expr,
+        x_expr,
+        y_expr,
+        text_expr,
+        x_expr,
+        y_expr
+      ))
+    else
+      append_word_outline_halo_eel(add, text_expr, x_expr, y_expr, alpha_expr, or_, og, ob, ogap, othick)
+    end
   end
   add(string.format("gfx_set(%s,%s,%s,%s); gfx_str_draw(%s,%s,%s);", tr, tg, tb, alpha_expr, text_expr, x_expr, y_expr))
   if (flags & WSTYLE_PSEUDO_BOLD) ~= 0 then
@@ -1793,7 +2102,7 @@ local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr,
   end
 
   if anim_pfx and anim_pfx ~= "" then
-    if not image_mask_fx then
+    if not image_mask_fx and not outline_mask_path then
       flush_fr("  ")
       append_occluder("  ")
       return
@@ -1809,11 +2118,15 @@ local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr,
     if rot_var and rot_var ~= "" then
       needs_img_expr = "max(" .. needs_img_expr .. string.format(",(abs(%s)>0.001?1:0))", rot_var)
     end
+    if outline_mask_path then
+      needs_img_expr = "max(" .. needs_img_expr .. ",1)"
+    end
     lines[#lines + 1] = "  wxov_useimg=" .. needs_img_expr .. "; (wxov_useimg>0.5) ? ("
     lines[#lines + 1] = string.format(
-      "  od=gfx_dest; colorspace='RGBA'; wxov_ps=max(%s,%s)+96; wxov_spin=max(0,floor(wxov_spin+0.5))<1 ? gfx_img_alloc(wxov_ps,wxov_ps,1) : gfx_img_resize(wxov_spin,wxov_ps,wxov_ps,1); gfx_dest=wxov_spin; gfx_set(0,1,0,1); gfx_fillrect(0,0,wxov_ps,wxov_ps); wxov_px=floor((wxov_ps-%s)*0.5); wxov_py=floor((wxov_ps-%s)*0.5);",
+      "  od=gfx_dest; colorspace='RGBA'; wxov_ps=max(%s,%s)+%d; wxov_spin=max(0,floor(wxov_spin+0.5))<1 ? gfx_img_alloc(wxov_ps,wxov_ps,1) : gfx_img_resize(wxov_spin,wxov_ps,wxov_ps,1); gfx_dest=wxov_spin; gfx_set(0,1,0,1); gfx_fillrect(0,0,wxov_ps,wxov_ps); wxov_px=floor((wxov_ps-%s)*0.5); wxov_py=floor((wxov_ps-%s)*0.5);",
       w_expr,
       h_expr,
+      96 + ps_extra,
       w_expr,
       h_expr
     )
@@ -1847,6 +2160,9 @@ local function append_styled_text_draw(lines, text_expr, x_expr, y_expr, w_expr,
     lines[#lines + 1] = "    ((wxov_hw>0) && (wxov_hh2>0)) ? (gfx_set(0,1,0,1); gfx_fillrect(wxov_hx,wxov_hy,wxov_hw,wxov_hh2);) : 0;"
     lines[#lines + 1] = "  ) : 0);"
     lines[#lines + 1] = '  gfx_evalrect(0,0,wxov_ps,wxov_ps,"_1=max(max(r,b),255-g); _1<8 ? (a=0;) : (a=min(255,_1); r=min(255,r*255/_1); g=min(255,max(0,g-(255-_1))*255/_1); b=min(255,b*255/_1););");'
+    if outline_mask_path then
+      append_outline_mask_post_eel(lines, or_, og, ob, tr, tg, tb, ogap, othick)
+    end
     lines[#lines + 1] = string.format(
       "  wxov_sx=max(0.03,%s); wxov_sy=max(0.03,%s); wxov_dw=floor(wxov_ps*wxov_sx+0.5); wxov_dh=floor(wxov_ps*wxov_sy+0.5); wxov_dx=floor((%s)+(%s)*0.5-(wxov_px+(%s)*0.5)*wxov_sx+0.5); wxov_dy=floor((%s)+(%s)*0.5-(wxov_py+(%s)*0.5)*wxov_sy+0.5);",
       sx,
@@ -2995,6 +3311,32 @@ local function ml_row_karaoke_vis_eel(words, phrase, row_idx, join_sep, fallback
   return expr
 end
 
+--- EEL: visible text = single current word only (no cumulative prefix), same timing grid as write-on.
+local function ml_row_single_word_vis_eel(words, phrase, row_idx, join_sep, fallback_row_text, eel_slot)
+  eel_slot = eel_slot or "#wxov_ml1"
+  join_sep = join_sep or " "
+  local rs, re = ml_row_word_abs_range(phrase, row_idx)
+  if not rs then
+    return string.format('strcpy(%s,"%s")', eel_slot, escape_eel_dq_string(fallback_row_text or ""))
+  end
+  local m = re - rs + 1
+  if m < 1 then
+    return string.format('strcpy(%s,"%s")', eel_slot, escape_eel_dq_string(fallback_row_text or ""))
+  end
+  local prefixes = {}
+  prefixes[0] = '""'
+  for k = 1, m do
+    local lit = (words[rs + k - 1] and words[rs + k - 1].w) or ""
+    prefixes[k] = '"' .. escape_eel_dq_string(lit) .. '"'
+  end
+  local expr = string.format("strcpy(%s,%s)", eel_slot, prefixes[m])
+  for j = m - 1, 1, -1 do
+    expr = string.format("(src < %s) ? strcpy(%s,%s) : (%s)", fmt_eel_num(words[rs + j].t), eel_slot, prefixes[j], expr)
+  end
+  expr = string.format("(src < %s) ? strcpy(%s,%s) : (%s)", fmt_eel_num(words[rs].t), eel_slot, prefixes[0], expr)
+  return expr
+end
+
 local function layout_segment_from_phrase(phrase, words, src_end, preset, karaoke, display_opts)
   local rows = phrase.rows or {}
   local n = #rows
@@ -3022,8 +3364,19 @@ local function layout_segment_from_phrase(phrase, words, src_end, preset, karaok
   if t1 <= t0 then
     t1 = t0 + 0.05
   end
+  local timing = tonumber(display_opts and display_opts.ml_timing_mode)
+  if timing == nil then
+    timing = karaoke and 0 or 1
+  end
+  timing = math.max(0, math.min(2, math.floor(timing)))
+  local phrase_static = timing == 1
+  local mode_write_on = timing == 0
+  local mode_single_word = timing == 2
+
+  local seg_karaoke_flag = not phrase_static
+
   local t_rev = {}
-  if karaoke and phrase.row_end_w then
+  if seg_karaoke_flag and phrase.row_end_w then
     for i = 1, n - 1 do
       local ew = phrase.row_end_w[i]
       if ew then
@@ -3053,11 +3406,18 @@ local function layout_segment_from_phrase(phrase, words, src_end, preset, karaok
   local lws = display_opts and display_opts.layout_word_scale
   local word_per_gfx = type(lws) == "table"
   local row_karaoke_vis_eel = nil
-  if karaoke and not word_per_gfx then
+  if not word_per_gfx then
     local join_sep = words_use_cjk_compact_join(words) and "" or " "
-    row_karaoke_vis_eel = {}
-    for ri = 1, n do
-      row_karaoke_vis_eel[ri] = ml_row_karaoke_vis_eel(words, phrase, ri, join_sep, rows[ri], "#wxov_ml" .. ri)
+    if mode_write_on then
+      row_karaoke_vis_eel = {}
+      for ri = 1, n do
+        row_karaoke_vis_eel[ri] = ml_row_karaoke_vis_eel(words, phrase, ri, join_sep, rows[ri], "#wxov_ml" .. ri)
+      end
+    elseif mode_single_word then
+      row_karaoke_vis_eel = {}
+      for ri = 1, n do
+        row_karaoke_vis_eel[ri] = ml_row_single_word_vis_eel(words, phrase, ri, join_sep, rows[ri], "#wxov_ml" .. ri)
+      end
     end
   end
   local rsw, rew = {}, {}
@@ -3099,7 +3459,7 @@ local function layout_segment_from_phrase(phrase, words, src_end, preset, karaok
     row_gap_mul = row_gap_mul,
     row_v_align = math.max(0, math.min(2, math.floor(tonumber(display_opts and display_opts.layout_row_v_align) or 0))),
     row_x_frac = row_x_frac,
-    karaoke = karaoke and true or false,
+    karaoke = seg_karaoke_flag,
     t_rev_karaoke = t_rev,
     row_karaoke_vis_eel = row_karaoke_vis_eel,
     row_start_w = rsw,
@@ -3436,6 +3796,7 @@ local function build_display_segments(words, src_end, display_opts)
       anim_in_use_graph = display_opts.anim_in_use_graph,
       anim_in_graph = display_opts.anim_in_graph,
       anim_in_auto_blob = display_opts.anim_in_auto_blob,
+      anim_in_graph_word_span = display_opts.anim_in_graph_word_span,
       anim_out_on = display_opts.anim_out_on,
       anim_out_type = display_opts.anim_out_type,
       anim_out_curve = display_opts.anim_out_curve,
@@ -3460,6 +3821,7 @@ local function build_display_segments(words, src_end, display_opts)
       anim_phrase_out_use_graph = display_opts.anim_phrase_out_use_graph,
       anim_phrase_out_graph = display_opts.anim_phrase_out_graph,
       anim_phrase_out_auto_blob = display_opts.anim_phrase_out_auto_blob,
+      anim_phrase_out_graph_word_span = display_opts.anim_phrase_out_graph_word_span,
       anim_out_bounce = display_opts.anim_out_bounce,
       anim_out_motion = display_opts.anim_out_motion,
       anim_out_wiggle = display_opts.anim_out_wiggle,
@@ -3473,6 +3835,7 @@ local function build_display_segments(words, src_end, display_opts)
       anim_out_use_graph = display_opts.anim_out_use_graph,
       anim_out_graph = display_opts.anim_out_graph,
       anim_out_auto_blob = display_opts.anim_out_auto_blob,
+      anim_out_graph_word_span = display_opts.anim_out_graph_word_span,
       video_guides = display_opts.video_guides,
       word_styles = display_opts.word_styles,
       font_name = display_opts.font_name,
@@ -3523,6 +3886,7 @@ local function append_layout_seg_eel(lines, seg, fontn, display_opts, words, ani
     wipe_mask_offset = display_opts and display_opts.anim_wipe_mask_offset,
     in_use_graph = display_opts and display_opts.anim_in_use_graph,
     in_graph = display_opts and display_opts.anim_in_graph,
+    in_graph_word_span = display_opts and display_opts.anim_in_graph_word_span,
     in_auto_blob = display_opts and display_opts.anim_in_auto_blob,
     out_on = display_opts and display_opts.anim_out_on,
     out_type = display_opts and display_opts.anim_out_type,
@@ -3541,8 +3905,14 @@ local function append_layout_seg_eel(lines, seg, fontn, display_opts, words, ani
     out_twist = display_opts
       and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_twist) or display_opts.anim_out_twist),
     wipe_mask_offset = display_opts and display_opts.anim_wipe_mask_offset,
+    out_use_graph = display_opts
+      and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_use_graph) or display_opts.anim_out_use_graph),
     out_graph = display_opts
       and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_graph) or display_opts.anim_out_graph),
+    out_auto_blob = display_opts
+      and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_auto_blob) or display_opts.anim_out_auto_blob),
+    out_graph_word_span = display_opts
+      and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_graph_word_span) or display_opts.anim_out_graph_word_span),
   }
   local phrase_start_w = tonumber(seg.phrase_start_w) or ((seg.row_start_w and seg.row_start_w[1]) or 1)
   local phrase_out_on = display_opts and display_opts.anim_phrase_out_on
@@ -3646,6 +4016,7 @@ local function append_layout_seg_eel(lines, seg, fontn, display_opts, words, ani
     out_use_graph = display_opts and (display_opts.anim_phrase_out_use_graph or display_opts.anim_out_use_graph),
     out_graph = display_opts and (display_opts.anim_phrase_out_graph or display_opts.anim_out_graph),
     out_auto_blob = display_opts and (display_opts.anim_phrase_out_auto_blob or display_opts.anim_out_auto_blob),
+    out_graph_word_span = display_opts and (display_opts.anim_phrase_out_graph_word_span or display_opts.anim_out_graph_word_span),
   })
   lines[#lines + 1] = "  a1=1;"
   for i = 2, n do
@@ -3886,7 +4257,7 @@ local function build_eel_body(words, src_end, startoffs, playrate, display_opts)
   lines[#lines + 1] = "iw=0; ih=0;"
   lines[#lines + 1] = "input_info(0, iw, ih);"
   lines[#lines + 1] = "wxov_vx=0; wxov_vy=0; wxov_vw=project_w; wxov_vh=project_h; ((iw>0) && (ih>0) && (project_w>0) && (project_h>0)) ? (wxov_ir=iw/ih; wxov_pr=project_w/project_h; (wxov_pr>wxov_ir) ? (wxov_vh=project_h; wxov_vw=floor(wxov_vh*wxov_ir+0.5); wxov_vx=floor((project_w-wxov_vw)*0.5+0.5);) : (wxov_vw=project_w; wxov_vh=floor(wxov_vw/wxov_ir+0.5); wxov_vy=floor((project_h-wxov_vh)*0.5+0.5);););"
-  lines[#lines + 1] = "gfx_blit(0, 0, 0, 0, project_w, project_h); wxov_spin=floor(wxov_spin+0.5);"
+  lines[#lines + 1] = "gfx_blit(0, 0, 0, 0, project_w, project_h); wxov_spin=floor(wxov_spin+0.5); wxov_ol0=floor(wxov_ol0+0.5); wxov_ol1=floor(wxov_ol1+0.5); wxov_ol2=floor(wxov_ol2+0.5); wxov_ol3=floor(wxov_ol3+0.5);"
   append_video_ratio_guides_eel(lines, display_opts and display_opts.video_guides)
   lines[#lines + 1] = "src=SO+time*PR;"
   lines[#lines + 1] = "txtw=0; txth=0;"
@@ -3953,6 +4324,7 @@ local function build_eel_body(words, src_end, startoffs, playrate, display_opts)
         wipe_mask_offset = display_opts and display_opts.anim_wipe_mask_offset,
         in_use_graph = display_opts and display_opts.anim_in_use_graph,
         in_graph = display_opts and display_opts.anim_in_graph,
+        in_graph_word_span = display_opts and display_opts.anim_in_graph_word_span,
         in_auto_blob = display_opts and display_opts.anim_in_auto_blob,
         out_on = display_opts and (display_opts.anim_out_on or display_opts.anim_phrase_out_on),
         out_type = display_opts and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_type) or display_opts.anim_out_type),
@@ -3977,6 +4349,8 @@ local function build_eel_body(words, src_end, startoffs, playrate, display_opts)
           and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_graph) or display_opts.anim_out_graph),
         out_auto_blob = display_opts
           and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_auto_blob) or display_opts.anim_out_auto_blob),
+        out_graph_word_span = display_opts
+          and ((display_opts.anim_phrase_out_on and display_opts.anim_phrase_out_graph_word_span) or display_opts.anim_out_graph_word_span),
       }
       append_anim_eel(lines, "as_", T0s, T1s, seg_anim_cfg)
       local sfnt = word_style_font_expr_for_text(fontn, st, seg.text or "")
@@ -4332,6 +4706,7 @@ local function default_display_opts()
     anim_in_dir = 90,
     anim_in_twist = 0,
     anim_in_use_graph = false,
+    anim_in_graph_word_span = false,
     anim_in_graph = "0,0,0|0.65,0,1;0",
     anim_in_auto_blob = "",
     anim_out_on = false,
@@ -4355,6 +4730,7 @@ local function default_display_opts()
     anim_out_dir = 90,
     anim_out_twist = 0,
     anim_out_use_graph = false,
+    anim_out_graph_word_span = false,
     anim_out_graph = "0,0,0|0.65,0,1;0",
     anim_out_auto_blob = "",
     anim_phrase_out_bounce = 0.7,
@@ -4369,6 +4745,7 @@ local function default_display_opts()
     anim_phrase_out_twist = 0,
     anim_wipe_mask_offset = 0,
     anim_phrase_out_use_graph = false,
+    anim_phrase_out_graph_word_span = false,
     anim_phrase_out_graph = "0,0,0|0.65,0,1;0",
     anim_phrase_out_auto_blob = "",
     word_styles = nil,
@@ -4443,7 +4820,7 @@ end
 --- Insert newlines from slider rules (original marker spellings). Does not change word text.
 local OVERLAY_UI_EXT_SECTION = "BRYAN_WX_OVERLAY_UI"
 
---- Combo index as stored by the bridge (0 = Word … 3 = Triple). Legacy 4 (stairs) maps to triple.
+--- Combo index as stored by the bridge (0 = Word … 3 = Triple). Legacy 4 still maps to triple (stairs removed from UI).
 local function overlay_preset_from_combo_index(idx)
   idx = math.floor(tonumber(idx) or 0)
   if idx == 1 then
@@ -4529,6 +4906,12 @@ local function word_styles_from_blob(blob)
       st.underline_thick = tonumber(parts[11])
       st.underline_offset = tonumber(parts[12])
       st.anim_preset_name = tostring(parts[13] or ""):match("^%s*(.-)%s*$")
+      st.outline_thickness = tonumber(parts[14])
+      st.outline_gap = tonumber(parts[15])
+      local oc = tonumber(parts[16])
+      if oc then
+        st.outline_color = math.max(0, math.min(0xFFFFFF, math.floor(oc)))
+      end
       if st.flags ~= 0 or st.text_color ~= nil or st.highlight_color ~= nil or st.anim_preset_name ~= "" then
         out[wi] = st
       end
@@ -4598,14 +4981,25 @@ end
 --- Optional `n_words`: when set (e.g. `#words`), parses `ML_PHRASE_AFTER` / `ML_ROW_AFTER` into `display_opts.ml_*` for triple/stairs CJK parse.
 local function overlay_display_opts_from_extstate(section, item, n_words)
   section = (type(section) == "string" and section ~= "" and section) or OVERLAY_UI_EXT_SECTION
-  local idx = math.floor(tonumber(r.GetExtState(section, "PRESET_IDX")) or 0)
-  if idx < 0 or idx > 4 then
-    idx = 0
+  --- Always triple-stack layout in UI; legacy PRESET_IDX / KARAOKE migrate into SHOW_WORDS_MODE.
+  local ml_timing_mode = math.floor(tonumber(r.GetExtState(section, "SHOW_WORDS_MODE")) or -1)
+  if ml_timing_mode < 0 or ml_timing_mode > 2 then
+    local idx = math.floor(tonumber(r.GetExtState(section, "PRESET_IDX")) or 3)
+    if idx == 4 then
+      idx = 3
+    end
+    idx = math.max(0, math.min(4, idx))
+    local karaoke_legacy = ext_bool_section(section, "KARAOKE", true)
+    if idx == 0 then
+      ml_timing_mode = 2
+    elseif karaoke_legacy then
+      ml_timing_mode = 0
+    else
+      ml_timing_mode = 1
+    end
   end
-  local karaoke = ext_bool_section(section, "KARAOKE", true)
-  if idx == 0 then
-    karaoke = false
-  end
+  ml_timing_mode = math.max(0, math.min(2, ml_timing_mode))
+  local karaoke = ml_timing_mode ~= 1
   local wpl = math.max(1, math.min(64, math.floor(tonumber(r.GetExtState(section, "WORDS_PER_LINE")) or 8)))
   local mx = math.max(0, math.min(500, math.floor(tonumber(r.GetExtState(section, "MAX_CHARS")) or 0)))
   local brk = ext_bool_section(section, "BREAK_SENTENCE", false)
@@ -4635,12 +5029,13 @@ local function overlay_display_opts_from_extstate(section, item, n_words)
   end
   local ml_pa, ml_ra = overlay_ml_after_tables_for_word_count(section, n_words)
   return {
-    preset = overlay_preset_from_combo_index(idx),
+    preset = PRESET_LINE_TRIPLE,
     words_per_line = wpl,
     max_chars = mx,
     break_after_sentence = brk,
     editor_text = et,
     karaoke = karaoke,
+    ml_timing_mode = ml_timing_mode,
     layout_max_rows = ml_max,
     layout_line_scales = ls,
     layout_line_rand = lr,
@@ -4684,6 +5079,7 @@ local function overlay_display_opts_from_extstate(section, item, n_words)
     anim_in_dir = math.max(-180, math.min(180, tonumber(r.GetExtState(section, "ANIM_IN_DIR")) or 90)),
     anim_in_twist = math.max(-720, math.min(720, tonumber(r.GetExtState(section, "ANIM_IN_TWIST")) or 0)),
     anim_in_use_graph = ext_bool_section(section, "ANIM_IN_USE_GRAPH", false),
+    anim_in_graph_word_span = ext_bool_section(section, "ANIM_IN_GRAPH_WORD_SPAN", false),
     anim_in_graph = (function()
       local g = r.GetExtState(section, "ANIM_IN_GRAPH")
       if type(g) == "string" and g ~= "" then
@@ -4735,6 +5131,7 @@ local function overlay_display_opts_from_extstate(section, item, n_words)
     anim_out_dir = math.max(-180, math.min(180, tonumber(r.GetExtState(section, "ANIM_OUT_DIR")) or 90)),
     anim_out_twist = math.max(-720, math.min(720, tonumber(r.GetExtState(section, "ANIM_OUT_TWIST")) or 0)),
     anim_out_use_graph = ext_bool_section(section, "ANIM_OUT_USE_GRAPH", false),
+    anim_out_graph_word_span = ext_bool_section(section, "ANIM_OUT_GRAPH_WORD_SPAN", false),
     anim_out_graph = (function()
       local g = r.GetExtState(section, "ANIM_OUT_GRAPH")
       if type(g) == "string" and g ~= "" then
@@ -4761,6 +5158,7 @@ local function overlay_display_opts_from_extstate(section, item, n_words)
       )
     ),
     anim_phrase_out_use_graph = ext_bool_section(section, "ANIM_PHRASE_OUT_USE_GRAPH", false),
+    anim_phrase_out_graph_word_span = ext_bool_section(section, "ANIM_PHRASE_OUT_GRAPH_WORD_SPAN", false),
     anim_phrase_out_graph = (function()
       local g = r.GetExtState(section, "ANIM_PHRASE_OUT_GRAPH")
       if type(g) == "string" and g ~= "" then
@@ -4788,36 +5186,38 @@ local function overlay_display_opts_from_extstate(section, item, n_words)
   }
 end
 
---- Fingerprint marker times + spellings for live-sync scripts (order-sensitive).
-local function overlay_marker_signature(words)
-  if not words or #words == 0 then
-    return ""
-  end
-  local parts = {}
-  for i = 1, #words do
-    parts[#parts + 1] = string.format("%.17g", words[i].t) .. "\031" .. tostring(words[i].w or "")
-  end
-  return table.concat(parts, "\030")
-end
-
-local function draft_editor_text_from_sliders(words, display_opts)
-  display_opts = display_opts or {}
-  if not words or #words == 0 then
-    return ""
-  end
-  local lines = split_words_into_lines(
-    words,
-    display_opts.words_per_line,
-    display_opts.max_chars,
-    display_opts.break_after_sentence and true or false
-  )
-  local sep = words_use_cjk_compact_join(words) and "" or " "
-  local parts = {}
-  for i = 1, #lines do
-    parts[#parts + 1] = join_words_range(lines[i], 1, #lines[i], sep)
-  end
-  return table.concat(parts, "\n")
-end
+--- Fingerprint marker times + spellings for live-sync scripts (order-sensitive), plus draft editor helpers.
+--- Packaged in one table to stay under Lua's 200 top-level locals per chunk.
+local _wx_overlay_tail = {
+  overlay_marker_signature = function(words)
+    if not words or #words == 0 then
+      return ""
+    end
+    local parts = {}
+    for i = 1, #words do
+      parts[#parts + 1] = string.format("%.17g", words[i].t) .. "\031" .. tostring(words[i].w or "")
+    end
+    return table.concat(parts, "\030")
+  end,
+  draft_editor_text_from_sliders = function(words, display_opts)
+    display_opts = display_opts or {}
+    if not words or #words == 0 then
+      return ""
+    end
+    local lines = split_words_into_lines(
+      words,
+      display_opts.words_per_line,
+      display_opts.max_chars,
+      display_opts.break_after_sentence and true or false
+    )
+    local sep = words_use_cjk_compact_join(words) and "" or " "
+    local parts = {}
+    for i = 1, #lines do
+      parts[#parts + 1] = join_words_range(lines[i], 1, #lines[i], sep)
+    end
+    return table.concat(parts, "\n")
+  end,
+}
 
 return {
   READ_MARKER_WORDS_AS_IS = READ_MARKER_WORDS_AS_IS,
@@ -4842,7 +5242,7 @@ return {
   words_use_cjk_compact_join = words_use_cjk_compact_join,
   default_editor_text_from_words = default_editor_text_from_words,
   editor_text_from_words_flat_until_punct = editor_text_from_words_flat_until_punct,
-  draft_editor_text_from_sliders = draft_editor_text_from_sliders,
+  draft_editor_text_from_sliders = _wx_overlay_tail.draft_editor_text_from_sliders,
   editor_text_from_ml_after_flags = editor_text_from_ml_after_flags,
   split_words_into_lines = split_words_into_lines,
   eel_plain_to_reaper_vp_chunk = eel_plain_to_reaper_vp_chunk,
@@ -4851,6 +5251,6 @@ return {
   overlay_display_opts_from_extstate = overlay_display_opts_from_extstate,
   OVERLAY_ITEM_EXT_WORD_STYLES = OVERLAY_ITEM_EXT_WORD_STYLES,
   OVERLAY_ITEM_EXT_ROW_SPACING = OVERLAY_ITEM_EXT_ROW_SPACING,
-  overlay_marker_signature = overlay_marker_signature,
+  overlay_marker_signature = _wx_overlay_tail.overlay_marker_signature,
   overlay_preset_from_combo_index = overlay_preset_from_combo_index,
 }

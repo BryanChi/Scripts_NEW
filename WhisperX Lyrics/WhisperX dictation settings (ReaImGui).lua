@@ -1,5 +1,5 @@
 -- @description WhisperX dictation — settings (ReaImGui)
--- @version 1.02
+-- @version 1.06
 -- @author Bryan
 -- @about
 --   Edits global extstate BRYAN_WHISPERX used by "WhisperX dictation (selected item to JSON).lua".
@@ -49,6 +49,8 @@ local MODEL_ITEMS_STR =
   "tiny\0tiny.en\0base\0base.en\0small\0small.en\0medium\0medium.en\0large-v1\0large-v2\0large-v3\0"
 
 local MARKER_ITEMS_STR = "start\0mid\0end\0"
+
+local VAD_ITEMS_STR = "pyannote\0silero\0"
 
 local INTERP_ITEMS_STR = "linear\0nearest\0quadratic\0"
 
@@ -238,6 +240,12 @@ local state = {
   marker_idx = index_in_list(MARKER_ITEMS_STR, es_get("MARKER_AT", "start")),
   timeout_ms = es_get("TIMEOUT_MS", "0"),
   max_markers = es_get("MAX_WORD_MARKERS", "1500"),
+  chunk_size = es_get("CHUNK_SIZE", ""),
+  vad_idx = index_in_list(VAD_ITEMS_STR, es_get("VAD_METHOD", "pyannote")),
+  vad_onset = es_get("VAD_ONSET", ""),
+  vad_offset = es_get("VAD_OFFSET", ""),
+  beam_size = es_get("BEAM_SIZE", ""),
+  align_model = es_get("ALIGN_MODEL", ""),
   use_background = es_bool("USE_BACKGROUND", true),
   write_notes = es_bool("WRITE_ITEM_NOTES", true),
   write_markers = es_bool("WRITE_TAKE_MARKERS", true),
@@ -369,13 +377,59 @@ local function save_settings()
     return
   end
 
+  local cs_raw = (state.chunk_size or ""):match("^%s*(.-)%s*$") or ""
+  if cs_raw ~= "" then
+    local cs = tonumber(cs_raw)
+    if not cs or cs < 4 or cs > 120 then
+      state.status = "CHUNK_SIZE must be empty (default) or an integer from 4 to 120 seconds."
+      state.status_err = true
+      return
+    end
+    cs_raw = tostring(math.floor(cs + 0.5))
+  end
+
+  local vo_raw = (state.vad_onset or ""):match("^%s*(.-)%s*$") or ""
+  if vo_raw ~= "" then
+    local vo = tonumber(vo_raw)
+    if not vo or vo < 0.001 or vo > 1.0 then
+      state.status = "VAD_ONSET must be empty or a number between 0.001 and 1.0."
+      state.status_err = true
+      return
+    end
+    vo_raw = tostring(vo)
+  end
+
+  local vf_raw = (state.vad_offset or ""):match("^%s*(.-)%s*$") or ""
+  if vf_raw ~= "" then
+    local vf = tonumber(vf_raw)
+    if not vf or vf < 0.001 or vf > 1.0 then
+      state.status = "VAD_OFFSET must be empty or a number between 0.001 and 1.0."
+      state.status_err = true
+      return
+    end
+    vf_raw = tostring(vf)
+  end
+
+  local bm_raw = (state.beam_size or ""):match("^%s*(.-)%s*$") or ""
+  if bm_raw ~= "" then
+    local bm = tonumber(bm_raw)
+    if not bm or bm < 1 or bm > 50 then
+      state.status = "BEAM_SIZE must be empty or an integer from 1 to 50."
+      state.status_err = true
+      return
+    end
+    bm_raw = tostring(math.floor(bm + 0.5))
+  end
+
   local marker_labels = split_null(MARKER_ITEMS_STR)
   local interp_labels = split_null(INTERP_ITEMS_STR)
+  local vad_labels = split_null(VAD_ITEMS_STR)
   local device_labels = split_null(DEVICE_ITEMS_STR)
   local compute_labels = split_null(COMPUTE_ITEMS_STR)
 
   local marker_at = marker_labels[state.marker_idx + 1] or "start"
   local interp = interp_labels[state.interp_idx + 1] or "linear"
+  local vad_m = vad_labels[state.vad_idx + 1] or "pyannote"
   local device = device_labels[state.device_idx + 1] or "cpu"
   local compute = compute_labels[state.compute_idx + 1] or "int8"
 
@@ -388,6 +442,12 @@ local function save_settings()
   r.SetExtState(SECTION, "USE_BACKGROUND", state.use_background and "1" or "0", true)
   r.SetExtState(SECTION, "WRITE_ITEM_NOTES", state.write_notes and "1" or "0", true)
   r.SetExtState(SECTION, "WRITE_TAKE_MARKERS", state.write_markers and "1" or "0", true)
+  r.SetExtState(SECTION, "CHUNK_SIZE", cs_raw, true)
+  r.SetExtState(SECTION, "VAD_METHOD", vad_m, true)
+  r.SetExtState(SECTION, "VAD_ONSET", vo_raw, true)
+  r.SetExtState(SECTION, "VAD_OFFSET", vf_raw, true)
+  r.SetExtState(SECTION, "BEAM_SIZE", bm_raw, true)
+  r.SetExtState(SECTION, "ALIGN_MODEL", (state.align_model or ""):match("^%s*(.-)%s*$") or "", true)
   r.SetExtState(SECTION, "DEVICE", device, true)
   r.SetExtState(SECTION, "COMPUTE_TYPE", compute, true)
 
@@ -401,7 +461,7 @@ local ctx = ImGui.CreateContext(WINDOW_TITLE)
 
 local function loop()
   local flags = ImGui.WindowFlags_NoCollapse
-  ImGui.SetNextWindowSize(ctx, 640, 540, ImGui.Cond_FirstUseEver)
+  ImGui.SetNextWindowSize(ctx, 640, 680, ImGui.Cond_FirstUseEver)
   local visible, open = ImGui.Begin(ctx, WINDOW_TITLE, true, flags)
   if visible then
     ImGui.TextWrapped(
@@ -461,6 +521,31 @@ local function loop()
 
     rv, state.interp_idx = ImGui.Combo(ctx, "Align interpolation", state.interp_idx, INTERP_ITEMS_STR)
     rv, state.marker_idx = ImGui.Combo(ctx, "Take marker time", state.marker_idx, MARKER_ITEMS_STR)
+
+    ImGui.Spacing(ctx)
+    ImGui.Text(ctx, "Segmentation / WhisperX pipeline")
+    ImGui.TextWrapped(
+      ctx,
+      "Alignment runs inside each Whisper segment. Long segments hurt JA mora timing; smaller CHUNK_SIZE (seconds) splits passes before wav2vec — maps to WhisperX transcribe chunk_size / vad_options."
+    )
+    rv, state.chunk_size = ImGui.InputTextWithHint(
+      ctx,
+      "CHUNK_SIZE (seconds)",
+      "empty = default ~30; try 12–18 for dense lyrics",
+      state.chunk_size or ""
+    )
+    rv, state.vad_idx = ImGui.Combo(ctx, "VAD_METHOD", state.vad_idx, VAD_ITEMS_STR)
+    rv, state.vad_onset = ImGui.InputTextWithHint(ctx, "VAD_ONSET", "empty = Whisper default (~0.5)", state.vad_onset or "")
+    rv, state.vad_offset =
+      ImGui.InputTextWithHint(ctx, "VAD_OFFSET", "empty = Whisper default (~0.363)", state.vad_offset or "")
+    rv, state.beam_size =
+      ImGui.InputTextWithHint(ctx, "BEAM_SIZE", "empty = Whisper default (5)", state.beam_size or "")
+    rv, state.align_model = ImGui.InputTextWithHint(
+      ctx,
+      "ALIGN_MODEL",
+      "optional HF wav2vec2 id for forced alignment",
+      state.align_model or ""
+    )
 
     ImGui.Spacing(ctx)
     ImGui.Text(ctx, "Inference")
