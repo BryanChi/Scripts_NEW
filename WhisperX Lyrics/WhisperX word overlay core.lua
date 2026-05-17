@@ -1,5 +1,5 @@
 -- WhisperX word overlay — shared core (loaded by action scripts; not a ReaPack action).
--- @version 1.68
+-- @version 1.69
 
 local r = reaper
 
@@ -1694,12 +1694,14 @@ local function word_style_for(display_opts, wi)
   end
   local anim_preset_name = tostring(st.anim_preset_name or ""):match("^%s*(.-)%s*$")
   local flags = math.max(0, math.floor(tonumber(st.flags) or 0))
-  if flags == 0 and st.text_color == nil and st.highlight_color == nil and anim_preset_name == "" then
+  local font_name = trim_display_line(tostring(st.font_name or ""))
+  if flags == 0 and st.text_color == nil and st.highlight_color == nil and anim_preset_name == "" and font_name == "" then
     return nil
   end
   return {
     flags = flags,
     anim_preset_name = anim_preset_name,
+    font_name = font_name,
     text_color = tonumber(st.text_color),
     highlight_color = tonumber(st.highlight_color),
     pseudo_bold_copies = math.max(1, math.min(8, math.floor(tonumber(st.pseudo_bold_copies) or 2))),
@@ -1816,8 +1818,9 @@ local function append_outline_mask_post_eel(lines, or_, og, ob, tr, tg, tb, gap_
     cur, nxt = nxt, cur
   end
   local mbig = cur
+  -- gfx_evalrect: first src -> sr/sg/sb/sa, second -> s2r/s2g/s2b/s2a. Ring uses outer−inner; fill recolors dest matte (see fill_code).
   local ring_code = string.format(
-    "a=max(0,sa-s2a); (a<0.5)?(r=0;g=0;b=0;a=0;):(r=min(255,%s*a); g=min(255,%s*a); b=min(255,%s*a););",
+    "_m1=min(255,sa); _m2=min(255,s2a); a=max(0,_m1-_m2); (a<=0)?(r=0;g=0;b=0;a=0;):(r=%s*a; g=%s*a; b=%s*a;);",
     or_,
     og,
     ob
@@ -1828,12 +1831,8 @@ local function append_outline_mask_post_eel(lines, or_, og, ob, tr, tg, tb, gap_
     .. '",0,'
     .. mbig
     .. ',"",wxov_ol2);'
-  local fill_code = string.format(
-    "a=sa; r=min(255,%s*a); g=min(255,%s*a); b=min(255,%s*a);",
-    tr,
-    tg,
-    tb
-  )
+  -- Recolor glyph matte using dest pixel alpha (chroma output); avoid second-src eval quirks on blit+preset sa.
+  local fill_code = string.format("na=a; r=%s*na; g=%s*na; b=%s*na; a=na;", tr, tg, tb)
   lines[#lines + 1] = "  gfx_dest=wxov_ol0; gfx_mode=0; gfx_set(0,0,0,0); gfx_fillrect(0,0,wxov_ps,wxov_ps); gfx_blit(wxov_ol3,1,0,0,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps);"
   lines[#lines + 1] = '  gfx_evalrect(0,0,wxov_ps,wxov_ps,"' .. fill_code .. '",0);'
   lines[#lines + 1] = "  gfx_dest=wxov_spin; gfx_mode=0x10000; gfx_a=1; gfx_blit(wxov_ol0,1,0,0,wxov_ps,wxov_ps,0,0,wxov_ps,wxov_ps); gfx_mode=0; gfx_a=1;"
@@ -1841,6 +1840,12 @@ end
 
 local function word_style_font_expr(fontn, st)
   local f = fontn or ""
+  if st then
+    local ow = trim_display_line(tostring(st.font_name or ""))
+    if ow ~= "" then
+      f = ow
+    end
+  end
   local flags = st and math.max(0, math.floor(tonumber(st.flags) or 0)) or 0
   if (flags & WSTYLE_BOLD) ~= 0 and (flags & WSTYLE_ITALIC) ~= 0 then
     f = f .. " Bold Italic"
@@ -4865,6 +4870,14 @@ local function video_guides_from_extstate(section)
   return (#out > 0) and out or nil
 end
 
+--- `@*` escapes in optional `font_name` field (last `:`-delimited field) so `:`/`;`/`@` survive blob storage.
+local function word_style_font_blob_unesc(s)
+  if type(s) ~= "string" or s == "" then
+    return ""
+  end
+  return s:gsub("@S", ";"):gsub("@C", ":"):gsub("@@", "@")
+end
+
 local function word_styles_from_blob(blob)
   local out = {}
   if type(blob) ~= "string" or blob == "" then
@@ -4912,7 +4925,8 @@ local function word_styles_from_blob(blob)
       if oc then
         st.outline_color = math.max(0, math.min(0xFFFFFF, math.floor(oc)))
       end
-      if st.flags ~= 0 or st.text_color ~= nil or st.highlight_color ~= nil or st.anim_preset_name ~= "" then
+      st.font_name = word_style_font_blob_unesc(parts[17] or "")
+      if st.flags ~= 0 or st.text_color ~= nil or st.highlight_color ~= nil or st.anim_preset_name ~= "" or trim_display_line(st.font_name or "") ~= "" then
         out[wi] = st
       end
     end

@@ -1,5 +1,5 @@
 -- @description WhisperX: word overlay bridge — presets & lines (ReaImGui → Video Processor)
--- @version 1.90
+-- @version 1.92
 -- @author Bryan
 -- @about
 --   GUI for the WhisperX Video Processor overlay: subtitle text is taken from take markers only (no free typing).
@@ -10,10 +10,10 @@
 --   Phrase/row structure is stored in extstate and synced for the VP core parser.
 --   Per-line size & randomize: jitter is stable until you move that row’s Randomize slider; row gap (% of fontPx). Apply/Save writes jitter to extstate for marker-sync.
 --   "Re-read markers → VP" refreshes take marker times from the item and rewrites the Video Processor
---   (no undo per push). “Live VP” (on by default) rewrites VP when controls are idle; uncheck if chunk writes glitch.
+--   (no undo per push). Video Processor updates run after you finish editing a control (deactivate-after-edit / combo pick) or when layout autosaves, not every frame.
 --   Separate action “WhisperX word overlay live VP sync take markers.lua” watches markers.
 --   “Save subtitle text to item” stores the editor in the media item’s extended state (P_EXT) so reopening the bridge restores it when it still matches markers.
---   Per-word styling and the word color palette are stored on that same item (separate P_EXT keys), so they do not carry over when you select a different item.
+--   Per-word styling (including optional per-word font), the word color palette, and related P_EXT keys are stored on that same item, so they do not carry over when you select a different item.
 --   Triple-stack: optional max characters per visual row (UTF-8 length) plus ± range varied per phrase (stable seed until you move those sliders); row indent sliders use their own seed.
 --   Requires ReaImGui and "WhisperX word overlay core.lua".
 
@@ -503,12 +503,30 @@ local state = {
   font_favorites = {},
   font_list_ready = false,
   font_scan_attempted = false,
-  live_gui_vp = es_bool("LIVE_GUI_VP", true),
+  --- Queued when a VP-affecting control ends an edit (or autosave runs); flushed when safe.
+  _wx_vp_sync_pending = false,
   wx_slider_style = tonumber(es_get("WX_SLIDER_STYLE", "1")) or 1,
   wx_slider_demo_value = tonumber(es_get("WX_SLIDER_DEMO_VALUE", "42")) or 42,
   wx_slider_demo_step_value = 2,
   _last_vp_body = nil,
 }
+
+local function wx_request_vp_sync()
+  state._wx_vp_sync_pending = true
+end
+
+--- Dirty flag for custom `InvisibleButton` sliders/knobs (ImGui does not treat them as edited widgets).
+local _wx_slider_vp_dirty = {}
+
+--- After native ImGui widgets (SliderInt, Combo, DragDouble, ColorEdit, …): queue VP sync when the user finishes an edit.
+local function wx_note_std_widget_vp(ctx)
+  if ctx and ImGui.IsItemDeactivatedAfterEdit then
+    local ok, v = pcall(ImGui.IsItemDeactivatedAfterEdit, ctx)
+    if ok and v then
+      wx_request_vp_sync()
+    end
+  end
+end
 
 local function wx_sync_karaoke_derived()
   state.karaoke = state.ml_timing_mode ~= 1
@@ -2087,6 +2105,7 @@ local function font_items_filtered()
 end
 
 -- Forward declare (Lua 5.1 local scoping): refresh_preview, wx_custom_*, wx_bridge_transport_strip (assigned after wx_custom_small_button).
+local overlay_request_autosave
 local refresh_preview
 local wx_custom_slider_int
 local wx_custom_combo
@@ -2292,6 +2311,7 @@ local function display_opts_from_state(words_for_scale)
         wstyles = wstyles or {}
         wstyles[i] = {
           flags = math.max(0, math.floor(tonumber(st.flags) or 0)),
+          font_name = trim(st.font_name or ""),
           text_color = st.text_color,
           highlight_color = st.highlight_color,
           pseudo_bold_copies = st.pseudo_bold_copies,
@@ -2640,12 +2660,17 @@ word_style_is_empty = function(st)
     return true
   end
   local apn = trim(st.anim_preset_name or "")
-  return (tonumber(st.flags) or 0) == 0 and st.text_color == nil and st.highlight_color == nil and apn == ""
+  return (tonumber(st.flags) or 0) == 0
+    and st.text_color == nil
+    and st.highlight_color == nil
+    and apn == ""
+    and trim(st.font_name or "") == ""
 end
 
 word_style_defaults = function(st)
   st = st or {}
   st.flags = math.max(0, math.floor(tonumber(st.flags) or 0))
+  st.font_name = trim(st.font_name or "")
   st.pseudo_bold_copies = math.max(1, math.min(8, math.floor(tonumber(st.pseudo_bold_copies) or 2)))
   st.pseudo_bold_offset = math.max(0.25, math.min(6, tonumber(st.pseudo_bold_offset) or 1))
   st.pseudo_slant = math.max(-12, math.min(12, tonumber(st.pseudo_slant) or 2))
@@ -2747,6 +2772,21 @@ end
 
 word_palette_load_for_item(nil)
 
+--- Escapes optional per-word `font_name` for `:`-delimited style records (`@S` / `@C` / `@@`).
+local function word_style_font_blob_esc(s)
+  if type(s) ~= "string" or s == "" then
+    return ""
+  end
+  return s:gsub("@", "@@"):gsub(";", "@S"):gsub(":", "@C")
+end
+
+local function word_style_font_blob_unesc(s)
+  if type(s) ~= "string" or s == "" then
+    return ""
+  end
+  return s:gsub("@S", ";"):gsub("@C", ":"):gsub("@@", "@")
+end
+
 local function word_styles_parse(blob, n)
   local out = {}
   n = math.max(0, math.floor(tonumber(n) or 0))
@@ -2787,6 +2827,7 @@ local function word_styles_parse(blob, n)
       if oc then
         st.outline_color = math.max(0, math.min(0xFFFFFF, math.floor(oc)))
       end
+      st.font_name = word_style_font_blob_unesc(parts[17] or "")
       word_style_defaults(st)
       if not word_style_is_empty(st) then
         out[wi] = st
@@ -2803,7 +2844,8 @@ local function word_styles_pack(styles, n)
     local st = styles and styles[wi]
     if not word_style_is_empty(st) then
       word_style_defaults(st)
-      recs[#recs + 1] = table.concat({
+      local fn_esc = word_style_font_blob_esc(trim(st.font_name or ""))
+      local fields = {
         tostring(wi),
         tostring(math.max(0, math.floor(tonumber(st.flags) or 0))),
         st.text_color and tostring(math.floor(st.text_color)) or "",
@@ -2820,7 +2862,11 @@ local function word_styles_pack(styles, n)
         tostring(math.floor(st.outline_thickness or 2)),
         tostring(math.floor(st.outline_gap or 0)),
         tostring(math.floor(st.outline_color or 0)),
-      }, ":")
+      }
+      if fn_esc ~= "" then
+        fields[#fields + 1] = fn_esc
+      end
+      recs[#recs + 1] = table.concat(fields, ":")
     end
   end
   return table.concat(recs, ";")
@@ -2900,6 +2946,7 @@ local function word_style_copy(st)
   word_style_defaults(st)
   return {
     flags = st.flags,
+    font_name = trim(st.font_name or ""),
     text_color = st.text_color,
     highlight_color = st.highlight_color,
     pseudo_bold_copies = st.pseudo_bold_copies,
@@ -3080,7 +3127,26 @@ local function ml_sync_editor_text(words)
   state.editor_text = W.editor_text_from_ml_after_flags(words, state.ml_phrase_after, state.ml_row_after)
 end
 
-refresh_preview = function(item)
+--- True if `take` is one of the takes on `mediaitem` (for safe refresh_preview cache).
+local function wx_take_on_item(mediaitem, take)
+  if not (mediaitem and take and r.CountTakes and r.GetMediaItemTake) then
+    return false
+  end
+  local n = r.CountTakes(mediaitem)
+  if not n or n < 1 then
+    return false
+  end
+  for i = 0, n - 1 do
+    if r.GetMediaItemTake(mediaitem, i) == take then
+      return true
+    end
+  end
+  return false
+end
+
+--- Optional `take_cached`, `words_cached`: when the caller already has the WX word list (e.g. main UI loop),
+--- pass them to avoid a second `find_take_and_wx_words` + marker scan every frame.
+refresh_preview = function(item, take_cached, words_cached)
   state.preview_words = 0
   state.preview_lines = 0
   state.preview_segs = 0
@@ -3092,7 +3158,18 @@ refresh_preview = function(item)
   if r.ValidatePtr and not r.ValidatePtr(item, "MediaItem*") then
     return
   end
-  local take, words = W.find_take_and_wx_words(item)
+  local take, words
+  if
+    take_cached
+    and words_cached
+    and type(words_cached) == "table"
+    and #words_cached > 0
+    and (not r.ValidatePtr or (r.ValidatePtr(take_cached, "MediaTake*") and wx_take_on_item(item, take_cached)))
+  then
+    take, words = take_cached, words_cached
+  else
+    take, words = W.find_take_and_wx_words(item)
+  end
   if not take or #words == 0 then
     return
   end
@@ -4042,6 +4119,107 @@ function word_style_apply_change(item, words, ctx)
   end
 end
 
+--- Per-word typeface in the word-style popup (same font list as the overlay; empty = use overlay font).
+local function word_font_selector_ui(ctx, item, words, wi, targets)
+  ensure_font_items(false)
+  if #state.font_items == 0 and not state.font_scan_attempted then
+    ensure_font_items(true)
+  end
+
+  local filtered = font_items_filtered()
+  local font_items = { "<Use overlay font>" }
+  local selected_idx = 0
+  local st_pri = word_style_get(wi)
+  local cur_font = trim(st_pri.font_name or "")
+  local current_seen = cur_font == ""
+  for i = 1, #filtered do
+    local nm = filtered[i].name
+    font_items[#font_items + 1] = nm
+    if cur_font == nm then
+      selected_idx = #font_items - 1
+      current_seen = true
+    end
+  end
+  if not current_seen and cur_font ~= "" then
+    font_items[#font_items + 1] = cur_font
+    selected_idx = #font_items - 1
+  end
+
+  local font_items_str = table.concat(font_items, "\0") .. "\0"
+  local function word_font_combo_popup_header_wrap(ctx2, inner_w, pw, fs, style_idx)
+    local rv_fil = false
+    local new_fil = state.font_combo_filter
+    if ImGui.PushItemWidth then
+      ImGui.PushItemWidth(ctx2, inner_w)
+    end
+    if ImGui.InputTextWithHint then
+      rv_fil, new_fil = ImGui.InputTextWithHint(
+        ctx2,
+        "##word_ov_font_filter",
+        "Filter fonts…",
+        state.font_combo_filter or ""
+      )
+    elseif ImGui.InputText then
+      rv_fil, new_fil = ImGui.InputText(ctx2, "Filter##word_ov_font_filter", state.font_combo_filter or "", 256)
+    end
+    if ImGui.PopItemWidth then
+      ImGui.PopItemWidth(ctx2)
+    end
+    if rv_fil then
+      state.font_combo_filter = new_fil or ""
+      r.SetExtState(SECTION, "FONT_COMBO_FILTER", state.font_combo_filter, true)
+    end
+
+    if wx_custom_small_button(ctx2, "Rescan fonts##word_ov_font_rescan", style_idx) then
+      ensure_font_items(true)
+    end
+    if cur_font ~= "" then
+      ImGui.SameLine(ctx2, 0, 8)
+      local is_fav = state.font_favorites[cur_font] and true or false
+      if wx_custom_small_button(ctx2, (is_fav and "★" or "☆") .. "##word_ov_font_fav", style_idx) then
+        font_toggle_favorite(cur_font)
+      end
+    end
+
+    if #font_items == 1 and #state.font_items == 0 then
+      ImGui.TextColored(ctx2, 0x888888FF, "No system fonts found.")
+    elseif #font_items == 1 then
+      ImGui.TextColored(ctx2, 0x888888FF, "No fonts match filter.")
+    end
+
+    if ImGui.Separator then
+      ImGui.Separator(ctx2)
+    end
+  end
+
+  local rv_font, next_idx = wx_custom_combo(
+    ctx,
+    "##word_overlay_font_combo",
+    "Font",
+    selected_idx,
+    font_items_str,
+    240,
+    state.wx_slider_style,
+    word_font_combo_popup_header_wrap
+  )
+  if rv_font then
+    local nm = font_items[(next_idx or 0) + 1] or ""
+    if (next_idx or 0) == 0 then
+      nm = ""
+    end
+    for ti = 1, #targets do
+      local t = targets[ti]
+      local s = word_style_get(t)
+      s.font_name = nm
+      if word_style_is_empty(s) then
+        state.word_styles[t] = nil
+      end
+    end
+    word_style_apply_change(item, words, ctx)
+    overlay_request_autosave()
+  end
+end
+
 function word_color_edit(ctx, label, color, default_rgb)
   color = tonumber(color) or default_rgb or 0xFFFFFF
   local rv, out = false, color
@@ -4060,6 +4238,7 @@ function word_color_edit(ctx, label, color, default_rgb)
       out = math.max(0, math.min(0xFFFFFF, math.floor(tonumber(out) or color)))
     end
   end
+  wx_note_std_widget_vp(ctx)
   return rv, out
 end
 
@@ -4265,28 +4444,40 @@ function word_style_popup_ui(ctx, item, words, wi)
   if #state.anim_preset_names == 0 then
     ImGui.TextColored(ctx, 0x888888FF, "No animation presets yet.")
   else
+    -- Index 0 is "none" (no override); presets follow at 1..n so empty `anim_preset_name` does not show the first preset.
     local ap_idx = 0
     local current_ap = trim(st.anim_preset_name or "")
-    for i = 1, #state.anim_preset_names do
-      if current_ap == state.anim_preset_names[i] then
-        ap_idx = i - 1
-        break
+    if current_ap ~= "" then
+      for i = 1, #state.anim_preset_names do
+        if current_ap == state.anim_preset_names[i] then
+          ap_idx = i
+          break
+        end
       end
     end
+    local anim_override_items = "none\0" .. table.concat(state.anim_preset_names, "\0") .. "\0"
     local rv_ap, ap_new_idx = wx_custom_combo(
       ctx,
       "##word_anim_preset_override",
-      "Anim preset",
+      "##word_anim_preset_override_cap",
       ap_idx,
-      table.concat(state.anim_preset_names, "\0") .. "\0",
+      anim_override_items,
       240,
       state.wx_slider_style
     )
     if rv_ap then
-      local nm = state.anim_preset_names[(ap_new_idx or 0) + 1]
-      if nm then
-        st.anim_preset_name = nm
-        changed = true
+      local idx = ap_new_idx or 0
+      if idx == 0 then
+        if trim(st.anim_preset_name or "") ~= "" then
+          st.anim_preset_name = ""
+          changed = true
+        end
+      else
+        local nm = state.anim_preset_names[idx]
+        if nm and st.anim_preset_name ~= nm then
+          st.anim_preset_name = nm
+          changed = true
+        end
       end
     end
   end
@@ -4296,6 +4487,12 @@ function word_style_popup_ui(ctx, item, words, wi)
       changed = true
     end
   end
+  if ImGui.Separator then
+    ImGui.Separator(ctx)
+  end
+  ImGui.Text(ctx, "Per-word font")
+  ImGui.TextColored(ctx, 0x888888FF, "Leave on “Use overlay font” except for this word (or selection). Bold/Italic still apply.")
+  word_font_selector_ui(ctx, item, words, wi, targets)
   if ImGui.Separator then
     ImGui.Separator(ctx)
   end
@@ -4324,6 +4521,7 @@ function word_style_popup_ui(ctx, item, words, wi)
       st.pseudo_bold_offset = math.max(0.25, math.min(6, tonumber(po) or 1))
       changed = true
     end
+    wx_note_std_widget_vp(ctx)
   end
 
   toggle_line("Pseudo slant (offset draw)", WSTYLE_PSEUDO_SLANT)
@@ -4333,6 +4531,7 @@ function word_style_popup_ui(ctx, item, words, wi)
       st.pseudo_slant = math.max(-12, math.min(12, tonumber(sl) or 2))
       changed = true
     end
+    wx_note_std_widget_vp(ctx)
   end
 
   toggle_line("Drop shadow", WSTYLE_SHADOW)
@@ -4342,11 +4541,13 @@ function word_style_popup_ui(ctx, item, words, wi)
       st.shadow_dx = math.max(-20, math.min(20, tonumber(dx) or 2))
       changed = true
     end
+    wx_note_std_widget_vp(ctx)
     local rvdy, dy = ImGui.DragDouble(ctx, "Shadow Y px", st.shadow_dy or 2, 0.1, -20, 20, "%.1f")
     if rvdy then
       st.shadow_dy = math.max(-20, math.min(20, tonumber(dy) or 2))
       changed = true
     end
+    wx_note_std_widget_vp(ctx)
     local sha = math.floor((tonumber(st.shadow_alpha) or 0.55) * 100 + 0.5)
     local rvsa, sha2 = wx_custom_slider_int(ctx, "##word_shadow_alpha", "Shadow alpha", sha, 0, 100, "%d%%", 260, state.wx_slider_style)
     if rvsa then
@@ -4398,6 +4599,7 @@ function word_style_popup_ui(ctx, item, words, wi)
       st.underline_offset = math.max(-8, math.min(16, tonumber(uo) or 1))
       changed = true
     end
+    wx_note_std_widget_vp(ctx)
   end
 
   toggle_line("Highlight", WSTYLE_HIGHLIGHT)
@@ -5181,7 +5383,6 @@ function save_settings()
   r.SetExtState(SECTION, "ML_INDENT_RAND", string.format("%.17g", state.ml_indent_rand), true)
   r.SetExtState(SECTION, "ML_INDENT_SEED", string.format("%.17g", state.ml_indent_seed), true)
   persist_ml_jitter()
-  r.SetExtState(SECTION, "LIVE_GUI_VP", state.live_gui_vp and "1" or "0", true)
   r.SetExtState(SECTION, "WORD_GRID_H", tostring(math.floor((state.word_grid_h or 240) + 0.5)), true)
   r.SetExtState(SECTION, "WORD_GRID_FLOAT", state.word_grid_floating and "1" or "0", true)
   r.SetExtState(SECTION, "ANIM_WIPE_MASK_OFFSET", string.format("%.17g", state.anim_wipe_mask_offset or 0), true)
@@ -5331,8 +5532,9 @@ function write_vp_for_item(item, live_opts)
 end
 
 --- Queue a subtitle + item/extstate autosave flush on the next end-of-frame pass (handles font, guides, global sliders, …).
-local function overlay_request_autosave()
+overlay_request_autosave = function()
   state.overlay_autosave_force = true
+  wx_request_vp_sync()
 end
 
 --- Fingerprint written to disk by `auto_persist_layout`; used to coalesce autosaves (word grid + globals + VP settings).
@@ -5396,9 +5598,6 @@ local function overlay_autosave_state_sig(words)
     ap(z)
     ap(blob)
   end
-
-  ap(z .. "LGV")
-  ap(z .. (state.live_gui_vp and "1" or "0"))
 
   local function scalar_anim_blob()
     ap(z .. "ANIM")
@@ -5542,9 +5741,9 @@ local function overlay_autosave_state_sig(words)
   return table.concat(p)
 end
 
---- Live VP: avoid SetItemStateChunk races with native take-marker / item UI (can hard-crash REAPER).
+--- VP chunk writes: avoid SetItemStateChunk races with native take-marker / item UI (can hard-crash REAPER).
 --- Skip while an ImGui control is active, while keyboard focus is outside this ReaImGui context (user in the arrange),
---- and briefly after each successful live chunk write (coalesce frames).
+--- and briefly after each successful chunked write (same guard as former “live VP” polling).
 local LIVE_VP_MIN_WRITE_INTERVAL = 0.09
 
 function anim_graph_live_vp_interacting()
@@ -5573,13 +5772,11 @@ function anim_graph_update_live_vp_coalesce()
   end
   if state.anim_graph_live_vp_was_interacting then
     state.anim_graph_live_vp_was_interacting = false
-    if state.live_gui_vp then
-      state.anim_graph_vp_defer_flush = true
-    end
+    wx_request_vp_sync()
   end
 end
 
-function live_vp_safe_for_chunk_write(ctx)
+function wx_vp_chunk_write_safe(ctx)
   if not ctx then
     return true
   end
@@ -5594,7 +5791,7 @@ function live_vp_safe_for_chunk_write(ctx)
       return false
     end
   end
-  if not state.anim_graph_vp_defer_flush and r.time_precise then
+  if r.time_precise then
     local now = r.time_precise()
     local last = state._live_vp_last_chunk_write_t
     if type(last) == "number" and (now - last) < LIVE_VP_MIN_WRITE_INTERVAL then
@@ -5602,6 +5799,25 @@ function live_vp_safe_for_chunk_write(ctx)
     end
   end
   return true
+end
+
+local function wx_flush_pending_vp_sync(ctx, item, take, words)
+  if not state._wx_vp_sync_pending then
+    return
+  end
+  if not (item and take and words and #words > 0) then
+    return
+  end
+  if state.preview_parse_err ~= "" or (state.preview_segs or 0) <= 0 then
+    return
+  end
+  if not wx_vp_chunk_write_safe(ctx) then
+    return
+  end
+  local ok = write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
+  if ok then
+    state._wx_vp_sync_pending = false
+  end
 end
 
 auto_persist_layout = function(item, words, ctx)
@@ -5635,13 +5851,16 @@ auto_persist_layout = function(item, words, ctx)
   if r.MarkProjectDirty then
     r.MarkProjectDirty(0)
   end
-  refresh_preview(item)
-  if state.live_gui_vp and state.preview_parse_err == "" and state.preview_segs > 0 and live_vp_safe_for_chunk_write(ctx) then
-    local ok_vp = write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
-    if ok_vp and state.anim_graph_vp_defer_flush then
-      state.anim_graph_vp_defer_flush = false
-    end
+  local take_ap = select(1, W.find_take_and_wx_words(item))
+  if take_ap then
+    refresh_preview(item, take_ap, words)
+  else
+    refresh_preview(item)
   end
+  if state.preview_parse_err == "" and state.preview_segs > 0 and wx_vp_chunk_write_safe(ctx) then
+    write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
+  end
+  state._wx_vp_sync_pending = false
   state.overlay_autosave_sig_saved = overlay_autosave_state_sig(words)
 end
 
@@ -6380,6 +6599,7 @@ function wx_degree_knob_int(ctx, id, label, value, min_v, max_v, fmt, width, sty
     if ImGui.PopItemWidth then
       ImGui.PopItemWidth(ctx)
     end
+    wx_note_std_widget_vp(ctx)
     return rv, out
   end
 
@@ -6451,6 +6671,15 @@ function wx_degree_knob_int(ctx, id, label, value, min_v, max_v, fmt, width, sty
     ImGui.SetTooltip(ctx,
       (shown_label ~= "" and (shown_label .. ": ") or "") .. value_text .. "\nDrag vertically • Shift: fine • Double-click: reset")
   end
+  if changed then
+    _wx_slider_vp_dirty[id] = true
+  end
+  if ImGui.IsItemDeactivated and ImGui.IsItemDeactivated(ctx) then
+    if _wx_slider_vp_dirty[id] then
+      wx_request_vp_sync()
+      _wx_slider_vp_dirty[id] = nil
+    end
+  end
   return changed, value
 end
 
@@ -6489,9 +6718,11 @@ wx_custom_slider_int = function(ctx, id, label, value, min_v, max_v, fmt, width,
   if not (ImGui.InvisibleButton and ImGui.GetWindowDrawList and ImGui.DrawList_AddRectFilled and ImGui.DrawList_AddLine and ImGui.GetMousePos) then
     if ImGui.PushItemWidth then ImGui.PushItemWidth(ctx, w) end
     local rv, out = ImGui.SliderInt(ctx, label .. id, value, min_v, max_v, fmt or "%d")
+    wx_note_std_widget_vp(ctx)
     local rv_r, out_r = false, rand_value
     if has_rand then
       rv_r, out_r = ImGui.SliderInt(ctx, "±##" .. id .. "_r", rand_value, 0, rand_max, rand_fmt or "%d")
+      wx_note_std_widget_vp(ctx)
     end
     if ImGui.PopItemWidth then ImGui.PopItemWidth(ctx) end
     return rv, out, rv_r, out_r
@@ -6828,20 +7059,33 @@ wx_custom_slider_int = function(ctx, id, label, value, min_v, max_v, fmt, width,
   if main_hover_paint and ImGui.SetTooltip then
     ImGui.SetTooltip(ctx, shown_label .. ": " .. value_text)
   end
+  if changed or changed_rand then
+    _wx_slider_vp_dirty[id] = true
+  end
+  if ImGui.IsItemDeactivated and ImGui.IsItemDeactivated(ctx) then
+    if _wx_slider_vp_dirty[id] then
+      wx_request_vp_sync()
+      _wx_slider_vp_dirty[id] = nil
+    end
+  end
   return changed, value, changed_rand, rand_value
 end
 
-wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_idx, popup_header_fn)
+wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_idx, popup_header_fn, external_label)
   current_idx = math.floor(tonumber(current_idx) or 0)
   style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
   local ebg, fill, knob, accent = wx_effective_style_colors(style_idx)
   local shown_label = wx_visible_label(label)
+  local elabel = trim(tostring(external_label or ""))
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
   local avail = ml_content_region_avail_x(ctx)
   local requested_w = tonumber(width)
   local w = requested_w and math.min(requested_w, avail) or math.min(fs * 18, avail)
   w = math.max(1, w)
   local h = math.max(26, math.floor(fs * 1.72 + 0.5))
+  if elabel ~= "" then
+    h = math.max(34, math.floor(fs * 2.55 + 0.5))
+  end
   local x, y = 0, 0
   if ImGui.GetCursorScreenPos then x, y = ImGui.GetCursorScreenPos(ctx) end
 
@@ -6851,6 +7095,7 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
   if not (ImGui.InvisibleButton and ImGui.GetWindowDrawList and ImGui.DrawList_AddRectFilled) then
     if ImGui.PushItemWidth then ImGui.PushItemWidth(ctx, w) end
     local rv, out = ImGui.Combo(ctx, label .. id, current_idx, items_str)
+    wx_note_std_widget_vp(ctx)
     if ImGui.PopItemWidth then ImGui.PopItemWidth(ctx) end
     return rv, out
   end
@@ -6881,10 +7126,14 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
   if cur_text == "" then
     cur_text = "—"
   end
-  local line_text = shown_label ~= "" and (shown_label .. ": " .. cur_text) or cur_text
+  local line_text = (elabel ~= "") and cur_text or (shown_label ~= "" and (shown_label .. ": " .. cur_text) or cur_text)
 
   local dl = ImGui.GetWindowDrawList(ctx)
   local rail_x0, rail_x1 = x + fs * 0.45, x + w - fs * 0.45
+  if elabel ~= "" then
+    rail_x0 = x + fs * 0.7
+    rail_x1 = x + w - fs * 0.7
+  end
   local pad_y = fs * 0.18
   local top = y + pad_y
   local bot = y + h - pad_y
@@ -6937,6 +7186,13 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
     text_col = active and fill or knob
   elseif style_idx == 10 then
     text_col = active and 0xFFFFFFFF or fill
+  end
+
+  if elabel ~= "" and ImGui.DrawList_AddText then
+    local _, th_el = wx_text_size(ctx, elabel)
+    local label_ty = mid_y - th_el * 0.5 - 1
+    local lbl_col = hovered and 0xFFFFFFFF or 0xCFCFCFFF
+    ImGui.DrawList_AddText(dl, x, label_ty, lbl_col, elabel)
   end
 
   local tw, th = wx_text_size(ctx, line_text)
@@ -7125,8 +7381,12 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
     ImGui.EndPopup(ctx)
   end
 
+  if changed then
+    wx_request_vp_sync()
+  end
+
   if hovered and ImGui.SetTooltip then
-    ImGui.SetTooltip(ctx, line_text)
+    ImGui.SetTooltip(ctx, (elabel ~= "") and (elabel .. ": " .. cur_text) or line_text)
   end
 
   return changed, current_idx
@@ -9054,6 +9314,14 @@ do
       take, words = W.find_take_and_wx_words(item)
     end
 
+    local function refresh_preview_here()
+      if item and take and words and #words > 0 then
+        refresh_preview(item, take, words)
+      else
+        refresh_preview(item)
+      end
+    end
+
     anim_graph_update_live_vp_coalesce()
 
     wx_draw_hint_row_with_gear(ctx, "")
@@ -9167,7 +9435,7 @@ do
               state.ml_row_spacings[i] = nil
             end
             ml_sync_editor_text(words)
-            refresh_preview(item)
+            refresh_preview_here()
             if auto_persist_layout then
               auto_persist_layout(item, words, ctx)
             end
@@ -9178,7 +9446,7 @@ do
           if item and words and #words > 0 then
             state.word_styles = {}
             persist_word_styles(#words, item)
-            refresh_preview(item)
+            refresh_preview_here()
             if auto_persist_layout then
               auto_persist_layout(item, words, ctx)
             end
@@ -9243,7 +9511,7 @@ do
         end
         if changed_guides then
           state._last_vp_body = nil
-          refresh_preview(item)
+          refresh_preview_here()
           overlay_request_autosave()
         end
 
@@ -9256,29 +9524,33 @@ do
           r.SetExtState(SECTION, "IMG_POST_WAVE", state.img_post_wave and "1" or "0", true)
           changed_post = true
         end
+        wx_note_std_widget_vp(ctx)
         if state.img_post_wave then
           local rv_amp, amp2 = ImGui.DragDouble(ctx, "Wave amp px##img_post_wave_amp", state.img_post_wave_amp or 24, 0.5, 0, 240, "%.1f")
           if rv_amp then
             state.img_post_wave_amp = math.max(0, math.min(240, amp2 or 24))
             r.SetExtState(SECTION, "IMG_POST_WAVE_AMP", string.format("%.17g", state.img_post_wave_amp), true)
-            changed_post = true
+            refresh_preview_here()
           end
+          wx_note_std_widget_vp(ctx)
           local rv_len, len2 = ImGui.DragDouble(ctx, "Wave length px##img_post_wave_len", state.img_post_wave_len or 90, 1, 8, 2000, "%.1f")
           if rv_len then
             state.img_post_wave_len = math.max(8, math.min(2000, len2 or 90))
             r.SetExtState(SECTION, "IMG_POST_WAVE_LEN", string.format("%.17g", state.img_post_wave_len), true)
-            changed_post = true
+            refresh_preview_here()
           end
+          wx_note_std_widget_vp(ctx)
           local rv_speed, speed2 = ImGui.DragDouble(ctx, "Wave speed##img_post_wave_speed", state.img_post_wave_speed or 6, 0.05, -20, 20, "%.2f")
           if rv_speed then
             state.img_post_wave_speed = math.max(-20, math.min(20, speed2 or 6))
             r.SetExtState(SECTION, "IMG_POST_WAVE_SPEED", string.format("%.17g", state.img_post_wave_speed), true)
-            changed_post = true
+            refresh_preview_here()
           end
+          wx_note_std_widget_vp(ctx)
         end
         if changed_post then
           state._last_vp_body = nil
-          refresh_preview(item)
+          refresh_preview_here()
           overlay_request_autosave()
         end
 
@@ -9614,7 +9886,7 @@ do
         end
         if changed_anim then
           persist_anim_settings_extstate()
-          refresh_preview(item)
+          refresh_preview_here()
           overlay_request_autosave()
         end
 
@@ -9755,7 +10027,7 @@ do
             end
             local valign_items = "Top\0Middle\0Bottom\0"
             iw = ml_layout_flow_next_cell(ctx)
-            local rv_va, va2 = wx_custom_combo(ctx, "##mlva", "Row V-align", state.ml_row_v_align or 0, valign_items, iw, state.wx_slider_style)
+            local rv_va, va2 = wx_custom_combo(ctx, "##mlva", "##mlva_cap", state.ml_row_v_align or 0, valign_items, iw, state.wx_slider_style, nil, "Row V-align")
             if rv_va then
               state.ml_row_v_align = math.max(0, math.min(2, va2 or 0))
               changed_layout = true
@@ -9807,7 +10079,7 @@ do
           end
 
           if changed_layout then
-            refresh_preview(item)
+            refresh_preview_here()
             overlay_request_autosave()
           end
 
@@ -9839,7 +10111,7 @@ do
     end
 
     ImGui.Separator(ctx)
-    refresh_preview(item)
+    refresh_preview_here()
     local autosave_force = state.overlay_autosave_force
     state.overlay_autosave_force = false
     if item and words and #words > 0 then
@@ -9857,6 +10129,8 @@ do
       state.overlay_autosave_force = true
     end
 
+    wx_flush_pending_vp_sync(ctx, item, take, words)
+
     state.prev_words_count = (words and #words) or 0
     if item and words and #words > 0 then
       ImGui.Text(
@@ -9868,23 +10142,6 @@ do
           state.preview_segs
         )
       )
-    end
-
-    rv, state.live_gui_vp = ImGui.Checkbox(
-      ctx,
-      "Live VP (writes VP chunk when idle; no undo per tweak)",
-      state.live_gui_vp
-    )
-    if rv then
-      state._last_vp_body = nil
-      r.SetExtState(SECTION, "LIVE_GUI_VP", state.live_gui_vp and "1" or "0", true)
-      overlay_request_autosave()
-    end
-    if state.live_gui_vp and item and words and #words > 0 and state.preview_parse_err == "" and state.preview_segs > 0 and live_vp_safe_for_chunk_write(ctx) then
-      local ok_live = write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
-      if ok_live and state.anim_graph_vp_defer_flush then
-        state.anim_graph_vp_defer_flush = false
-      end
     end
 
     ImGui.Separator(ctx)
@@ -9911,7 +10168,7 @@ do
 
     if anim_graph_editor_ui(ctx) then
       persist_anim_settings_extstate()
-      refresh_preview(item)
+      refresh_preview_here()
       overlay_request_autosave()
     end
     wx_draw_settings_modal(ctx)
