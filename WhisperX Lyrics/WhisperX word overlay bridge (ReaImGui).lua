@@ -1,9 +1,9 @@
 -- @description WhisperX: word overlay bridge — presets & lines (ReaImGui → Video Processor)
--- @version 1.92
+-- @version 1.128
 -- @author Bryan
 -- @about
 --   GUI for the WhisperX Video Processor overlay: subtitle text is taken from take markers only (no free typing).
---   Words: horizontal drag scales size; triple-stack uses ReaImGui drag–drop onto the previous word or “new phrase” (applied on drop). Ctrl+Shift+click makes a word the first of its phrase.
+--   Words: drag direction is chosen from the first ~4px — horizontal adjusts size, vertical repositions (triple-stack drag–drop onto adjacent words, the first word of the next phrase to move the dragged word down into that phrase, or + new phrase). Ctrl+Shift+click makes a word the first of its phrase.
 --   Triple-stack: cut zones between words create phrase/row breaks; marquee selection; Shift+click range. Layout auto-saves to the item (P_EXT) + bridge extstate when you change the word grid or other overlay parameters (no manual “save layout” required).
 --   Triple-stack layout parameters can be stored in named presets (save/load/delete).
 --   Motion tab: “Show words by” chooses phrase write-on, phrase visible from start, or single-word timing.
@@ -32,6 +32,7 @@ local ITEM_EXT = {
   WORD_STYLES = "P_EXT:BRYAN_WX_OVERLAY_WORD_STYLES",
   WORD_PALETTE = "P_EXT:BRYAN_WX_OVERLAY_WORD_PALETTE",
   ROW_SPACING = "P_EXT:BRYAN_WX_OVERLAY_ROW_SPACING",
+  WORD_SPACING = "P_EXT:BRYAN_WX_OVERLAY_WORD_SPACING",
 }
 
 --- Overview hint for triple-stack timing mode (matches `SHOW_WORDS_MODE` / state.ml_timing_mode).
@@ -46,8 +47,9 @@ local ANIM_TYPE_STR =
   "None\0Fade\0Zoom In\0Zoom Out\0Slide Left\0Slide Right\0Slide Up\0Slide Down\0Whip Left\0Whip Right\0"
   .. "Pop\0Punch\0Squash (dir °)\0Stretch (dir °)\0Drop Bounce\0Rise Bounce\0Drift Left\0Drift Right\0Shake\0Jitter\0"
   .. "Wave\0Orbit\0Spiral\0Stamp\0Echo Trail\0Clone Burst\0Blur\0Custom\0Wipe Reveal\0"
---- Built-in type ids 0..28 (Blur=26, Custom=27, Wipe Reveal=28).
-local ANIM_TYPE_MAX = 28
+  .. "--- Accent Animations ---\0Chroma Pulse\0Outline Stack\0Glitch Flash\0Radiate\0"
+--- Built-in type ids 0..33 (Blur=26, Custom=27, Wipe Reveal=28, Sep=29, Accent=30+).
+local ANIM_TYPE_MAX = 33
 local ANIM_MAX_DUPES = 8
 --- Word-animation type ids (one table keeps main-chunk local count under Lua 5.1’s 200 limit).
 local ANIM_KIND = {
@@ -74,6 +76,11 @@ local ANIM_KIND = {
   BLUR = 26,
   CUSTOM = 27,
   WIPE_REVEAL = 28,
+  SEP_ACCENT = 29,
+  CHROMA_PULSE = 30,
+  OUTLINE_STACK = 31,
+  GLITCH_FLASH = 32,
+  RADIATE = 33,
 }
 local ANIM_CURVE_STR = "Linear\0In Quad\0Out Quad\0InOut Quad\0In Exp\0Out Exp\0InOut Exp\0In Log\0Out Log\0Back Overshoot\0Elastic Bounce\0"
 local ANIM_CURVE_MAX = 10
@@ -97,6 +104,7 @@ local ANIM_AUTO_LANES = {
   { key = "dupes", label = "dupes", min = 1, max = ANIM_MAX_DUPES, integer = true },
   { key = "twist", label = "twist", min = -720, max = 720, integer = false },
   { key = "dir", label = "dir", min = -180, max = 180, integer = false },
+  { key = "dup_off", label = "dup offset", min = 0, max = 3, integer = false },
 }
 
 local _, script_fn = r.get_action_context()
@@ -126,6 +134,9 @@ if not ok_imgui then
   r.MB("ReaImGui is required.\nInstall from ReaPack, then reload REAPER.", WINDOW_TITLE, 0)
   return
 end
+
+--- Font combo grid: previewing each row with a unique face allocates ImGui fonts (memory + bake cost).
+local WX_FONT_COMBO_PREVIEW_MAX_ROWS = 96
 
 local wx_bridge_icon_images = {
   settings = nil,
@@ -285,6 +296,20 @@ local function item_guid_str(item)
   return ""
 end
 
+local function find_media_item_by_guid(guid)
+  if type(guid) ~= "string" or guid == "" then
+    return nil
+  end
+  local n = r.CountMediaItems(0)
+  for i = 0, n - 1 do
+    local it = r.GetMediaItem(0, i)
+    if item_guid_str(it) == guid then
+      return it
+    end
+  end
+  return nil
+end
+
 local function read_editor_text_from_item(item)
   if not item or not r.GetSetMediaItemInfo_String then
     return nil
@@ -354,10 +379,14 @@ local state = {
   --- Avoid reloading the subtitle field when take markers briefly read as empty (e.g. after refocus).
   tracked_item_guid = "",
   prev_words_count = 0,
+  --- Previous frame marker words (text + src time) for layout remap when markers are inserted/deleted.
+  prev_words_snapshot = nil,
   ml_max_rows = 4,
   ml_s = { 0.58, 2, 0.58, 1, 1, 1 },
   ml_r = { 0, 0, 0, 0, 0, 0 },
   ml_line_gap = 0.1,
+  --- Horizontal gap between words in VP (% of fontPx); nil = legacy default (0 CJK, 0.1 Latin).
+  ml_word_gap = nil,
   ml_jitter = { 0, 0, 0, 0, 0, 0 },
   ml_row_chars = 0,
   ml_row_chars_rand = 0,
@@ -445,6 +474,8 @@ local state = {
   ml_word_scales = {},
   ml_row_indents = {},
   ml_row_spacings = {},
+  --- Gap after word index `wi` before the next word (% of fontPx); nil = use global `ml_word_gap`.
+  ml_word_spacings = {},
   word_styles = {},
   word_color_palette = {},
   word_sel = {},
@@ -463,6 +494,7 @@ local state = {
   word_drag_lock = nil,
   word_drag_acc_x = 0,
   word_drag_acc_y = 0,
+  word_drag_wi = nil,
   word_scale_tip_active = false,
   word_scale_tip_until = 0,
   --- Pixel height of words grid section (persisted in extstate).
@@ -499,10 +531,17 @@ local state = {
   word_style_preset_save_name = "",
   font_items = {},
   font_preview_fonts = {},
+  --- Count of failed ImGui_PushFont per family while combo is open (atlas bake races / unloadable faces).
+  font_preview_push_fails = {},
+  --- `pk` → last ImGui frame when we incremented `font_preview_push_fails` for `pk` (avoid multi-count per visible row/frame).
+  font_preview_fail_inc_frame = {},
   font_combo_filter = "",
   font_favorites = {},
+  font_favorites_gen = 0,
   font_list_ready = false,
   font_scan_attempted = false,
+  --- Lazily allocated for combo font previews (virtualized popup list).
+  font_combo_list_clipper = nil,
   --- Queued when a VP-affecting control ends an edit (or autosave runs); flushed when safe.
   _wx_vp_sync_pending = false,
   wx_slider_style = tonumber(es_get("WX_SLIDER_STYLE", "1")) or 1,
@@ -542,6 +581,50 @@ state.wx_slider_demo_step_value = math.max(0, math.min(5, math.floor(tonumber(st
 for _, guide in ipairs(VIDEO_RATIO_GUIDES) do
   state.video_guides[guide.id] = es_bool(guide.key, false)
 end
+
+local _wx_guides_gmem_defer_on = false
+
+local function video_guides_any_on_state()
+  for _, guide in ipairs(VIDEO_RATIO_GUIDES) do
+    if state.video_guides[guide.id] then
+      return true
+    end
+  end
+  return false
+end
+
+local function wx_sync_video_guides_gmem_now()
+  if W.sync_video_ratio_guides_gmem then
+    W.sync_video_ratio_guides_gmem(video_guides_any_on_state())
+  end
+end
+
+local function wx_ensure_video_guides_gmem_defer()
+  if _wx_guides_gmem_defer_on then
+    return
+  end
+  if not video_guides_any_on_state() then
+    return
+  end
+  _wx_guides_gmem_defer_on = true
+  local function tick()
+    if not video_guides_any_on_state() then
+      if W.sync_video_ratio_guides_gmem then
+        W.sync_video_ratio_guides_gmem(false)
+      end
+      _wx_guides_gmem_defer_on = false
+      return
+    end
+    wx_sync_video_guides_gmem_now()
+    r.defer(tick)
+  end
+  r.defer(tick)
+end
+
+if video_guides_any_on_state() then
+  wx_ensure_video_guides_gmem_defer()
+end
+
 state.wx_slider_colors = {}
 state.wx_slider_highlight_colors = {}
 for i = 1, 10 do
@@ -562,6 +645,12 @@ do
     state.ml_r[i] = math.max(0, math.min(1, rv))
   end
   state.ml_line_gap = math.max(-0.95, math.min(0.5, tonumber(es_get("ML_LINE_GAP", "0.1")) or 0.1))
+  do
+    local wgs = es_get("ML_WORD_GAP", "")
+    if wgs ~= "" then
+      state.ml_word_gap = math.max(-0.95, math.min(1.5, tonumber(wgs) or 0.1))
+    end
+  end
   local j_any = false
   for i = 1, 6 do
     local js = es_get("ML_J" .. tostring(i), "")
@@ -819,9 +908,17 @@ end
 
 function anim_side_param_value(side_key, lane_key)
   if side_key == "phrase_out" then
-    return tonumber(state["anim_phrase_out_" .. lane_key]) or 0
+    local v = tonumber(state["anim_phrase_out_" .. lane_key])
+    if lane_key == "dup_off" and v == nil then
+      return 1
+    end
+    return v or 0
   end
-  return tonumber(state["anim_" .. side_key .. "_" .. lane_key]) or 0
+  local v = tonumber(state["anim_" .. side_key .. "_" .. lane_key])
+  if lane_key == "dup_off" and v == nil then
+    return 1
+  end
+  return v or 0
 end
 
 function anim_graph_auto_lane_spec(lane_key)
@@ -866,6 +963,13 @@ function anim_graph_auto_decode_blob(blob, side_key)
           bi = bi + 1
         end
       end
+      if p[6] and p[7] then
+        local gm, gM = tonumber(trim(tostring(p[6]))), tonumber(trim(tostring(p[7])))
+        if gm and gM and gM > gm then
+          lane.graph_min = gm
+          lane.graph_max = gM
+        end
+      end
       lanes[key] = lane
     end
   end
@@ -888,10 +992,21 @@ function anim_graph_auto_decode_blob(blob, side_key)
     lane.points[#lane.points].t = 1
     for pidx = 1, #lane.points do
       local p = lane.points[pidx]
-      p.v = math.max(spec.min, math.min(spec.max, tonumber(p.v) or base))
+      local pv = tonumber(p.v) or base
       if spec.integer then
-        p.v = math.floor(p.v + 0.5)
+        pv = math.floor(pv + 0.5)
       end
+      local lo = tonumber(lane.graph_min)
+      local hi = tonumber(lane.graph_max)
+      if not lo or not hi or hi <= lo then
+        lo = spec.min
+        hi = spec.max
+      end
+      pv = math.max(lo, math.min(hi, pv))
+      if spec.key == "dupes" then
+        pv = math.max(spec.min, math.min(spec.max, pv))
+      end
+      p.v = pv
     end
     for cidx = 1, #lane.points - 1 do
       if lane.curves[cidx] == nil then
@@ -912,9 +1027,12 @@ function anim_graph_auto_encode_blob(lanes)
       local pts = {}
       for pidx = 1, #lane.points do
         local p = lane.points[pidx]
-        local v = math.max(spec.min, math.min(spec.max, tonumber(p.v) or 0))
+        local v = tonumber(p.v) or 0
         if spec.integer then
           v = math.floor(v + 0.5)
+        end
+        if spec.key == "dupes" then
+          v = math.max(spec.min, math.min(spec.max, v))
         end
         local t = math.max(0, math.min(1, tonumber(p.t) or 0))
         pts[#pts + 1] = string.format("%.17g@%.17g", v, t)
@@ -932,12 +1050,7 @@ function anim_graph_auto_encode_blob(lanes)
           end
         end
       end
-      local parts = {
-        spec.key,
-        lane.enabled and "1" or "0",
-        table.concat(pts, "|"),
-        table.concat(curves, ","),
-      }
+      local blend_csv = ""
       if need_bl then
         local bp = {}
         for cidx = 1, #lane.points - 1 do
@@ -948,8 +1061,23 @@ function anim_graph_auto_encode_blob(lanes)
             bp[#bp + 1] = "d"
           end
         end
-        parts[#parts + 1] = table.concat(bp, ",")
+        blend_csv = table.concat(bp, ",")
       end
+      local ymin = tonumber(lane.graph_min)
+      local ymax = tonumber(lane.graph_max)
+      if not ymin or not ymax or ymax <= ymin then
+        ymin = spec.min
+        ymax = spec.max
+      end
+      local parts = {
+        spec.key,
+        lane.enabled and "1" or "0",
+        table.concat(pts, "|"),
+        table.concat(curves, ","),
+        blend_csv,
+        string.format("%.17g", ymin),
+        string.format("%.17g", ymax),
+      }
       recs[#recs + 1] = table.concat(parts, "~")
     end
   end
@@ -1225,6 +1353,7 @@ local function ml_preset_pack_current()
     vals[#vals + 1] = string.format("%.17g", state.ml_jitter[i] or 0)
   end
   vals[#vals + 1] = tostring(math.floor(state.ml_row_v_align or 0))
+  vals[#vals + 1] = string.format("%.17g", state.ml_word_gap or -999)
   return table.concat(vals, ML_PRESET_SEP)
 end
 
@@ -1264,6 +1393,15 @@ local function ml_preset_apply_blob(blob)
   end
   if t[p] ~= nil then
     state.ml_row_v_align = math.max(0, math.min(2, math.floor(tonumber(t[p]) or 0)))
+    p = p + 1
+  end
+  if t[p] ~= nil then
+    local wgv = tonumber(t[p])
+    if wgv and wgv > -900 then
+      state.ml_word_gap = math.max(-0.95, math.min(1.5, wgv))
+    else
+      state.ml_word_gap = nil
+    end
   end
   persist_ml_jitter()
   return true
@@ -1338,7 +1476,7 @@ local function persist_anim_settings_extstate()
   r.SetExtState(SECTION, "ANIM_PHRASE_OUT_GRAPH_AUTO", state.anim_phrase_out_graph_auto_blob or "", true)
   r.SetExtState(SECTION, "KARAOKE", state.karaoke and "1" or "0", true)
   r.SetExtState(SECTION, "SHOW_WORDS_MODE", tostring(math.max(0, math.min(2, math.floor(state.ml_timing_mode or 1)))), true)
-  r.SetExtState(SECTION, "ANIM_TYPE_REV", "3", true)
+  r.SetExtState(SECTION, "ANIM_TYPE_REV", "4", true)
 end
 
 local function ml_preset_blob(name)
@@ -1890,7 +2028,7 @@ local function anim_preset_delete_named(nm)
   return true
 end
 
-local function load_system_font_items()
+local function load_system_font_items_legacy()
   local names = {}
   local seen = {}
   local osname = ((r.GetOS and r.GetOS()) or ""):lower()
@@ -1948,6 +2086,10 @@ local function load_system_font_items()
   return names
 end
 
+local function load_system_font_items()
+  return load_system_font_items_legacy()
+end
+
 local function load_font_items_from_cache()
   local raw = es_get("FONT_LIST_CACHE", "")
   local out = {}
@@ -1996,6 +2138,9 @@ local function ensure_font_items(force_scan)
   state.font_list_ready = true
 end
 
+--- Font preview raster size when using legacy `ImGui_CreateFont(family, size)`. Shim requires exactly 2 Lua args per call.
+local FONT_PREVIEW_COMBO_PT = 15
+
 local function font_preview_get(ctx, font_name)
   if not font_name or font_name == "" then
     return nil
@@ -2005,16 +2150,28 @@ local function font_preview_get(ctx, font_name)
     return f or nil
   end
   -- ReaImGui exposes CreateFont/AttachFont on reaper as ImGui_CreateFont / ImGui_AttachFont.
-  -- The imgui.lua wrapper may omit AttachFont or error on absent fields; never index ImGui.* directly.
-  local function try_create(name, sz)
+  -- The bundled imgui shim (`ImGui__shim`) rejects anything except **exactly 2 Lua args**.
+  -- 0.10+ native binding: CreateFont(family, flags). Older/template style: CreateFont(family, size).
+  local function try_create(name)
     if r.ImGui_CreateFont then
-      local ok, h = pcall(r.ImGui_CreateFont, name, sz)
+      --- Prefer flags=none for modern builds; fallback to-sized CreateFont for older shims.
+      local ok, h = pcall(r.ImGui_CreateFont, name, 0)
+      if ok and h then
+        return h
+      end
+      ok, h = pcall(r.ImGui_CreateFont, name, FONT_PREVIEW_COMBO_PT)
       if ok and h then
         return h
       end
     end
     local ok, h = pcall(function()
-      return ImGui.CreateFont(name, sz)
+      return ImGui.CreateFont(name, FONT_PREVIEW_COMBO_PT)
+    end)
+    if ok and h then
+      return h
+    end
+    ok, h = pcall(function()
+      return ImGui.CreateFont(name, 0)
     end)
     if ok and h then
       return h
@@ -2028,12 +2185,23 @@ local function font_preview_get(ctx, font_name)
         return true
       end
     end
+    if r.ImGui_Attach then
+      local ok = pcall(r.ImGui_Attach, c, font_handle)
+      if ok then
+        return true
+      end
+    end
     local ok = pcall(function()
       ImGui.AttachFont(c, font_handle)
     end)
-    return ok
+    if ok then
+      return true
+    end
+    return pcall(function()
+      ImGui.Attach(c, font_handle)
+    end)
   end
-  local created = try_create(font_name, 15)
+  local created = try_create(font_name)
   if not created then
     state.font_preview_fonts[font_name] = false
     return nil
@@ -2044,6 +2212,18 @@ local function font_preview_get(ctx, font_name)
   end
   state.font_preview_fonts[font_name] = created
   return created
+end
+
+--- Lazy-loaded preview glyph for popup rows (`wx_custom_combo` + ListClipper). Skips overlay fallbacks/sentinels by label.
+local function wx_font_combo_item_preview_lazy(ctx_popup, _idx1, disp)
+  disp = trim(tostring(disp or ""))
+  if disp == "" or disp == "(empty)" then
+    return nil
+  end
+  if disp == "<Default system fallback>" or disp == "<Use overlay font>" then
+    return nil
+  end
+  return font_preview_get(ctx_popup, disp)
 end
 
 local function font_favorites_persist()
@@ -2069,7 +2249,55 @@ local function font_toggle_favorite(nm)
   else
     state.font_favorites[nm] = true
   end
+  state.font_favorites_gen = (math.floor(tonumber(state.font_favorites_gen) or 0) + 1) % 2147483647
   font_favorites_persist()
+  state._fc_grp_cache = nil
+end
+
+local function font_name_is_favorite(nm)
+  return state.font_favorites[trim(nm or "")] and true or false
+end
+
+--- True if any face in the family is starred (favorites are stored by full font name, not family).
+local function font_family_has_favorite(fobj)
+  if not fobj or not fobj.variants then
+    return false
+  end
+  for vi = 1, #fobj.variants do
+    if font_name_is_favorite(fobj.variants[vi].full_name) then
+      return true
+    end
+  end
+  return false
+end
+
+--- Which variant to show / apply for a family row (matches current selection, lone favorite face, or last pick).
+local function font_family_pick_variant_idx(fobj, sel_item_idx1)
+  if not fobj or not fobj.variants or #fobj.variants == 0 then
+    return 1
+  end
+  if sel_item_idx1 then
+    for vi = 1, #fobj.variants do
+      if fobj.variants[vi].index == sel_item_idx1 then
+        return vi
+      end
+    end
+  end
+  local fav_n, fav_v = 0, 1
+  for vi = 1, #fobj.variants do
+    if font_name_is_favorite(fobj.variants[vi].full_name) then
+      fav_n = fav_n + 1
+      fav_v = vi
+    end
+  end
+  if fav_n == 1 then
+    return fav_v
+  end
+  local stored = state.font_family_variant_sel and state.font_family_variant_sel[fobj.name]
+  if stored and stored >= 1 and stored <= #fobj.variants then
+    return stored
+  end
+  return 1
 end
 
 --- Favorites first (A–Z), then others (A–Z); only names matching filter (substring, case-insensitive).
@@ -2079,9 +2307,9 @@ local function font_items_filtered()
   local rest = {}
   for i = 1, #state.font_items do
     local it = state.font_items[i]
-    local nm = it.name or ""
+    local nm = trim(it.name or "")
     if filt == "" or nm:lower():find(filt, 1, true) then
-      if state.font_favorites[nm] then
+      if state.font_favorites[it.name or ""] then
         favs[#favs + 1] = it
       else
         rest[#rest + 1] = it
@@ -2105,13 +2333,19 @@ local function font_items_filtered()
 end
 
 -- Forward declare (Lua 5.1 local scoping): refresh_preview, wx_custom_*, wx_bridge_transport_strip (assigned after wx_custom_small_button).
-local overlay_request_autosave
 local refresh_preview
 local wx_custom_slider_int
 local wx_custom_combo
+local wx_font_combo_draw
 local wx_custom_button
 local wx_custom_small_button
 local wx_bridge_transport_strip
+
+--- Pass the result as the last argument to `wx_custom_combo` when using `external_label`.
+--- `true`: caption + pill use the same geometry as `wx_custom_slider_int` (Flow & wrapping row); `false`: caption vertically centered on the left beside the pill.
+local function wx_combo_external_label_placement(place_top_left)
+  return place_top_left and true or false
+end
 
 local function font_selector_ui(ctx, item)
   ensure_font_items(false)
@@ -2136,8 +2370,7 @@ local function font_selector_ui(ctx, item)
     selected_idx = #font_items - 1
   end
 
-  local font_items_str = table.concat(font_items, "\0") .. "\0"
-  local function font_combo_popup_header_wrap(ctx2, inner_w, pw, fs, style_idx)
+  local function font_combo_popup_header_wrap(ctx2, inner_w, fs, style_idx)
     local rv_fil = false
     local new_fil = state.font_combo_filter
     if ImGui.PushItemWidth then
@@ -2183,13 +2416,13 @@ local function font_selector_ui(ctx, item)
     end
   end
 
-  local rv_font, next_idx = wx_custom_combo(
+  local rv_font, next_idx = wx_font_combo_draw(
     ctx,
     "##font_wx",
     "Font",
     selected_idx,
-    font_items_str,
-    240,
+    font_items,
+    420,
     state.wx_slider_style,
     font_combo_popup_header_wrap
   )
@@ -2292,6 +2525,15 @@ local function display_opts_from_state(words_for_scale)
       end
     end
   end
+  local word_sp = nil
+  if type(words_for_scale) == "table" and #words_for_scale > 0 then
+    for i = 1, #words_for_scale - 1 do
+      if state.ml_word_spacings and state.ml_word_spacings[i] ~= nil then
+        word_sp = word_sp or {}
+        word_sp[i] = state.ml_word_spacings[i]
+      end
+    end
+  end
   local wstyles = nil
   --- Snapshot for triple CJK minimal parse (`parse_editor_phrases_for_multiline` uses markers + flags only).
   local ml_pa_tabs, ml_ra_tabs = nil, nil
@@ -2325,6 +2567,7 @@ local function display_opts_from_state(words_for_scale)
           outline_thickness = st.outline_thickness,
           outline_gap = st.outline_gap,
           outline_color = st.outline_color,
+          outline_mode = st.outline_mode,
           anim_preset_name = trim(st.anim_preset_name or ""),
         }
       end
@@ -2342,6 +2585,7 @@ local function display_opts_from_state(words_for_scale)
     layout_line_scales = ls,
     layout_line_rand = lr,
     layout_line_gap = state.ml_line_gap,
+    layout_word_gap = state.ml_word_gap,
     layout_rand_jitter = jit,
     layout_ml_row_chars = state.ml_row_chars,
     layout_ml_row_chars_rand = state.ml_row_chars_rand,
@@ -2353,6 +2597,7 @@ local function display_opts_from_state(words_for_scale)
     layout_word_scale = wscale,
     layout_row_indent = row_indent,
     layout_row_gap = row_gap,
+    layout_word_spacings = word_sp,
     ml_phrase_after = ml_pa_tabs,
     ml_row_after = ml_ra_tabs,
     video_guides = video_guides,
@@ -2424,13 +2669,20 @@ local function display_opts_from_state(words_for_scale)
   }
 end
 
+--- Display opts for parsing a stored editor string (ignore in-memory phrase/row flags).
+local function display_opts_for_editor_parse(words)
+  local opts = display_opts_from_state(words)
+  opts.ml_phrase_after = nil
+  opts.ml_row_after = nil
+  return opts
+end
+
 --- True if `editor_text` parses against current marker words (triple-stack phrases).
 local function editor_text_parse_ok(words, editor_text)
   if not words or #words == 0 or type(editor_text) ~= "string" then
     return false
   end
-  local opts = display_opts_from_state(words)
-  return W.parse_editor_phrases_for_multiline(words, editor_text, opts) and true
+  return W.parse_editor_phrases_for_multiline(words, editor_text, display_opts_for_editor_parse(words)) and true
 end
 
 
@@ -2681,6 +2933,7 @@ word_style_defaults = function(st)
   st.underline_offset = math.max(-8, math.min(16, tonumber(st.underline_offset) or 1))
   st.outline_thickness = math.max(1, math.min(12, math.floor(tonumber(st.outline_thickness) or 2)))
   st.outline_gap = math.max(0, math.min(24, math.floor(tonumber(st.outline_gap) or 0)))
+  st.outline_mode = math.max(0, math.min(1, math.floor(tonumber(st.outline_mode) or 0)))
   do
     local oc = tonumber(st.outline_color)
     st.outline_color = oc and math.max(0, math.min(0xFFFFFF, math.floor(oc))) or 0
@@ -2828,6 +3081,7 @@ local function word_styles_parse(blob, n)
         st.outline_color = math.max(0, math.min(0xFFFFFF, math.floor(oc)))
       end
       st.font_name = word_style_font_blob_unesc(parts[17] or "")
+      st.outline_mode = tonumber(parts[18])
       word_style_defaults(st)
       if not word_style_is_empty(st) then
         out[wi] = st
@@ -2863,8 +3117,11 @@ local function word_styles_pack(styles, n)
         tostring(math.floor(st.outline_gap or 0)),
         tostring(math.floor(st.outline_color or 0)),
       }
-      if fn_esc ~= "" then
+      if fn_esc ~= "" or (st.outline_mode and st.outline_mode ~= 0) then
         fields[#fields + 1] = fn_esc
+        if st.outline_mode and st.outline_mode ~= 0 then
+          fields[#fields + 1] = tostring(math.floor(st.outline_mode))
+        end
       end
       recs[#recs + 1] = table.concat(fields, ":")
     end
@@ -2960,6 +3217,7 @@ local function word_style_copy(st)
     outline_thickness = st.outline_thickness,
     outline_gap = st.outline_gap,
     outline_color = st.outline_color,
+    outline_mode = st.outline_mode,
     anim_preset_name = trim(st.anim_preset_name or ""),
   }
 end
@@ -3030,6 +3288,7 @@ local function ml_load_for_word_count(n, item)
     state.ml_word_scales = {}
     state.ml_row_indents = {}
     state.ml_row_spacings = {}
+    state.ml_word_spacings = {}
     state.word_styles = {}
     return
   end
@@ -3049,6 +3308,14 @@ local function ml_load_for_word_count(n, item)
     end
   end
   state.ml_row_spacings = ml_parse_row_spacings(row_spacing_blob, n)
+  local word_spacing_blob = ""
+  if item and r.GetSetMediaItemInfo_String then
+    local ok, s = r.GetSetMediaItemInfo_String(item, ITEM_EXT.WORD_SPACING, "", false)
+    if ok and type(s) == "string" then
+      word_spacing_blob = s
+    end
+  end
+  state.ml_word_spacings = ml_parse_row_spacings(word_spacing_blob, n)
   if n < 2 then
     state.ml_phrase_after = {}
     state.ml_row_after = {}
@@ -3082,15 +3349,94 @@ local function ml_load_for_word_count(n, item)
   state.ml_row_indents = ml_parse_indents(ind, n)
 end
 
---- Keep current triple layout as much as possible when marker count changes on the same item.
-local function ml_preserve_layout_for_new_count(n)
-  n = math.max(0, math.floor(tonumber(n) or 0))
-  local old_n = math.max(0, math.floor(tonumber(state.ml_word_n) or 0))
-  local old_pa, old_ra, old_sc, old_ind, old_gap = state.ml_phrase_after, state.ml_row_after, state.ml_word_scales, state.ml_row_indents, state.ml_row_spacings
+--- Map old word indices → new word indices when markers are inserted/deleted (LCS on marker text).
+local function ml_align_old_to_new_indices(old_words, new_words)
+  if type(old_words) ~= "table" or type(new_words) ~= "table" then
+    return {}
+  end
+  local m, n = #old_words, #new_words
+  if m < 1 or n < 1 then
+    return {}
+  end
+  if m * n > 2500 * 2500 then
+    local map = {}
+    local o, ni = 1, 1
+    while o <= m and ni <= n do
+      if old_words[o].w == new_words[ni].w then
+        map[o] = ni
+        o = o + 1
+        ni = ni + 1
+      elseif ni < n and old_words[o].w == new_words[ni + 1].w then
+        ni = ni + 1
+      elseif o < m and old_words[o + 1].w == new_words[ni].w then
+        o = o + 1
+      else
+        ni = ni + 1
+        o = o + 1
+      end
+    end
+    return map
+  end
+  local dp = {}
+  for i = 0, m do
+    dp[i] = {}
+    dp[i][0] = 0
+  end
+  for j = 0, n do
+    dp[0][j] = 0
+  end
+  for i = 1, m do
+    for j = 1, n do
+      if old_words[i].w == new_words[j].w then
+        dp[i][j] = dp[i - 1][j - 1] + 1
+      else
+        dp[i][j] = math.max(dp[i - 1][j], dp[i][j - 1])
+      end
+    end
+  end
+  local map = {}
+  local i, j = m, n
+  while i > 0 and j > 0 do
+    if old_words[i].w == new_words[j].w then
+      map[i] = j
+      i = i - 1
+      j = j - 1
+    elseif dp[i - 1][j] >= dp[i][j - 1] then
+      i = i - 1
+    else
+      j = j - 1
+    end
+  end
+  return map
+end
+
+--- Keep triple layout when marker words change on the same item; remap splits/styles by word identity, not raw index.
+--- Returns false when alignment is too weak (caller should reload layout from item extstate).
+local function ml_preserve_layout_for_new_count(new_words, old_words)
+  local n = (type(new_words) == "table") and #new_words or math.max(0, math.floor(tonumber(new_words) or 0))
+  local old_n = (type(old_words) == "table") and #old_words or math.max(0, math.floor(tonumber(state.ml_word_n) or 0))
+  if n < 1 then
+    state.ml_word_n = 0
+    return true
+  end
+  if old_n < 1 or type(old_words) ~= "table" or #old_words < 1 then
+    return false
+  end
+  local old_pa, old_ra, old_sc, old_ind, old_gap, old_wsp = state.ml_phrase_after, state.ml_row_after, state.ml_word_scales, state.ml_row_indents, state.ml_row_spacings, state.ml_word_spacings
   local old_styles = state.word_styles
-  state.ml_phrase_after, state.ml_row_after, state.ml_word_scales, state.ml_row_indents, state.ml_row_spacings = {}, {}, {}, {}, {}
+  local idx_map = ml_align_old_to_new_indices(old_words, new_words)
+  local matched = 0
+  for oi = 1, old_n do
+    if idx_map[oi] then
+      matched = matched + 1
+    end
+  end
+  if matched < math.max(1, math.floor(math.min(old_n, n) * 0.45)) then
+    return false
+  end
+  state.ml_phrase_after, state.ml_row_after, state.ml_word_scales, state.ml_row_indents, state.ml_row_spacings, state.ml_word_spacings = {}, {}, {}, {}, {}, {}
   state.word_styles = {}
-  for i = 1, math.max(0, n - 1) do
+  for i = 1, n - 1 do
     state.ml_phrase_after[i] = false
     state.ml_row_after[i] = false
   end
@@ -3098,25 +3444,39 @@ local function ml_preserve_layout_for_new_count(n)
     state.ml_word_scales[i] = 1
     state.ml_row_indents[i] = 0
   end
-  if old_n > 0 then
-    local m_br = math.min(math.max(0, old_n - 1), math.max(0, n - 1))
-    for i = 1, m_br do
-      state.ml_phrase_after[i] = old_pa[i] and true or false
-      state.ml_row_after[i] = old_ra[i] and true or false
-    end
-    local m_sc = math.min(old_n, n)
-    for i = 1, m_sc do
-      state.ml_word_scales[i] = tonumber(old_sc[i]) or 1
-      state.ml_row_indents[i] = tonumber(old_ind[i]) or 0
-      if type(old_gap) == "table" and old_gap[i] ~= nil then
-        state.ml_row_spacings[i] = tonumber(old_gap[i]) or nil
+  for oi = 1, old_n - 1 do
+    local ni = idx_map[oi]
+    if ni and ni >= 1 and ni < n then
+      if old_pa[oi] then
+        state.ml_phrase_after[ni] = true
       end
-      if type(old_styles) == "table" and old_styles[i] then
-        state.word_styles[i] = old_styles[i]
+      if old_ra[oi] then
+        state.ml_row_after[ni] = true
       end
     end
   end
+  for oi = 1, old_n do
+    local ni = idx_map[oi]
+    if ni and ni >= 1 and ni <= n then
+      state.ml_word_scales[ni] = tonumber(old_sc[oi]) or 1
+      state.ml_row_indents[ni] = tonumber(old_ind[oi]) or 0
+      if type(old_gap) == "table" and old_gap[oi] ~= nil then
+        state.ml_row_spacings[ni] = tonumber(old_gap[oi]) or nil
+      end
+      if type(old_styles) == "table" and old_styles[oi] then
+        state.word_styles[ni] = old_styles[oi]
+      end
+    end
+  end
+  for oi = 1, old_n - 1 do
+    local ni = idx_map[oi]
+    local nj = idx_map[oi + 1]
+    if ni and nj and nj == ni + 1 and type(old_wsp) == "table" and old_wsp[oi] ~= nil then
+      state.ml_word_spacings[ni] = tonumber(old_wsp[oi])
+    end
+  end
   state.ml_word_n = n
+  return true
 end
 
 local function ml_sync_editor_text(words)
@@ -3125,6 +3485,28 @@ local function ml_sync_editor_text(words)
     return
   end
   state.editor_text = W.editor_text_from_ml_after_flags(words, state.ml_phrase_after, state.ml_row_after)
+end
+
+--- Load phrase/row splits from item P_EXT editor text when present; else global extstate + sync.
+local function ml_load_layout_for_item(item, words)
+  local n = words and #words or 0
+  ml_load_for_word_count(n, item)
+  if n < 1 then
+    state.editor_text = ""
+    state.ml_word_n = 0
+    return
+  end
+  state.ml_word_n = n
+  local et_item = read_editor_text_from_item(item)
+  if et_item then
+    local phrases = W.parse_editor_phrases_for_multiline(words, et_item, display_opts_for_editor_parse(words))
+    if phrases then
+      state.editor_text = et_item
+      state.ml_phrase_after, state.ml_row_after = W.ml_after_flags_from_phrases(n, phrases)
+      return
+    end
+  end
+  ml_sync_editor_text(words)
 end
 
 --- True if `take` is one of the takes on `mediaitem` (for safe refresh_preview cache).
@@ -3276,7 +3658,7 @@ local function ml_row_ranges_in(s, e)
   return r
 end
 
---- `kind`: "indent" | "rowsp" | "styles" | "all" — only affects word indices ps..pe (one phrase).
+--- `kind`: "indent" | "rowsp" | "wordsp" | "styles" | "all" — only affects word indices ps..pe (one phrase).
 local function ml_phrase_reset_layout(kind, ps, pe, n, item, words, ctx)
   local rows = ml_row_ranges_in(ps, pe)
   if kind == "indent" or kind == "all" then
@@ -3287,6 +3669,11 @@ local function ml_phrase_reset_layout(kind, ps, pe, n, item, words, ctx)
   if kind == "rowsp" or kind == "all" then
     for ri = 1, #rows - 1 do
       state.ml_row_spacings[rows[ri + 1][1]] = nil
+    end
+  end
+  if kind == "wordsp" or kind == "all" then
+    for wi = ps, pe - 1 do
+      state.ml_word_spacings[wi] = nil
     end
   end
   if kind == "styles" or kind == "all" then
@@ -3302,7 +3689,7 @@ local function ml_phrase_reset_layout(kind, ps, pe, n, item, words, ctx)
   end
 end
 
-local function ml_phrase_start_index(wi)
+function ml_phrase_start_index(wi)
   local s = wi
   while s > 1 and not state.ml_phrase_after[s - 1] do
     s = s - 1
@@ -3310,8 +3697,35 @@ local function ml_phrase_start_index(wi)
   return s
 end
 
+function ml_phrase_end_index(wi, n)
+  return ml_phrase_range_end(ml_phrase_start_index(wi), n)
+end
+
+function ml_is_first_word_of_phrase(wi, n)
+  return wi >= 1 and wi <= n and ml_phrase_start_index(wi) == wi
+end
+
+--- Drop `src` onto first word `dst` of the next phrase: split before `src`, then join with the next phrase.
+function ml_drop_move_word_to_next_phrase_start(src, dst, n)
+  if src < 2 or dst < 2 or src > n or dst > n or src >= dst then
+    return false
+  end
+  if not ml_is_first_word_of_phrase(dst, n) then
+    return false
+  end
+  local src_pe = ml_phrase_end_index(src, n)
+  if dst ~= src_pe + 1 then
+    return false
+  end
+  state.ml_phrase_after[src - 1] = true
+  state.ml_row_after[src - 1] = true
+  state.ml_phrase_after[dst - 1] = false
+  state.ml_row_after[dst - 1] = false
+  return true
+end
+
 --- Drop dragged word `src` onto previous word `src-1`: merge into same phrase/row (clear breaks between).
-local function ml_drop_merge_into_prev_word(src, n)
+function ml_drop_merge_into_prev_word(src, n)
   if src < 2 or src > n then
     return false
   end
@@ -3326,7 +3740,7 @@ local function ml_drop_merge_into_prev_word(src, n)
 end
 
 --- Drop dragged word `src` onto next word `src+1`: move `src` into the next row/phrase.
-local function ml_drop_merge_into_next_word(src, n)
+function ml_drop_merge_into_next_word(src, n)
   if src < 1 or src >= n then
     return false
   end
@@ -3350,7 +3764,7 @@ local function ml_drop_merge_into_next_word(src, n)
 end
 
 --- Start a new phrase at word index `src` (phrase + row break before `src`).
-local function ml_drop_new_phrase_at(src, n)
+function ml_drop_new_phrase_at(src, n)
   if src < 1 or src > n or src <= 1 then
     return false
   end
@@ -3359,7 +3773,7 @@ local function ml_drop_new_phrase_at(src, n)
   return true
 end
 
-local function ml_word_in_last_phrase(wi, n)
+function ml_word_in_last_phrase(wi, n)
   local phrases = ml_phrase_ranges(n)
   if #phrases == 0 then
     return false
@@ -3369,7 +3783,7 @@ local function ml_word_in_last_phrase(wi, n)
 end
 
 --- Make `wi` the first word of its phrase (split before `wi`, merge prefix with previous phrase).
-local function ml_make_word_phrase_start(wi, n)
+function ml_make_word_phrase_start(wi, n)
   if wi < 1 or wi > n then
     return false
   end
@@ -3411,31 +3825,62 @@ function word_grid_reset_drag_state()
   state.word_drag_lock = nil
   state.word_drag_acc_x = 0
   state.word_drag_acc_y = 0
+  state.word_drag_wi = nil
+end
+
+local WORD_DRAG_AXIS_THRESHOLD = 4
+
+--- After ~4px movement, lock drag to horizontal scale or vertical word reposition (triple only).
+local function word_grid_commit_drag_lock(triple_preset)
+  if state.word_drag_lock then
+    return
+  end
+  local ax = state.word_drag_acc_x or 0
+  local ay = state.word_drag_acc_y or 0
+  local th = WORD_DRAG_AXIS_THRESHOLD
+  if triple_preset then
+    if ax < th and ay < th then
+      return
+    end
+    if ax > ay then
+      state.word_drag_lock = "scale"
+    elseif ay > ax then
+      state.word_drag_lock = "phrase"
+    elseif ax >= th then
+      state.word_drag_lock = "scale"
+    else
+      state.word_drag_lock = "phrase"
+    end
+  else
+    if ax >= th and ax > ay then
+      state.word_drag_lock = "scale"
+    elseif ay >= th and ay >= ax then
+      state.word_drag_lock = "scale"
+    end
+  end
 end
 
 --- Horizontal drag adjusts word scale (triple: horizontal only; other presets: dominant axis).
 function word_grid_drag_on_word(ctx, item, words, n, wi, triple_preset)
-  if not (ImGui.IsItemActive(ctx) and ImGui.IsMouseDragging and ImGui.IsMouseDragging(ctx, 0, 0)) then
+  if not ImGui.IsItemActive(ctx) then
+    return
+  end
+  if not (ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, 0)) then
+    return
+  end
+  if not state.word_drag_wi then
+    state.word_drag_wi = wi
+  elseif state.word_drag_wi ~= wi then
     return
   end
   local dx, dy = 0, 0
   if ImGui.GetMouseDelta then
     dx, dy = ImGui.GetMouseDelta(ctx)
   end
-  if not state.word_drag_lock then
-    state.word_drag_acc_x = state.word_drag_acc_x + math.abs(dx or 0)
-    state.word_drag_acc_y = state.word_drag_acc_y + math.abs(dy or 0)
-    if triple_preset then
-      if state.word_drag_acc_x >= 4 then
-        state.word_drag_lock = "scale"
-      end
-    else
-      if state.word_drag_acc_x >= 4 and state.word_drag_acc_x > state.word_drag_acc_y then
-        state.word_drag_lock = "scale"
-      elseif state.word_drag_acc_y >= 4 and state.word_drag_acc_y >= state.word_drag_acc_x then
-        state.word_drag_lock = "scale"
-      end
-    end
+  if math.abs(dx or 0) > 0 or math.abs(dy or 0) > 0 then
+    state.word_drag_acc_x = (state.word_drag_acc_x or 0) + math.abs(dx or 0)
+    state.word_drag_acc_y = (state.word_drag_acc_y or 0) + math.abs(dy or 0)
+    word_grid_commit_drag_lock(triple_preset)
   end
   if state.word_drag_lock ~= "scale" then
     return
@@ -3476,6 +3921,34 @@ function word_grid_drag_on_word(ctx, item, words, n, wi, triple_preset)
   end
 end
 
+--- Double-click (or reset helper): set font scale to 100% for `wi`, or all selected words if `wi` is selected.
+function word_grid_reset_word_scales(wi, n, item, words, ctx)
+  if wi < 1 or wi > n then
+    return false
+  end
+  local any = false
+  if state.word_sel and state.word_sel[wi] then
+    for j = 1, n do
+      if state.word_sel[j] then
+        state.ml_word_scales[j] = 1
+        any = true
+      end
+    end
+  else
+    state.ml_word_scales[wi] = 1
+    any = true
+  end
+  if not any then
+    return false
+  end
+  ml_sync_editor_text(words)
+  refresh_preview(item)
+  if auto_persist_layout then
+    auto_persist_layout(item, words, ctx)
+  end
+  return true
+end
+
 function word_grid_show_size_labels(ctx, n)
   local now = (r.time_precise and r.time_precise()) or 0
   if not state.word_scale_tip_active and now > (state.word_scale_tip_until or 0) then
@@ -3506,7 +3979,7 @@ function word_grid_show_size_labels(ctx, n)
   end
 end
 
-local function word_grid_take_for_item(item)
+function word_grid_take_for_item(item)
   if not item then
     return nil
   end
@@ -3527,7 +4000,7 @@ end
 
 --- Map absolute project timeline time to WhisperX word index (1-based).
 --- Returns wi, src_t where src_t is source time seconds (or nil, nil).
-local function word_grid_word_index_from_proj_time(item, words, proj_t)
+function word_grid_word_index_from_proj_time(item, words, proj_t)
   if not (item and words and #words > 0 and type(proj_t) == "number") then
     return nil, nil
   end
@@ -3601,7 +4074,7 @@ function word_grid_current_play_word(item, words)
   return wi
 end
 
-local function word_grid_seek_word(item, words, wi)
+function word_grid_seek_word(item, words, wi)
   if not (item and words and words[wi] and r.SetEditCurPos) then
     return false
   end
@@ -3626,40 +4099,118 @@ local function word_grid_seek_word(item, words, wi)
   return true
 end
 
+function word_grid_reset_cut_drag_state()
+  state._wx_cut_drag_wi = nil
+  state._wx_cut_drag_lock = nil
+  state._wx_cut_drag_acc_x = 0
+  state._wx_cut_drag_acc_y = 0
+  state._wx_cut_wsp_acc = nil
+end
+
 function word_grid_cut_zone(ctx, item, words, n, wi, bh)
   if wi < 1 or wi >= n then
     return
   end
   ImGui.SameLine(ctx, 0, 0)
   ImGui.PushID(ctx, wi + 930000)
-  local zone_w = 10
+  local gap_px = word_grid_word_gap_px_for(ctx, words, wi)
+  local zone_w = math.max(10, gap_px)
   local zone_h = math.max(18, tonumber(bh) or 20)
-  if ImGui.InvisibleButton(ctx, "##cut", zone_w, zone_h) then
-    if overlay_mod_alt(ctx) then
-      ml_alt_row(wi, n)
-    else
-      ml_ctrl_phrase(wi, n)
+  ImGui.InvisibleButton(ctx, "##cut", zone_w, zone_h)
+  local x0, y0 = ImGui.GetItemRectMin(ctx)
+  local x1, y1 = ImGui.GetItemRectMax(ctx)
+  local hovered = ImGui.IsItemHovered and ImGui.IsItemHovered(ctx)
+
+  if hovered and ImGui.IsMouseClicked and ImGui.IsMouseClicked(ctx, MOUSE_LEFT) then
+    state._wx_cut_drag_wi = wi
+    state._wx_cut_drag_lock = nil
+    state._wx_cut_drag_acc_x = 0
+    state._wx_cut_drag_acc_y = 0
+    state._wx_cut_wsp_acc = 0
+    state._wx_ind_drag_w = nil
+    state._wx_rowsp_drag_w = nil
+  end
+
+  local v0 = ml_word_gap_after_effective(words, wi)
+  local gap_i = math.floor(v0 * 100 + 0.5)
+  gap_i = math.max(-95, math.min(150, gap_i))
+  local dragging_spacing = state._wx_cut_drag_wi == wi and state._wx_cut_drag_lock == "spacing"
+  local mouse_held = ImGui.IsMouseDown and ImGui.IsMouseDown(ctx, MOUSE_LEFT)
+
+  if state._wx_cut_drag_wi == wi and mouse_held and ImGui.GetMouseDelta then
+    local dx, dy = ImGui.GetMouseDelta(ctx)
+    state._wx_cut_drag_acc_x = (state._wx_cut_drag_acc_x or 0) + math.abs(dx or 0)
+    state._wx_cut_drag_acc_y = (state._wx_cut_drag_acc_y or 0) + math.abs(dy or 0)
+    if not state._wx_cut_drag_lock then
+      local ax = state._wx_cut_drag_acc_x or 0
+      local ay = state._wx_cut_drag_acc_y or 0
+      if ax >= WORD_DRAG_AXIS_THRESHOLD and ax >= ay then
+        state._wx_cut_drag_lock = "spacing"
+      end
     end
-    ml_sync_editor_text(words)
-    refresh_preview(item)
-    if auto_persist_layout then
-      auto_persist_layout(item, words, ctx)
+    if state._wx_cut_drag_lock == "spacing" then
+      dragging_spacing = true
+      state._wx_cut_wsp_acc = (state._wx_cut_wsp_acc or 0) + (dx or 0)
+      local thr = 3.0
+      local changed = false
+      while state._wx_cut_wsp_acc >= thr do
+        if gap_i < 150 then
+          gap_i = gap_i + 1
+          changed = true
+        end
+        state._wx_cut_wsp_acc = state._wx_cut_wsp_acc - thr
+      end
+      while state._wx_cut_wsp_acc <= -thr do
+        if gap_i > -95 then
+          gap_i = gap_i - 1
+          changed = true
+        end
+        state._wx_cut_wsp_acc = state._wx_cut_wsp_acc + thr
+      end
+      if changed then
+        state.ml_word_spacings[wi] = math.max(-0.95, math.min(1.5, gap_i / 100))
+        ml_sync_editor_text(words)
+        refresh_preview(item)
+        if auto_persist_layout then
+          auto_persist_layout(item, words, ctx)
+        end
+      end
     end
   end
-  local hovered = ImGui.IsItemHovered and ImGui.IsItemHovered(ctx)
-  if hovered then
-    if ImGui.SetMouseCursor and ImGui.MouseCursor_Hand then
+
+  if state._wx_cut_drag_wi == wi and ImGui.IsMouseReleased and ImGui.IsMouseReleased(ctx, MOUSE_LEFT) then
+    if state._wx_cut_drag_lock ~= "spacing" then
+      if overlay_mod_alt(ctx) then
+        ml_alt_row(wi, n)
+      else
+        ml_ctrl_phrase(wi, n)
+      end
+      ml_sync_editor_text(words)
+      refresh_preview(item)
+      if auto_persist_layout then
+        auto_persist_layout(item, words, ctx)
+      end
+    end
+    word_grid_reset_cut_drag_state()
+    dragging_spacing = false
+  end
+
+  if hovered or dragging_spacing then
+    if dragging_spacing and ImGui.SetMouseCursor and ImGui.MouseCursor_ResizeEW then
+      ImGui.SetMouseCursor(ctx, ImGui.MouseCursor_ResizeEW)
+    elseif hovered and not dragging_spacing and ImGui.SetMouseCursor and ImGui.MouseCursor_Hand then
       ImGui.SetMouseCursor(ctx, ImGui.MouseCursor_Hand)
     end
     if ImGui.SetTooltip then
-      ImGui.SetTooltip(ctx, "Cut here: phrase break\nAlt+click: row break")
+      if dragging_spacing then
+        ImGui.SetTooltip(ctx, ("Word spacing: %d/100 × font height"):format(gap_i))
+      else
+        ImGui.SetTooltip(ctx, "Click: phrase break · Alt+click: row break · Drag left/right: word spacing")
+      end
     end
-    if ImGui.GetWindowDrawList and ImGui.DrawList_AddLine then
+    if ImGui.GetWindowDrawList and ImGui.DrawList_AddLine and x0 and y0 and x1 and y1 then
       local dl = ImGui.GetWindowDrawList(ctx)
-      local x0, y0 = ImGui.GetItemRectMin(ctx)
-      local x1, y1 = ImGui.GetItemRectMax(ctx)
       local x = (x0 + x1) * 0.5
-      -- High-contrast separator: blend fill RGB toward white, full alpha, thicker stroke.
       local c = wx_active_style_fill_rgba()
       local t = 0.65
       local rr = (c >> 24) & 0xFF
@@ -3670,6 +4221,11 @@ function word_grid_cut_zone(ctx, item, words, n, wi, bh)
       bb = math.min(255, math.floor(bb + (255 - bb) * t + 0.5))
       local sep = (rr << 24) | (gg << 16) | (bb << 8) | 0xFF
       ImGui.DrawList_AddLine(dl, x, y0, x, y1, sep, 3)
+      if dragging_spacing then
+        local gv = math.floor((state.ml_word_spacings[wi] or v0) * 100 + 0.5)
+        gv = math.max(-95, math.min(150, gv))
+        wx_draw_grip_int_below(dl, ctx, x0, x1, y1, gv, c, true)
+      end
     end
   end
   ImGui.PopID(ctx)
@@ -3677,7 +4233,7 @@ function word_grid_cut_zone(ctx, item, words, n, wi, bh)
 end
 
 --- True while phrase-row gutter seek/hover must stay inactive (widgets inside the phrase own the interaction).
-local function word_grid_phrase_row_widgets_busy(ctx)
+function word_grid_phrase_row_widgets_busy(ctx)
   if state.word_drag_lock then
     return true
   end
@@ -3685,6 +4241,9 @@ local function word_grid_phrase_row_widgets_busy(ctx)
     return true
   end
   if state._wx_rowsp_drag_w then
+    return true
+  end
+  if state._wx_cut_drag_wi then
     return true
   end
   if ImGui.IsAnyItemActive and ImGui.IsAnyItemActive(ctx) then
@@ -3871,6 +4430,7 @@ function word_grid_row_indent_handle(ctx, item, words, row_start_w, bh, row_sc, 
     state._wx_ind_drag_w = row_start_w
     state._wx_ind_drag_acc = 0
     state._wx_rowsp_drag_w = nil
+    word_grid_reset_cut_drag_state()
   end
 
   local dragging_here = state._wx_ind_drag_w == row_start_w
@@ -4011,6 +4571,7 @@ function word_grid_row_spacing_handle(ctx, item, words, lower_row_start_w, base_
     state._wx_rowsp_drag_w = lower_row_start_w
     state._wx_rs_drag_acc = 0
     state._wx_ind_drag_w = nil
+    word_grid_reset_cut_drag_state()
   end
 
   local dragging_here = state._wx_rowsp_drag_w == lower_row_start_w
@@ -4116,107 +4677,6 @@ function word_style_apply_change(item, words, ctx)
   refresh_preview(item)
   if auto_persist_layout then
     auto_persist_layout(item, words, ctx)
-  end
-end
-
---- Per-word typeface in the word-style popup (same font list as the overlay; empty = use overlay font).
-local function word_font_selector_ui(ctx, item, words, wi, targets)
-  ensure_font_items(false)
-  if #state.font_items == 0 and not state.font_scan_attempted then
-    ensure_font_items(true)
-  end
-
-  local filtered = font_items_filtered()
-  local font_items = { "<Use overlay font>" }
-  local selected_idx = 0
-  local st_pri = word_style_get(wi)
-  local cur_font = trim(st_pri.font_name or "")
-  local current_seen = cur_font == ""
-  for i = 1, #filtered do
-    local nm = filtered[i].name
-    font_items[#font_items + 1] = nm
-    if cur_font == nm then
-      selected_idx = #font_items - 1
-      current_seen = true
-    end
-  end
-  if not current_seen and cur_font ~= "" then
-    font_items[#font_items + 1] = cur_font
-    selected_idx = #font_items - 1
-  end
-
-  local font_items_str = table.concat(font_items, "\0") .. "\0"
-  local function word_font_combo_popup_header_wrap(ctx2, inner_w, pw, fs, style_idx)
-    local rv_fil = false
-    local new_fil = state.font_combo_filter
-    if ImGui.PushItemWidth then
-      ImGui.PushItemWidth(ctx2, inner_w)
-    end
-    if ImGui.InputTextWithHint then
-      rv_fil, new_fil = ImGui.InputTextWithHint(
-        ctx2,
-        "##word_ov_font_filter",
-        "Filter fonts…",
-        state.font_combo_filter or ""
-      )
-    elseif ImGui.InputText then
-      rv_fil, new_fil = ImGui.InputText(ctx2, "Filter##word_ov_font_filter", state.font_combo_filter or "", 256)
-    end
-    if ImGui.PopItemWidth then
-      ImGui.PopItemWidth(ctx2)
-    end
-    if rv_fil then
-      state.font_combo_filter = new_fil or ""
-      r.SetExtState(SECTION, "FONT_COMBO_FILTER", state.font_combo_filter, true)
-    end
-
-    if wx_custom_small_button(ctx2, "Rescan fonts##word_ov_font_rescan", style_idx) then
-      ensure_font_items(true)
-    end
-    if cur_font ~= "" then
-      ImGui.SameLine(ctx2, 0, 8)
-      local is_fav = state.font_favorites[cur_font] and true or false
-      if wx_custom_small_button(ctx2, (is_fav and "★" or "☆") .. "##word_ov_font_fav", style_idx) then
-        font_toggle_favorite(cur_font)
-      end
-    end
-
-    if #font_items == 1 and #state.font_items == 0 then
-      ImGui.TextColored(ctx2, 0x888888FF, "No system fonts found.")
-    elseif #font_items == 1 then
-      ImGui.TextColored(ctx2, 0x888888FF, "No fonts match filter.")
-    end
-
-    if ImGui.Separator then
-      ImGui.Separator(ctx2)
-    end
-  end
-
-  local rv_font, next_idx = wx_custom_combo(
-    ctx,
-    "##word_overlay_font_combo",
-    "Font",
-    selected_idx,
-    font_items_str,
-    240,
-    state.wx_slider_style,
-    word_font_combo_popup_header_wrap
-  )
-  if rv_font then
-    local nm = font_items[(next_idx or 0) + 1] or ""
-    if (next_idx or 0) == 0 then
-      nm = ""
-    end
-    for ti = 1, #targets do
-      local t = targets[ti]
-      local s = word_style_get(t)
-      s.font_name = nm
-      if word_style_is_empty(s) then
-        state.word_styles[t] = nil
-      end
-    end
-    word_style_apply_change(item, words, ctx)
-    overlay_request_autosave()
   end
 end
 
@@ -4568,6 +5028,12 @@ function word_style_popup_ui(ctx, item, words, wi)
       st.outline_gap = math.max(0, math.min(24, tonumber(ogp) or 0))
       changed = true
     end
+    ImGui.SetNextItemWidth(ctx, 260)
+    local rvom, om = ImGui.Combo(ctx, "Outline Mode", st.outline_mode or 0, "True Outline (Slower)\0Stacked Font (Fast)\0\0")
+    if rvom then
+      st.outline_mode = om
+      changed = true
+    end
     if ImGui.Separator then
       ImGui.Separator(ctx)
     end
@@ -4773,6 +5239,30 @@ function auto_phrase_from_lyrics(item, words, lyrics_text, char_split, ctx)
   if auto_persist_layout then
     auto_persist_layout(item, words, ctx)
   end
+end
+
+function ml_word_gap_effective(words)
+  if state.ml_word_gap ~= nil then
+    return math.max(-0.95, math.min(1.5, tonumber(state.ml_word_gap) or 0.1))
+  end
+  if words and W.words_use_cjk_compact_join(words) then
+    return 0
+  end
+  return 0.1
+end
+
+--- Gap after word `after_wi` (before word `after_wi + 1`); per-seam override or global default.
+function ml_word_gap_after_effective(words, after_wi)
+  local v = state.ml_word_spacings and state.ml_word_spacings[after_wi]
+  if v ~= nil then
+    return math.max(-0.95, math.min(1.5, tonumber(v) or 0.1))
+  end
+  return ml_word_gap_effective(words)
+end
+
+function word_grid_word_gap_px_for(ctx, words, after_wi)
+  local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
+  return math.max(4, math.floor(fs * ml_word_gap_after_effective(words, after_wi) + 0.5))
 end
 
 function word_grid_ui(ctx, item, words)
@@ -5057,9 +5547,6 @@ function word_grid_ui(ctx, item, words)
         end
         word_grid_row_indent_handle(ctx, item, words, ra, row_line_h, row_sc, row_has_sel)
         for wi = ra, rb do
-            if wi > ra then
-              ImGui.SameLine(ctx, 0, 4)
-            end
             ImGui.PushID(ctx, wi + 910000)
             local sc = state.ml_word_scales[wi] or 1
             local wtxt, bw = wx_word_grid_button_label_and_width(ctx, words[wi].w, sc, 24, 7)
@@ -5079,7 +5566,16 @@ function word_grid_ui(ctx, item, words)
             else
               word_clicked = wx_custom_button(ctx, wtxt .. "##w", bw, bh, state.wx_slider_style, false, wb_fill, wb_outline)
             end
-            if word_clicked then
+            local word_double_clicked = false
+            if
+              ImGui.IsItemHovered
+              and ImGui.IsItemHovered(ctx)
+              and ImGui.IsMouseDoubleClicked
+              and ImGui.IsMouseDoubleClicked(ctx, MOUSE_LEFT)
+            then
+              word_double_clicked = word_grid_reset_word_scales(wi, n, item, words, ctx) and true or false
+            end
+            if word_clicked and not word_double_clicked then
               word_grid_seek_word(item, words, wi)
               if overlay_mod_ctrl_shift(ctx) then
                 if ml_make_word_phrase_start(wi, n) then
@@ -5137,13 +5633,13 @@ function word_grid_ui(ctx, item, words)
             end
             word_style_popup_ui(ctx, item, words, wi)
             word_grid_drag_on_word(ctx, item, words, n, wi, true)
-            local can_drag_drop = true
-            if ImGui.IsMouseDown then
+            local can_drag_drop = state.word_drag_lock == "phrase"
+            if can_drag_drop and ImGui.IsMouseDown then
               can_drag_drop = ImGui.IsMouseDown(ctx, MOUSE_LEFT)
             end
             if can_drag_drop and ImGui.BeginDragDropSource and ImGui.BeginDragDropSource(ctx) then
               ImGui.SetDragDropPayload(ctx, WX_WORD, tostring(wi))
-              ImGui.Text(ctx, "→ previous/next word or new phrase")
+              ImGui.Text(ctx, "→ adjacent word, move into next phrase, or + new phrase")
               ImGui.EndDragDropSource(ctx)
             end
             if ImGui.BeginDragDropTarget and ImGui.BeginDragDropTarget(ctx) then
@@ -5155,6 +5651,8 @@ function word_grid_ui(ctx, item, words)
                   changed = ml_drop_merge_into_prev_word(src, n)
                 elseif src and src == wi - 1 then
                   changed = ml_drop_merge_into_next_word(src, n)
+                elseif src and src ~= wi then
+                  changed = ml_drop_move_word_to_next_phrase_start(src, wi, n)
                 end
                 if changed then
                   ml_sync_editor_text(words)
@@ -5179,7 +5677,7 @@ function word_grid_ui(ctx, item, words)
             end
             if ImGui.IsItemHovered and ImGui.IsItemHovered(ctx) then
               if ImGui.SetTooltip then
-                ImGui.SetTooltip(ctx, (words[wi].w or "") .. "\nCtrl/Cmd+right-click: word style · Drag: reposition · H-drag: size · Ctrl/Cmd+Shift: phrase start")
+                ImGui.SetTooltip(ctx, (words[wi].w or "") .. "\nCtrl/Cmd+right-click: word style · V-drag: reposition · H-drag: size · Double-click: reset size to 100% · Ctrl/Cmd+Shift: phrase start")
               end
             end
             if wi < rb then
@@ -5194,9 +5692,9 @@ function word_grid_ui(ctx, item, words)
                 end
               end
               if ImGui.SetItemTooltip then
-                ImGui.SetItemTooltip(ctx, "This phrase: reset indents, row gaps, and/or word styles")
+                ImGui.SetItemTooltip(ctx, "This phrase: reset indents, row/word gaps, and/or word styles")
               elseif ImGui.SetTooltip and ImGui.IsItemHovered and ImGui.IsItemHovered(ctx) then
-                ImGui.SetTooltip(ctx, "This phrase: reset indents, row gaps, and/or word styles")
+                ImGui.SetTooltip(ctx, "This phrase: reset indents, row/word gaps, and/or word styles")
               end
               if ImGui.BeginPopup and ImGui.BeginPopup(ctx, popup_id) then
                 if wx_custom_button(ctx, "Reset row indents", 280, 0, state.wx_slider_style) then
@@ -5207,6 +5705,12 @@ function word_grid_ui(ctx, item, words)
                 end
                 if wx_custom_button(ctx, "Reset row spacing", 280, 0, state.wx_slider_style) then
                   ml_phrase_reset_layout("rowsp", ps, pe, n, item, words, ctx)
+                  if ImGui.CloseCurrentPopup then
+                    ImGui.CloseCurrentPopup(ctx)
+                  end
+                end
+                if wx_custom_button(ctx, "Reset word spacing", 280, 0, state.wx_slider_style) then
+                  ml_phrase_reset_layout("wordsp", ps, pe, n, item, words, ctx)
                   if ImGui.CloseCurrentPopup then
                     ImGui.CloseCurrentPopup(ctx)
                   end
@@ -5375,6 +5879,11 @@ function save_settings()
     r.SetExtState(SECTION, "ML_R" .. tostring(i), tostring(state.ml_r[i]), true)
   end
   r.SetExtState(SECTION, "ML_LINE_GAP", string.format("%.17g", state.ml_line_gap), true)
+  if state.ml_word_gap ~= nil then
+    r.SetExtState(SECTION, "ML_WORD_GAP", string.format("%.17g", state.ml_word_gap), true)
+  else
+    r.SetExtState(SECTION, "ML_WORD_GAP", "", true)
+  end
   r.SetExtState(SECTION, "ML_ROW_CHARS", tostring(state.ml_row_chars), true)
   r.SetExtState(SECTION, "ML_ROW_CHARS_RAND", tostring(state.ml_row_chars_rand), true)
   r.SetExtState(SECTION, "ML_ROW_VALIGN", tostring(math.floor(state.ml_row_v_align or 0)), true)
@@ -5532,13 +6041,113 @@ function write_vp_for_item(item, live_opts)
 end
 
 --- Queue a subtitle + item/extstate autosave flush on the next end-of-frame pass (handles font, guides, global sliders, …).
-overlay_request_autosave = function()
+function overlay_request_autosave()
   state.overlay_autosave_force = true
   wx_request_vp_sync()
 end
 
+--- Per-word typeface in the word-style popup (global function — avoids Lua 200-local limit in this script’s main chunk).
+function word_font_selector_ui(ctx, item, words, wi, targets)
+  ensure_font_items(false)
+  if #state.font_items == 0 and not state.font_scan_attempted then
+    ensure_font_items(true)
+  end
+
+  local filtered = font_items_filtered()
+  local font_items = { "<Use overlay font>" }
+  local selected_idx = 0
+  local st_pri = word_style_get(wi)
+  local cur_font = trim(st_pri.font_name or "")
+  local current_seen = cur_font == ""
+  for i = 1, #filtered do
+    local nm = filtered[i].name
+    font_items[#font_items + 1] = nm
+    if cur_font == nm then
+      selected_idx = #font_items - 1
+      current_seen = true
+    end
+  end
+  if not current_seen and cur_font ~= "" then
+    font_items[#font_items + 1] = cur_font
+    selected_idx = #font_items - 1
+  end
+
+  local function word_font_combo_popup_header_wrap(ctx2, inner_w, fs, style_idx)
+    local rv_fil = false
+    local new_fil = state.font_combo_filter
+    if ImGui.PushItemWidth then
+      ImGui.PushItemWidth(ctx2, inner_w)
+    end
+    if ImGui.InputTextWithHint then
+      rv_fil, new_fil = ImGui.InputTextWithHint(
+        ctx2,
+        "##word_ov_font_filter",
+        "Filter fonts…",
+        state.font_combo_filter or ""
+      )
+    elseif ImGui.InputText then
+      rv_fil, new_fil = ImGui.InputText(ctx2, "Filter##word_ov_font_filter", state.font_combo_filter or "", 256)
+    end
+    if ImGui.PopItemWidth then
+      ImGui.PopItemWidth(ctx2)
+    end
+    if rv_fil then
+      state.font_combo_filter = new_fil or ""
+      r.SetExtState(SECTION, "FONT_COMBO_FILTER", state.font_combo_filter, true)
+    end
+
+    if wx_custom_small_button(ctx2, "Rescan fonts##word_ov_font_rescan", style_idx) then
+      ensure_font_items(true)
+    end
+    if cur_font ~= "" then
+      ImGui.SameLine(ctx2, 0, 8)
+      local is_fav = state.font_favorites[cur_font] and true or false
+      if wx_custom_small_button(ctx2, (is_fav and "★" or "☆") .. "##word_ov_font_fav", style_idx) then
+        font_toggle_favorite(cur_font)
+      end
+    end
+
+    if #font_items == 1 and #state.font_items == 0 then
+      ImGui.TextColored(ctx2, 0x888888FF, "No system fonts found.")
+    elseif #font_items == 1 then
+      ImGui.TextColored(ctx2, 0x888888FF, "No fonts match filter.")
+    end
+
+    if ImGui.Separator then
+      ImGui.Separator(ctx2)
+    end
+  end
+
+  local rv_font, next_idx = wx_font_combo_draw(
+    ctx,
+    "##word_overlay_font_combo",
+    "Font",
+    selected_idx,
+    font_items,
+    420,
+    state.wx_slider_style,
+    word_font_combo_popup_header_wrap
+  )
+  if rv_font then
+    local nm = font_items[(next_idx or 0) + 1] or ""
+    if (next_idx or 0) == 0 then
+      nm = ""
+    end
+    for ti = 1, #targets do
+      local t = targets[ti]
+      local s = word_style_get(t)
+      s.font_name = nm
+      if word_style_is_empty(s) then
+        state.word_styles[t] = nil
+      end
+    end
+    word_style_apply_change(item, words, ctx)
+    overlay_request_autosave()
+  end
+end
+
 --- Fingerprint written to disk by `auto_persist_layout`; used to coalesce autosaves (word grid + globals + VP settings).
-local function overlay_autosave_state_sig(words)
+function overlay_autosave_state_sig(words)
   words = words or {}
   local n = #words
   local z = "\255"
@@ -5575,6 +6184,7 @@ local function overlay_autosave_state_sig(words)
   ap(z .. "LM")
   ap(z .. tostring(math.floor(state.ml_max_rows or 0)))
   ap(z .. fq(state.ml_line_gap or 0))
+  ap(z .. (state.ml_word_gap ~= nil and fq(state.ml_word_gap) or "x"))
   ap(z .. tostring(math.floor(state.ml_row_chars or 0)))
   ap(z .. tostring(math.floor(state.ml_row_chars_rand or 0)))
   ap(z .. tostring(math.floor(state.ml_row_v_align or 0)))
@@ -5696,6 +6306,15 @@ local function overlay_autosave_state_sig(words)
       ap(z .. fq(sp))
     end
   end
+  ap(z .. "WNG")
+  for i = 1, math.max(0, n - 1) do
+    local sp = state.ml_word_spacings[i]
+    if sp == nil then
+      ap(z .. "x")
+    else
+      ap(z .. fq(sp))
+    end
+  end
   ap(z .. "WS")
   for i = 1, n do
     local st = state.word_styles and state.word_styles[i]
@@ -5801,7 +6420,7 @@ function wx_vp_chunk_write_safe(ctx)
   return true
 end
 
-local function wx_flush_pending_vp_sync(ctx, item, take, words)
+function wx_flush_pending_vp_sync(ctx, item, take, words)
   if not state._wx_vp_sync_pending then
     return
   end
@@ -5845,6 +6464,7 @@ auto_persist_layout = function(item, words, ctx)
     r.SetExtState(SECTION, "ML_ROW_INDENT", ml_indents_pack(state.ml_row_indents, nw), true)
     if r.GetSetMediaItemInfo_String then
       r.GetSetMediaItemInfo_String(item, ITEM_EXT.ROW_SPACING, ml_row_spacings_pack(state.ml_row_spacings, nw), true)
+      r.GetSetMediaItemInfo_String(item, ITEM_EXT.WORD_SPACING, ml_row_spacings_pack(state.ml_word_spacings, nw), true)
     end
   end
   persist_word_styles(nw, item)
@@ -5857,11 +6477,18 @@ auto_persist_layout = function(item, words, ctx)
   else
     refresh_preview(item)
   end
-  if state.preview_parse_err == "" and state.preview_segs > 0 and wx_vp_chunk_write_safe(ctx) then
-    write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })
+  local need_vp = state.preview_parse_err == "" and (state.preview_segs or 0) > 0
+  local vp_written = false
+  if need_vp and wx_vp_chunk_write_safe(ctx) then
+    vp_written = select(1, write_vp_for_item(item, { no_undo = true, skip_refresh = true, skip_if_same = true })) and true
+      or false
   end
-  state._wx_vp_sync_pending = false
-  state.overlay_autosave_sig_saved = overlay_autosave_state_sig(words)
+  -- Do not clear VP sync / autosave fingerprint while a control is still active or chunk write was
+  -- deferred — otherwise release-after-edit never reaches the item (layout sliders looked "stuck").
+  if not need_vp or vp_written then
+    state._wx_vp_sync_pending = false
+    state.overlay_autosave_sig_saved = overlay_autosave_state_sig(words)
+  end
 end
 
 function apply_to_selection()
@@ -5900,11 +6527,10 @@ function refresh_markers_and_apply(item)
     state.status_err = true
     return
   end
-  ml_load_for_word_count(#words, item)
-  ml_sync_editor_text(words)
-  local opts_chk = display_opts_from_state(words)
-  local parsed_ok = W.parse_editor_phrases_for_multiline(words, state.editor_text or "", opts_chk)
-  if not parsed_ok then
+  if not ml_preserve_layout_for_new_count(words, state.prev_words_snapshot) then
+    ml_load_layout_for_item(item, words)
+  end
+  if not editor_text_parse_ok(words, state.editor_text or "") then
     for i = 1, math.max(0, #words - 1) do
       state.ml_phrase_after[i] = false
       state.ml_row_after[i] = false
@@ -5942,7 +6568,7 @@ function ml_stack_param_item_w(ctx)
 end
 
 --- Content region width (X) for layout; ReaImGui may return one or two values.
-local function ml_content_region_avail_x(ctx)
+function ml_content_region_avail_x(ctx)
   if not ImGui.GetContentRegionAvail then
     return 400
   end
@@ -6226,7 +6852,7 @@ wx_custom_small_button = function(ctx, label, style_idx)
 end
 
 --- True while REAPER plays or records — matches word-marker follow heuristic.
-local function wx_reaper_transport_moving()
+function wx_reaper_transport_moving()
   if not r.GetPlayState then
     return false
   end
@@ -6235,7 +6861,7 @@ local function wx_reaper_transport_moving()
 end
 
 --- Small vector transport glyphs (triangle play, filled square stop/pause motif, wedge skip cues).
-local function wx_transport_triangle_r(dl, ax, ay, bx, by, cx, cy, col)
+function wx_transport_triangle_r(dl, ax, ay, bx, by, cx, cy, col)
   if ImGui.DrawList_AddTriangleFilled then
     ImGui.DrawList_AddTriangleFilled(dl, ax, ay, bx, by, cx, cy, col)
     return true
@@ -6250,7 +6876,7 @@ local function wx_transport_triangle_r(dl, ax, ay, bx, by, cx, cy, col)
   return false
 end
 
-local function wx_transport_draw_glyph_play(dl, x, y, w, h, col)
+function wx_transport_draw_glyph_play(dl, x, y, w, h, col)
   local pad = math.max(3.6, math.min(w, h) * 0.15)
   local apex_x = x + w - pad
   local base_x = x + pad + math.min(w, h) * 0.06
@@ -6260,7 +6886,7 @@ local function wx_transport_draw_glyph_play(dl, x, y, w, h, col)
 end
 
 --- Stop / pause square (filled).
-local function wx_transport_draw_glyph_stop(dl, x, y, w, h, col)
+function wx_transport_draw_glyph_stop(dl, x, y, w, h, col)
   local sz = math.min(w, h) * 0.44
   local x0 = x + (w - sz) * 0.5
   local y0 = y + (h - sz) * 0.5
@@ -6272,7 +6898,7 @@ local function wx_transport_draw_glyph_stop(dl, x, y, w, h, col)
   return false
 end
 
-local function wx_transport_draw_glyph_next(dl, x, y, w, h, col)
+function wx_transport_draw_glyph_next(dl, x, y, w, h, col)
   --- Two right-pointing wedges + slim bar (“skip toward end” motif).
   local mid_y = y + h * 0.5
   local apex_off = math.min(w, h) * 0.33
@@ -6294,7 +6920,7 @@ local function wx_transport_draw_glyph_next(dl, x, y, w, h, col)
   return true
 end
 
-local function wx_transport_draw_glyph_previous(dl, x, y, w, h, col)
+function wx_transport_draw_glyph_previous(dl, x, y, w, h, col)
   --- Mirror of Next.
   local mid_y = y + h * 0.5
   local apex_off = math.min(w, h) * 0.33
@@ -6317,7 +6943,7 @@ local function wx_transport_draw_glyph_previous(dl, x, y, w, h, col)
 end
 
 --- Icon-only toolbar button; `playback_lit` tints chrome (used for Play while transport runs).
-local function wx_transport_icon_button(ctx, label, bw, bh, slider_style_idx, draw_glyph, playback_lit)
+function wx_transport_icon_button(ctx, label, bw, bh, slider_style_idx, draw_glyph, playback_lit)
   if not (ImGui.InvisibleButton and ImGui.GetWindowDrawList and ImGui.DrawList_AddRectFilled) then
     return wx_custom_small_button(ctx, label, slider_style_idx)
   end
@@ -7071,26 +7697,849 @@ wx_custom_slider_int = function(ctx, id, label, value, min_v, max_v, fmt, width,
   return changed, value, changed_rand, rand_value
 end
 
-wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_idx, popup_header_fn, external_label)
+--- Compact wastebasket glyph for preset list rows (no emoji font dependency).
+function wx_draw_combo_popup_trash_icon(dl, x, y, w, h, col)
+  if not dl or not ImGui.DrawList_AddLine then
+    return
+  end
+  local th = math.max(1.1, math.min(w, h) * 0.1)
+  local cx = x + w * 0.5
+  local lid_y = y + h * 0.26
+  local body_top = y + h * 0.38
+  local body_bot = y + h * 0.76
+  local xL = cx - w * 0.2
+  local xR = cx + w * 0.2
+  ImGui.DrawList_AddLine(dl, xL - w * 0.06, lid_y, xR + w * 0.06, lid_y, col, th * 1.05)
+  ImGui.DrawList_AddLine(dl, xL, body_top, xL, body_bot, col, th)
+  ImGui.DrawList_AddLine(dl, xR, body_top, xR, body_bot, col, th)
+  ImGui.DrawList_AddLine(dl, xL, body_bot, xR, body_bot, col, th)
+  ImGui.DrawList_AddLine(dl, cx - w * 0.1, lid_y, cx - w * 0.12, body_top, col, th * 0.95)
+  ImGui.DrawList_AddLine(dl, cx + w * 0.1, lid_y, cx + w * 0.12, body_top, col, th * 0.95)
+end
+
+local function wx_font_combo_row_is_builtin_sentinel(nm)
+  nm = trim(tostring(nm or ""))
+  return nm == "<Default system fallback>" or nm == "<Use overlay font>"
+end
+
+local wx_font_combo_custom_table_popup = (function()
+  local FC_FONT_COL_FAV, FC_FONT_COL_NAME = 101, 102
+
+  --- Dear ImGui uses negative FLT_MIN (“stretch”) when width should fill available space; width 0 often collapses BeginTable inside popups.
+  local function tbl_outer_width(inner_w)
+    local w = tonumber(inner_w) or 0
+    if w > 1 then
+      return w
+    end
+    if ImGui.NumericLimits_Float then
+      local flt_min = select(1, ImGui.NumericLimits_Float())
+      if flt_min and flt_min ~= 0 then
+        return -math.abs(flt_min)
+      end
+    end
+    return -1
+  end
+
+  --- Outer-size BeginTable overloads vary by ReaImGui build; errors/false here previously forced wx_custom_combo back to a plain list.
+  local function font_combo_begin_table(ctx, sid, tbl_flags, ow, oh)
+    local bt = ImGui.BeginTable
+    if not bt then
+      return false
+    end
+    local trials = {
+      function()
+        return bt(ctx, sid, 3, tbl_flags, ow, oh, 0)
+      end,
+      function()
+        return bt(ctx, sid, 3, tbl_flags, ow, oh)
+      end,
+      function()
+        return bt(ctx, sid, 3, tbl_flags)
+      end,
+      function()
+        return bt(ctx, sid, 3, 0)
+      end,
+    }
+    for ti = 1, #trials do
+      local okc, opened = pcall(trials[ti])
+      if okc and opened then
+        return true
+      end
+    end
+    return false
+  end
+
+  return function(ctx, items, inner_w, row_h, preview_fn_active, combo_id_tag, popup_id_str, sel_idx_box, style_idx)
+  combo_id_tag = trim(tostring(combo_id_tag or ""))
+  popup_id_str = tostring(popup_id_str or "")
+  style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or 1)))
+  if not sel_idx_box or type(sel_idx_box) ~= "table" then
+    return false
+  end
+  if not items then
+    return false
+  end
+
+  local n_raw = #items
+  local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
+  local pfn_preview = preview_fn_active
+  if n_raw > WX_FONT_COMBO_PREVIEW_MAX_ROWS then
+    pfn_preview = nil
+  end
+
+  --- Map full font face name → 0-based index in `items` (selection is by name, not grouped row index).
+  local items_idx_by_name = {}
+  for i = 1, n_raw do
+    local nm = trim(tostring(items[i] or ""))
+    if nm ~= "" then
+      items_idx_by_name[nm] = i - 1
+    end
+  end
+
+  local function font_combo_apply_selection(full_name)
+    full_name = trim(tostring(full_name or ""))
+    sel_idx_box.name = full_name
+    if full_name == "" or wx_font_combo_row_is_builtin_sentinel(full_name) then
+      sel_idx_box.v = 0
+      return
+    end
+    local ix = items_idx_by_name[full_name]
+    if ix ~= nil then
+      sel_idx_box.v = ix
+    end
+  end
+
+  if not sel_idx_box.name or sel_idx_box.name == "" then
+    sel_idx_box.name = trim(tostring(items[math.floor(tonumber(sel_idx_box.v) or 0) + 1] or ""))
+  end
+
+  local function group_fonts_by_family(items_arr)
+    local families = {}
+    local family_list = {}
+    local variants = { "bold italic", "semibold italic", "medium italic", "light italic", "thin italic", "extra bold", "extrabold", "extra light", "extralight", "black", "heavy", "bold", "italic", "semibold", "medium", "light", "thin", "condensed", "compressed", "oblique", "regular" }
+    
+    for i = 1, #items_arr do
+      local nm = trim(tostring(items_arr[i] or ""))
+      local fam = nm
+      local var = "Regular"
+      
+      if nm ~= "" and nm ~= "<Default system fallback>" and nm ~= "<Use overlay font>" then
+        local lower_nm = nm:lower()
+        for _, v in ipairs(variants) do
+          local vl = v:lower()
+          --- Use a function replacer so the pattern fragment is not parsed as gsub escapes (Lua 5.3+: `%` rules are strict).
+          local vf = vl:gsub(" ", function()
+            return "[ %-]?"
+          end)
+          local pat = ".*()[ %-]" .. vf .. "[ %-0-9a-z]*$"
+          local s = lower_nm:match(pat)
+          if s then
+            fam = trim(nm:sub(1, s - 1))
+            var = trim(nm:sub(s))
+            if var == "" then var = "Regular" end
+            break
+          end
+        end
+      end
+      
+      if not families[fam] then
+        families[fam] = { name = fam, variants = {}, variant_names = {}, first_idx = i }
+        family_list[#family_list + 1] = families[fam]
+      end
+      local fobj = families[fam]
+      fobj.variants[#fobj.variants + 1] = { name = var, full_name = nm, index = i }
+      fobj.variant_names[#fobj.variant_names + 1] = var
+    end
+    return family_list, families
+  end
+
+  local cache_key =
+    combo_id_tag
+    .. ":"
+    .. tostring(n_raw)
+    .. ":"
+    .. trim(state.font_combo_filter or "")
+    .. ":fg"
+    .. tostring(state.font_favorites_gen or 0)
+  if not state._fc_grp_cache or state._fc_grp_cache.key ~= cache_key then
+    local fl, fm = group_fonts_by_family(items)
+    state._fc_grp_cache = { key = cache_key, family_list = fl, families = fm }
+  end
+  local family_list = state._fc_grp_cache.family_list
+  local n = #family_list
+  state.font_family_variant_sel = state.font_family_variant_sel or {}
+
+  local sel_item_idx = math.floor(tonumber(sel_idx_box.v) or 0) + 1
+  if sel_idx_box.name ~= "" and items_idx_by_name[sel_idx_box.name] ~= nil then
+    sel_item_idx = items_idx_by_name[sel_idx_box.name] + 1
+  end
+  for i = 1, #family_list do
+    local fobj = family_list[i]
+    for v = 1, #fobj.variants do
+      if trim(fobj.variants[v].full_name) == trim(sel_idx_box.name or "") then
+        state.font_family_variant_sel[fobj.name] = v
+        break
+      end
+    end
+  end
+
+  local function row_nm(ii)
+    return family_list[ii].name
+  end
+
+  local SORT_ASC = ImGui.SortDirection_Ascending
+  local SORT_DESC = ImGui.SortDirection_Descending
+
+  local function sort_is_asc(d)
+    if SORT_ASC ~= nil then
+      return d == SORT_ASC
+    end
+    if SORT_DESC ~= nil then
+      return d ~= SORT_DESC
+    end
+    return true
+  end
+
+  --- Body rows = families only (pinned sentinel stays row 1, not reordered).
+  local sort_cache_key = combo_id_tag .. ":" .. tostring(n) .. ":fg" .. tostring(state.font_favorites_gen or 0)
+  if not state._fc_tbl_sort or state._fc_tbl_sort.key ~= sort_cache_key then
+    state._fc_tbl_sort = { key = sort_cache_key, body = {}, fgen = -1 }
+    local b = state._fc_tbl_sort.body
+    if n >= 2 then
+      for ii = 2, n do
+        b[#b + 1] = ii
+      end
+    end
+  end
+
+  local body = state._fc_tbl_sort and state._fc_tbl_sort.body or {}
+
+  local function cmp_ia_ib(ia, ib, sort_specs)
+    if sort_specs == nil or #sort_specs == 0 then
+      local ra = font_family_has_favorite(family_list[ia]) and 0 or 1
+      local rb = font_family_has_favorite(family_list[ib]) and 0 or 1
+      if ra ~= rb then
+        return ra < rb
+      end
+      local na = row_nm(ia):lower()
+      local nb = row_nm(ib):lower()
+      if na ~= nb then
+        return na < nb
+      end
+      return ia < ib
+    end
+    for s = 1, #sort_specs do
+      local sp = sort_specs[s]
+      local asc = sort_is_asc(sp.dir)
+      local cid = sp.cid or 0
+      local cix = tonumber(sp.idx) or 0
+      if cid == FC_FONT_COL_FAV or cix == 0 then
+        local ra = font_family_has_favorite(family_list[ia]) and 0 or 1
+        local rb = font_family_has_favorite(family_list[ib]) and 0 or 1
+        if ra ~= rb then
+          if asc then
+            return ra < rb
+          end
+          return ra > rb
+        end
+      elseif cid == FC_FONT_COL_NAME or cix == 1 then
+        local na = row_nm(ia):lower()
+        local nb = row_nm(ib):lower()
+        if na ~= nb then
+          if asc then
+            return na < nb
+          end
+          return na > nb
+        end
+      end
+    end
+    local na = row_nm(ia):lower()
+    local nb = row_nm(ib):lower()
+    if na ~= nb then
+      return na < nb
+    end
+    return ia < ib
+  end
+
+  local list_rows_vis = math.min(math.max(n, 1), 26)
+  local scroll_h = math.max(1, list_rows_vis * row_h + row_h + fs * 0.85 + 10)
+
+  local tbl_outer_w = tbl_outer_width(inner_w)
+  local tbl_outer_h = math.max(1, tonumber(scroll_h) or 1)
+
+  --- Favorite sort runs without needing table headers/sort specs (flat fallback skips BeginTable entirely).
+  local gen_now = tonumber(state.font_favorites_gen) or 0
+  local fav_dirty = state._fc_tbl_sort and state._fc_tbl_sort.fgen ~= gen_now
+  if fav_dirty and #body >= 2 then
+    pcall(table.sort, body, function(a, b)
+      return cmp_ia_ib(a, b, {})
+    end)
+    if state._fc_tbl_sort then
+      state._fc_tbl_sort.fgen = gen_now
+    end
+  end
+
+  local tbl_flags = 0
+  if ImGui.TableFlags_Resizable then
+    tbl_flags = tbl_flags | ImGui.TableFlags_Resizable
+  end
+  if ImGui.TableFlags_Sortable then
+    tbl_flags = tbl_flags | ImGui.TableFlags_Sortable
+  end
+  if ImGui.TableFlags_RowBg then
+    tbl_flags = tbl_flags | ImGui.TableFlags_RowBg
+  end
+  if ImGui.TableFlags_BordersInnerV then
+    tbl_flags = tbl_flags | ImGui.TableFlags_BordersInnerV
+  end
+  if ImGui.TableFlags_BordersOuterH then
+    tbl_flags = tbl_flags | ImGui.TableFlags_BordersOuterH
+  end
+  if ImGui.TableFlags_ScrollY then
+    tbl_flags = tbl_flags | ImGui.TableFlags_ScrollY
+  end
+
+  local tbl_sid = popup_id_str .. "_wx_font_tbl_" .. combo_id_tag
+  local has_full_table =
+    ImGui.BeginTable and ImGui.TableSetupColumn and ImGui.TableHeadersRow and ImGui.TableNextRow and ImGui.TableNextColumn
+  local ok_tbl = false
+  if has_full_table then
+    ok_tbl = font_combo_begin_table(ctx, tbl_sid, tbl_flags, tbl_outer_w, tbl_outer_h)
+  end
+
+  local fav_cell = math.max(26, fs * 2.3)
+  local iw_eff = math.max(tonumber(inner_w) or 0, fav_cell + 140)
+  local name_cell = math.max(120, iw_eff - fav_cell - fs * 8 - 20)
+
+  local sel_flags = ImGui.SelectableFlags_None or 0
+
+  local function try_preview_push(nm_disp)
+    if not pfn_preview or wx_font_combo_row_is_builtin_sentinel(nm_disp) then
+      return nil, false
+    end
+    local preview_font = nil
+    local ok_pf, fh = pcall(pfn_preview, ctx, 0, nm_disp)
+    if ok_pf then
+      preview_font = fh
+    end
+    local pushed = false
+    if preview_font then
+      if r.ImGui_PushFont then
+        local ok2, _ = pcall(r.ImGui_PushFont, ctx, preview_font)
+        pushed = ok2 and true or false
+      end
+      if not pushed and ImGui.PushFont then
+        local ok2, _ = pcall(ImGui.PushFont, ctx, preview_font)
+        pushed = ok2 and true or false
+      end
+    end
+    return preview_font, pushed
+  end
+
+  local function preview_pop_if(pushed)
+    if pushed then
+      if ImGui.PopFont then
+        pcall(ImGui.PopFont, ctx)
+      elseif r.ImGui_PopFont then
+        pcall(r.ImGui_PopFont, ctx)
+      end
+    end
+  end
+
+  local function draw_font_row(ii)
+    if ii < 1 or ii > n then
+      return
+    end
+    ImGui.TableNextRow(ctx)
+    local fobj = family_list[ii]
+    local fam = fobj.name
+
+    local var_idx = nil
+    local row_sel = false
+    local cur_sel_name = trim(sel_idx_box.name or "")
+    if cur_sel_name ~= "" then
+      for vi = 1, #fobj.variants do
+        if trim(fobj.variants[vi].full_name) == cur_sel_name then
+          var_idx = vi
+          row_sel = true
+          break
+        end
+      end
+    end
+    if not var_idx then
+      var_idx = font_family_pick_variant_idx(fobj, sel_item_idx)
+    end
+    if var_idx > #fobj.variants then
+      var_idx = 1
+    end
+
+    local active_var = fobj.variants[var_idx]
+    local full_name = active_var.full_name
+    local is_sentinel = wx_font_combo_row_is_builtin_sentinel(full_name)
+
+    ImGui.PushID(ctx, popup_id_str .. "_frow_" .. tostring(ii))
+    ImGui.TableNextColumn(ctx)
+    if full_name ~= "" and not is_sentinel then
+      local is_fav = font_name_is_favorite(full_name)
+      local star_lab = (is_fav and "★" or "☆") .. "##favtog_" .. tostring(ii)
+      local star_hit = false
+      if wx_custom_small_button then
+        star_hit = wx_custom_small_button(ctx, star_lab, style_idx)
+      elseif ImGui.SmallButton then
+        star_hit = ImGui.SmallButton(ctx, star_lab)
+      end
+      if star_hit then
+        font_toggle_favorite(full_name)
+      end
+    else
+      if ImGui.Dummy then
+        pcall(ImGui.Dummy, ctx, math.max(20, fs * 1.3), math.max(row_h - 2, fs * 1.1))
+      end
+    end
+
+    ImGui.TableNextColumn(ctx)
+    local label = fam ~= "" and fam or "(empty)"
+    local show_prev = full_name ~= "" and full_name ~= "(empty)" and not is_sentinel
+
+    local _, pushed_pf = try_preview_push(show_prev and full_name or "")
+    local clicked_sel = false
+    if ImGui.Selectable then
+      local ok_sc, sel_hit = pcall(ImGui.Selectable, ctx, label .. "##selw", row_sel, sel_flags, 0, row_h)
+      if ok_sc then
+        clicked_sel = sel_hit and true or false
+      else
+        clicked_sel = ImGui.Selectable(ctx, label .. "##selw", row_sel)
+      end
+    end
+    preview_pop_if(pushed_pf)
+
+    if clicked_sel then
+      if not row_sel then
+        var_idx = font_family_pick_variant_idx(fobj, nil)
+      end
+      if var_idx > #fobj.variants then
+        var_idx = 1
+      end
+      state.font_family_variant_sel[fam] = var_idx
+      font_combo_apply_selection(fobj.variants[var_idx].full_name)
+    end
+
+    ImGui.TableNextColumn(ctx)
+    if #fobj.variants > 1 then
+      if ImGui.PushItemWidth then
+        pcall(ImGui.PushItemWidth, ctx, -1)
+      end
+      local var_str = table.concat(fobj.variant_names, "\0") .. "\0"
+      if ImGui.Combo then
+        local rv, out = ImGui.Combo(ctx, "##var" .. tostring(ii), var_idx - 1, var_str)
+        if rv and out ~= nil then
+          local nv = math.floor(tonumber(out) or 0) + 1
+          if nv >= 1 and nv <= #fobj.variants then
+            state.font_family_variant_sel[fam] = nv
+            if row_sel or clicked_sel then
+              font_combo_apply_selection(fobj.variants[nv].full_name)
+            end
+          end
+        end
+      end
+      if ImGui.PopItemWidth then
+        pcall(ImGui.PopItemWidth, ctx)
+      end
+    else
+      local vdisp = fobj.variant_names[1] or ""
+      if vdisp ~= "Regular" and vdisp ~= fam and vdisp ~= "" then
+        if ImGui.TextDisabled then
+          pcall(ImGui.TextDisabled, ctx, vdisp)
+        end
+      end
+    end
+
+    ImGui.PopID(ctx)
+  end
+
+  --- Same-line layout when BeginTable fails (still beats falling back to wx_custom_combo's single-column clipper list).
+  local function flat_draw_font_row(ii)
+    if ii < 1 or ii > n then
+      return
+    end
+    local fobj = family_list[ii]
+    local fam = fobj.name
+
+    local var_idx = nil
+    local row_sel = false
+    local cur_sel_name = trim(sel_idx_box.name or "")
+    if cur_sel_name ~= "" then
+      for vi = 1, #fobj.variants do
+        if trim(fobj.variants[vi].full_name) == cur_sel_name then
+          var_idx = vi
+          row_sel = true
+          break
+        end
+      end
+    end
+    if not var_idx then
+      var_idx = font_family_pick_variant_idx(fobj, sel_item_idx)
+    end
+    if var_idx > #fobj.variants then
+      var_idx = 1
+    end
+
+    local active_var = fobj.variants[var_idx]
+    local full_name = active_var.full_name
+    local is_sentinel = wx_font_combo_row_is_builtin_sentinel(full_name)
+
+    ImGui.PushID(ctx, popup_id_str .. "_fflat_" .. tostring(ii))
+
+    if full_name ~= "" and not is_sentinel then
+      local is_fav = font_name_is_favorite(full_name)
+      local star_lab = (is_fav and "★" or "☆") .. "##ffav_" .. tostring(ii)
+      local star_hit = false
+      if wx_custom_small_button then
+        star_hit = wx_custom_small_button(ctx, star_lab, style_idx)
+      elseif ImGui.SmallButton then
+        star_hit = ImGui.SmallButton(ctx, star_lab)
+      end
+      if star_hit then
+        font_toggle_favorite(full_name)
+      end
+    else
+      if ImGui.Dummy then
+        pcall(ImGui.Dummy, ctx, fav_cell, math.max(row_h - 2, fs * 1.1))
+      end
+    end
+
+    ImGui.SameLine(ctx, 0, 8)
+
+    local label = fam ~= "" and fam or "(empty)"
+    local show_prev = full_name ~= "" and full_name ~= "(empty)" and not is_sentinel
+    local _, pushed_pf = try_preview_push(show_prev and full_name or "")
+    local clicked_sel = false
+    if ImGui.Selectable then
+      local ok_sc, sel_hit = pcall(ImGui.Selectable, ctx, label .. "##fsel", row_sel, sel_flags, name_cell, row_h)
+      if ok_sc then
+        clicked_sel = sel_hit and true or false
+      else
+        clicked_sel = ImGui.Selectable(ctx, label .. "##fsel", row_sel)
+      end
+    end
+    preview_pop_if(pushed_pf)
+    if clicked_sel then
+      if not row_sel then
+        var_idx = font_family_pick_variant_idx(fobj, nil)
+      end
+      if var_idx > #fobj.variants then
+        var_idx = 1
+      end
+      state.font_family_variant_sel[fam] = var_idx
+      font_combo_apply_selection(fobj.variants[var_idx].full_name)
+    end
+
+    ImGui.SameLine(ctx, 0, 8)
+
+    if #fobj.variants > 1 then
+      if ImGui.PushItemWidth then
+        pcall(ImGui.PushItemWidth, ctx, fs * 8)
+      end
+      local var_str = table.concat(fobj.variant_names, "\0") .. "\0"
+      if ImGui.Combo then
+        local rv, out = ImGui.Combo(ctx, "##fvar" .. tostring(ii), var_idx - 1, var_str)
+        if rv and out ~= nil then
+          local nv = math.floor(tonumber(out) or 0) + 1
+          if nv >= 1 and nv <= #fobj.variants then
+            state.font_family_variant_sel[fam] = nv
+            if row_sel or clicked_sel then
+              font_combo_apply_selection(fobj.variants[nv].full_name)
+            end
+          end
+        end
+      end
+      if ImGui.PopItemWidth then
+        pcall(ImGui.PopItemWidth, ctx)
+      end
+    else
+      local vdisp = fobj.variant_names[1] or ""
+      if vdisp ~= "Regular" and vdisp ~= fam and vdisp ~= "" then
+        if ImGui.TextDisabled then pcall(ImGui.TextDisabled, ctx, vdisp) end
+      end
+    end
+    
+    ImGui.PopID(ctx)
+  end
+
+  if ok_tbl then
+    if not state.font_table_debugged then
+      state.font_table_debugged = true
+      r.ShowConsoleMsg("wx_font_combo: using BeginTable, tbl_outer_w=" .. tostring(tbl_outer_w) .. "\n")
+    end
+    local cfix = ImGui.TableColumnFlags_WidthFixed or 0
+    local cstretch = ImGui.TableColumnFlags_WidthStretch or 0
+    local cdefs = ImGui.TableColumnFlags_DefaultSort or 0
+    ImGui.TableSetupColumn(ctx, "★", cfix, fav_cell, 101)
+    ImGui.TableSetupColumn(ctx, "Family", cstretch | cdefs, 2.4, 102)
+    ImGui.TableSetupColumn(ctx, "Variant", cstretch, 1.0, 103)
+
+    if ImGui.TableSetupScrollFreeze then
+      pcall(ImGui.TableSetupScrollFreeze, ctx, 0, 1)
+    end
+    ImGui.TableHeadersRow(ctx)
+
+    local sort_specs = {}
+    if ImGui.TableGetColumnSortSpecs then
+      for si = 0, 64 do
+        local ok_sp, col_idx, col_uid, sort_direction = ImGui.TableGetColumnSortSpecs(ctx, si)
+        if not ok_sp then
+          break
+        end
+        sort_specs[#sort_specs + 1] = {
+          cid = col_uid or col_idx or 0,
+          idx = col_idx,
+          dir = sort_direction,
+        }
+      end
+    end
+
+    local need_sort = false
+    if ImGui.TableNeedSort then
+      local ok_ns, dirty_or_first = pcall(ImGui.TableNeedSort, ctx)
+      if ok_ns and dirty_or_first then
+        need_sort = true
+      end
+    end
+    if need_sort and #body >= 2 then
+      pcall(table.sort, body, function(a, b)
+        return cmp_ia_ib(a, b, sort_specs)
+      end)
+    end
+
+    if n >= 1 then
+      draw_font_row(1)
+    end
+    for rj = 1, #body do
+      draw_font_row(body[rj])
+    end
+
+    ImGui.EndTable(ctx)
+  else
+    if not state.font_table_debugged then
+      state.font_table_debugged = true
+      r.ShowConsoleMsg("wx_font_combo: fallback flat layout, tbl_outer_w=" .. tostring(tbl_outer_w) .. "\n")
+    end
+    ImGui.TextColored(ctx, 0x99AABBFF, "★")
+    ImGui.SameLine(ctx, 0, 10)
+    ImGui.TextColored(ctx, 0x99AABBFF, "Name")
+    if ImGui.Separator then
+      ImGui.Separator(ctx)
+    end
+    if n >= 1 then
+      flat_draw_font_row(1)
+    end
+    for rj = 1, #body do
+      flat_draw_font_row(body[rj])
+    end
+  end
+
+  return true
+  end
+end)()
+
+--- Font picker using ImGui.BeginCombo + BeginTable grid (`wx_font_combo_custom_table_popup`). Bypasses wx_custom_combo's OpenPopup/ListClipper path.
+wx_font_combo_draw = function(ctx, combo_id, caption_label, selected_idx0, font_items, width_px, style_idx, header_fn)
+  selected_idx0 = math.floor(tonumber(selected_idx0) or 0)
+  style_idx =
+    math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
+
+  local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
+  local avail = ml_content_region_avail_x(ctx)
+  local w = math.min(tonumber(width_px) or 420, avail)
+  w = math.max(1, w)
+
+  local preview_raw = font_items[selected_idx0 + 1] or ""
+  local preview = trim(tostring(preview_raw))
+  if preview == "" then
+    preview = "—"
+  end
+
+  local cap = trim(tostring(caption_label or ""))
+  if cap ~= "" then
+    if ImGui.AlignTextToFramePadding then
+      pcall(ImGui.AlignTextToFramePadding, ctx)
+    end
+    ImGui.Text(ctx, cap)
+    ImGui.SameLine(ctx, 0, 8)
+  end
+
+  local changed = false
+  local new_idx = selected_idx0
+
+  if not ImGui.BeginCombo then
+    if ImGui.PushItemWidth then
+      ImGui.PushItemWidth(ctx, w)
+    end
+    local items_str = table.concat(font_items, "\0") .. "\0"
+    local rv, out = ImGui.Combo(ctx, combo_id .. "_legacyfb", selected_idx0, items_str)
+    wx_note_std_widget_vp(ctx)
+    if ImGui.PopItemWidth then
+      ImGui.PopItemWidth(ctx)
+    end
+    local ni = tonumber(out)
+    if rv and ni ~= nil then
+      return true, math.floor(ni)
+    end
+    return false, selected_idx0
+  end
+
+  if ImGui.PushItemWidth then
+    ImGui.PushItemWidth(ctx, w)
+  end
+
+  local cflags = ImGui.ComboFlags_None or 0
+  if ImGui.ComboFlags_HeightLargest then
+    cflags = cflags | ImGui.ComboFlags_HeightLargest
+  end
+
+  if ImGui.BeginCombo(ctx, combo_id, preview, cflags) then
+    --- `PushItemWidth(w)` for the combo button still applies inside the popup; override with stretch
+    --- width for all popup contents so the font table uses the full popup region (fixes name clipping).
+    if ImGui.PushItemWidth then
+      local stretch_w = -1
+      if ImGui.NumericLimits_Float then
+        local flm = select(1, ImGui.NumericLimits_Float())
+        if flm and flm ~= 0 then
+          stretch_w = -math.abs(flm)
+        end
+      end
+      pcall(ImGui.PushItemWidth, ctx, stretch_w)
+    end
+    --- Avoid querying GetContentRegionAvail inside a newly opened popup, as it may return ~0
+    --- before contents establish the window width. This caused the font table to layout
+    --- at 1px width, ellipsizing all names.
+    local inner_w = math.max(w, fs * 22)
+
+    if header_fn then
+      header_fn(ctx, inner_w, fs, style_idx)
+    end
+    if #font_items > WX_FONT_COMBO_PREVIEW_MAX_ROWS then
+      if ImGui.TextDisabled then
+        pcall(ImGui.TextDisabled, ctx, "Large list — font previews off (memory).")
+      elseif ImGui.TextColored then
+        pcall(ImGui.TextColored, ctx, 0x8899AAFF, "Large list — font previews off (memory).")
+      elseif ImGui.Text then
+        pcall(ImGui.Text, ctx, "Large list — font previews off (memory).")
+      end
+    end
+
+    local sel_box = { v = selected_idx0, name = trim(tostring(font_items[selected_idx0 + 1] or "")) }
+    local row_h = math.floor(fs * 1.38 + 10)
+    local ok_gr, drew =
+      pcall(
+        wx_font_combo_custom_table_popup,
+        ctx,
+        font_items,
+        inner_w,
+        row_h,
+        wx_font_combo_item_preview_lazy,
+        combo_id,
+        combo_id .. "_grid",
+        sel_box,
+        style_idx
+      )
+
+    if ImGui.PopItemWidth then
+      pcall(ImGui.PopItemWidth, ctx)
+    end
+
+    if not ok_gr then
+      r.ShowConsoleMsg("wx_font_combo_custom_table_popup crashed: " .. tostring(drew) .. "\n")
+    end
+
+    if ok_gr and drew then
+      local picked_name = trim(tostring(sel_box.name or ""))
+      local nv = math.floor(tonumber(sel_box.v) or selected_idx0)
+      if picked_name ~= "" and not wx_font_combo_row_is_builtin_sentinel(picked_name) then
+        local ix = nil
+        for i = 1, #font_items do
+          if trim(tostring(font_items[i] or "")) == picked_name then
+            ix = i - 1
+            break
+          end
+        end
+        if ix ~= nil then
+          nv = ix
+        end
+      elseif picked_name ~= "" and wx_font_combo_row_is_builtin_sentinel(picked_name) then
+        nv = 0
+      end
+      if nv ~= selected_idx0 then
+        new_idx = nv
+        changed = true
+      end
+    end
+
+    ImGui.EndCombo(ctx)
+  end
+
+  if ImGui.PopItemWidth then
+    ImGui.PopItemWidth(ctx)
+  end
+
+  if changed then
+    wx_request_vp_sync()
+  end
+
+  return changed, new_idx
+end
+
+wx_custom_combo = function(
+  ctx,
+  id,
+  label,
+  current_idx,
+  items_str,
+  width,
+  style_idx,
+  popup_header_fn,
+  external_label,
+  item_preview_font_fn,
+  popup_row_delete_fn,
+  popup_custom_font_table_fn,
+  external_label_top_left
+)
   current_idx = math.floor(tonumber(current_idx) or 0)
   style_idx = math.max(1, math.min(#WX_SLIDER_STYLES, math.floor(tonumber(style_idx) or state.wx_slider_style or 1)))
+  external_label_top_left = external_label_top_left and true or false
   local ebg, fill, knob, accent = wx_effective_style_colors(style_idx)
   local shown_label = wx_visible_label(label)
   local elabel = trim(tostring(external_label or ""))
   local fs = (ImGui.GetFontSize and ImGui.GetFontSize(ctx)) or 13
+  local pad_y = fs * 0.18
+  local label_gap = math.max(4, math.floor(fs * 0.28 + 0.5))
+  local tw_el, th_el = 0, 0
+  if elabel ~= "" then
+    tw_el, th_el = wx_text_size(ctx, elabel)
+  end
+  local items = split_sep(items_str, "\0")
+  if #items > 0 and items[#items] == "" then table.remove(items) end
+  local cur_raw = items[current_idx + 1] or ""
+  local cur_text = trim(tostring(cur_raw or ""))
+  if cur_text == "" then
+    cur_text = "—"
+  end
+
   local avail = ml_content_region_avail_x(ctx)
   local requested_w = tonumber(width)
   local w = requested_w and math.min(requested_w, avail) or math.min(fs * 18, avail)
   w = math.max(1, w)
-  local h = math.max(26, math.floor(fs * 1.72 + 0.5))
-  if elabel ~= "" then
-    h = math.max(34, math.floor(fs * 2.55 + 0.5))
-  end
+  --- Same vertical band as `wx_custom_slider_int` (`h_main`, no random row) for layout alignment.
+  local h_main = math.max(34, math.floor(fs * 2.55 + 0.5))
+  local h = h_main
   local x, y = 0, 0
-  if ImGui.GetCursorScreenPos then x, y = ImGui.GetCursorScreenPos(ctx) end
+  if ImGui.GetCursorScreenPos then
+    x, y = ImGui.GetCursorScreenPos(ctx)
+  end
 
-  local items = split_sep(items_str, "\0")
-  if #items > 0 and items[#items] == "" then table.remove(items) end
+  --- Font table UI only needs the custom drawer; row previews are optional (preview_fn may be nil inside the drawer).
+  local use_font_table_ui =
+    popup_custom_font_table_fn ~= nil and type(popup_custom_font_table_fn) == "function"
 
   if not (ImGui.InvisibleButton and ImGui.GetWindowDrawList and ImGui.DrawList_AddRectFilled) then
     if ImGui.PushItemWidth then ImGui.PushItemWidth(ctx, w) end
@@ -7121,26 +8570,71 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
     ImGui.OpenPopup(ctx, id .. "_popup")
   end
 
-  local cur_raw = items[current_idx + 1] or ""
-  local cur_text = trim(tostring(cur_raw or ""))
-  if cur_text == "" then
-    cur_text = "—"
-  end
   local line_text = (elabel ~= "") and cur_text or (shown_label ~= "" and (shown_label .. ": " .. cur_text) or cur_text)
 
   local dl = ImGui.GetWindowDrawList(ctx)
   local rail_x0, rail_x1 = x + fs * 0.45, x + w - fs * 0.45
-  if elabel ~= "" then
+  local top, bot, mid_y, body_h, rail_h
+  local combo_el_label_ty = nil
+
+  if elabel ~= "" and external_label_top_left then
+    local rail_y = y + h_main * 0.68
+    local slider_rail_h = (style_idx == 4) and 3 or math.max(6, math.floor(h_main * 0.34))
+    if style_idx == 6 then
+      slider_rail_h = math.max(10, math.floor(h_main * 0.38))
+    elseif style_idx == 8 then
+      slider_rail_h = math.max(14, math.floor(h_main * 0.46))
+    elseif style_idx == 10 then
+      slider_rail_h = math.max(16, math.floor(h_main * 0.5))
+    end
     rail_x0 = x + fs * 0.7
     rail_x1 = x + w - fs * 0.7
+    local readout_gap = math.max(4, math.floor(fs * 0.28))
+    local readout_pad = math.max(3, math.floor(fs * 0.24 + 0.5))
+    local tw_r, th_r = wx_text_size(ctx, cur_text)
+    local box_h = math.max(fs * 1.25, th_r + readout_pad * 2)
+    local th_l = th_el
+    local extent_up = wx_slider_extent_above_rail(style_idx, slider_rail_h, fs, h_main, active, false)
+    local cap_by1 = (rail_y - extent_up) - readout_gap
+    local row_h = math.max(th_l, box_h)
+    local row_top = y + 1
+    local by1 = math.min(row_top + row_h, cap_by1)
+    local by0 = by1 - box_h
+    if by0 < row_top then
+      by0 = row_top
+      by1 = math.min(by0 + box_h, cap_by1)
+    end
+    if by1 <= by0 then
+      by1 = by0 + math.max(math.floor(th_r + 0.5) + 2, 6)
+    end
+    local box_draw_h = by1 - by0
+    local mid_label_row = by0 + box_draw_h * 0.5
+    combo_el_label_ty = mid_label_row - th_l * 0.5 - 1
+    top = rail_y - slider_rail_h * 0.45
+    bot = rail_y + slider_rail_h * 0.45
+    mid_y = (top + bot) * 0.5
+    body_h = bot - top
+    rail_h = body_h * 0.5
+  else
+    if elabel ~= "" then
+      rail_x1 = x + w - fs * 0.7
+      local min_pill = math.max(fs * 4.5, math.floor(fs * 5 + 4))
+      rail_x0 = x + tw_el + label_gap
+      if rail_x0 > rail_x1 - min_pill then
+        rail_x0 = rail_x1 - min_pill
+      end
+      if rail_x0 < x + fs * 0.45 then
+        rail_x0 = x + fs * 0.45
+      end
+    end
+    top = y + pad_y
+    bot = y + h - pad_y
+    mid_y = (top + bot) * 0.5
+    body_h = bot - top
+    rail_h = body_h * 0.5
   end
-  local pad_y = fs * 0.18
-  local top = y + pad_y
-  local bot = y + h - pad_y
-  local mid_y = (top + bot) * 0.5
-  local body_h = bot - top
+
   local rrad_c = (style_idx == 4 or style_idx == 9) and 2 or math.max(3, math.floor(body_h * 0.28))
-  local rail_h = body_h * 0.5
 
   local bg = hovered and accent or ebg
   local can_rect = ImGui.DrawList_AddRect ~= nil
@@ -7189,10 +8683,16 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
   end
 
   if elabel ~= "" and ImGui.DrawList_AddText then
-    local _, th_el = wx_text_size(ctx, elabel)
-    local label_ty = mid_y - th_el * 0.5 - 1
+    local label_ty = combo_el_label_ty or (mid_y - th_el * 0.5 - 1)
     local lbl_col = hovered and 0xFFFFFFFF or 0xCFCFCFFF
+    local clip_lbl = ImGui.PushClipRect and ImGui.PopClipRect and (combo_el_label_ty == nil) and rail_x0 > x + 1
+    if clip_lbl then
+      ImGui.PushClipRect(ctx, x, y, rail_x0 - 1, y + h, true)
+    end
     ImGui.DrawList_AddText(dl, x, label_ty, lbl_col, elabel)
+    if clip_lbl then
+      ImGui.PopClipRect(ctx)
+    end
   end
 
   local tw, th = wx_text_size(ctx, line_text)
@@ -7223,7 +8723,8 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
   if ImGui.WindowFlags_NoMove then
     popup_flags = popup_flags | ImGui.WindowFlags_NoMove
   end
-  if ImGui.WindowFlags_AlwaysAutoResize then
+  --- AlwaysAutoResize fights nested BeginTable sizing inside combo popups; keep fixed sizing from SetNextWindowSize for font grids.
+  if ImGui.WindowFlags_AlwaysAutoResize and not use_font_table_ui then
     popup_flags = popup_flags | ImGui.WindowFlags_AlwaysAutoResize
   end
   if ImGui.WindowFlags_NoTitleBar then
@@ -7231,7 +8732,12 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
   end
 
   local cond_anchor = ImGui.Cond_Always or ImGui.Cond_Appearing or 0
-  local pw = w
+  --- Popup width was capped with math.min(w, …), so it could never exceed the combo rail — too narrow for the font table + tags column.
+  local pw_desired = w
+  if use_font_table_ui then
+    pw_desired = math.max(w, math.floor(fs * 28 + 140))
+  end
+  local pw = pw_desired
   local px, py = rx0, ry1 + 2
   local anchor_combo = true
   if ImGui.IsPopupOpen then
@@ -7242,12 +8748,18 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
   end
   if anchor_combo and ImGui.SetNextWindowPos and ImGui.SetNextWindowSize then
     local gap = 2
-    local row_h_est = math.floor(fs * 1.38 + 10)
+    local font_virt = item_preview_font_fn ~= nil and type(item_preview_font_fn) == "function"
+    local row_h_est = font_virt and math.floor(fs * 1.42 + 11) or math.floor(fs * 1.38 + 10)
     local header_extra = 0
     if popup_header_fn then
       header_extra = row_h_est * 4 + 28
     end
-    local est_h = math.min(math.max(#items, 1), 24) * row_h_est + 14 + header_extra
+    if use_font_table_ui then
+      header_extra = header_extra + row_h_est + 22
+    end
+    --- Font preview combos use a fixed-height scroll child (lazy ListClipper); cap height estimate for viewport placement.
+    local list_rows_vis = math.min(math.max(#items, 1), font_virt and 26 or 24)
+    local est_h = list_rows_vis * row_h_est + 14 + header_extra
     local margin = 8
     local place_below = true
     local wx, wy, ws_w, ws_h = nil, nil, nil, nil
@@ -7275,7 +8787,7 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
         end
         px = rx0
       end
-      pw = math.min(w, math.max(fs * 10, ws_w - margin * 2 - math.max(0, px - wx)))
+      pw = math.min(pw_desired, math.max(fs * 10, ws_w - margin * 2 - math.max(0, px - wx)))
     else
       px, py = rx0, ry1 + gap
     end
@@ -7345,33 +8857,246 @@ wx_custom_combo = function(ctx, id, label, current_idx, items_str, width, style_
         inner_w = cr_w
       end
     end
-    local row_h = math.floor(fs * 1.28 + 6)
+    local preview_fn_active = item_preview_font_fn
+    local row_h = math.floor(fs * (preview_fn_active and 1.36 or 1.28) + (preview_fn_active and 8 or 6))
     local sel_flags = ImGui.SelectableFlags_None or 0
 
     if popup_header_fn then
       popup_header_fn(ctx, inner_w, pw, fs, style_idx)
     end
 
-    for i, item_str in ipairs(items) do
-      ImGui.PushID(ctx, tostring(id) .. "_wxcb_" .. tostring(i))
+    local function draw_combo_selectable_row(ii)
+      ii = tonumber(ii) or 0
+      if ii < 1 or ii > #items then
+        return
+      end
+      ImGui.PushID(ctx, tostring(id) .. "_wxcb_" .. tostring(ii))
+      local item_str = items[ii]
       local disp = trim(tostring(item_str or ""))
       if disp == "" then
         disp = "(empty)"
       end
+      local del_slot = 0
+      if popup_row_delete_fn then
+        del_slot = math.floor(fs * 2.15 + 10)
+      end
+      local sel_w = inner_w
+      if del_slot > 0 then
+        sel_w = math.max(fs * 4.2, inner_w - del_slot - 6)
+      end
+      local preview_font = nil
+      if preview_fn_active then
+        local ok_pf, fh = pcall(preview_fn_active, ctx, ii, disp)
+        if ok_pf then
+          preview_font = fh
+        end
+      end
+      local pushed = false
+      if preview_font then
+        --- imgui.lua shim requires exactly `(ctx, font)` — third arg triggers __shim "maximum 2" error.
+        if r.ImGui_PushFont then
+          local ok2, _ = pcall(r.ImGui_PushFont, ctx, preview_font)
+          pushed = ok2 and true or false
+        end
+        if not pushed and ImGui.PushFont then
+          local ok2, _ = pcall(ImGui.PushFont, ctx, preview_font)
+          pushed = ok2 and true or false
+        end
+        --- PushFont triggers Font::install; failures log from native code and recur every row until cached out.
+        local pk = trim(tostring(disp or ""))
+        if pushed then
+          if pk ~= "" and pk ~= "(empty)" then
+            state.font_preview_push_fails[pk] = nil
+            state.font_preview_fail_inc_frame[pk] = nil
+          end
+        else
+          if
+            pk ~= ""
+            and pk ~= "(empty)"
+            and pk ~= "<Default system fallback>"
+            and pk ~= "<Use overlay font>"
+          then
+            local fc_now = nil
+            if ImGui.GetFrameCount then
+              local okf, fv = pcall(ImGui.GetFrameCount, ctx)
+              if okf and tonumber(fv) then
+                fc_now = tonumber(fv)
+              end
+            end
+            local fails = state.font_preview_push_fails[pk] or 0
+            local last_inc_fc = fc_now and state.font_preview_fail_inc_frame[pk]
+            local should_inc = fc_now == nil or last_inc_fc ~= fc_now
+            if should_inc then
+              fails = fails + 1
+              state.font_preview_push_fails[pk] = fails
+              if fc_now then
+                state.font_preview_fail_inc_frame[pk] = fc_now
+              end
+              if fails <= 2 then
+                state.font_preview_fonts[pk] = nil
+              else
+                state.font_preview_fonts[pk] = false
+              end
+            end
+          end
+        end
+      end
       local clicked = false
       if ImGui.Selectable then
-        local ok_sc, r1 = pcall(ImGui.Selectable, ctx, disp, current_idx == (i - 1), sel_flags, inner_w, row_h)
+        local ok_sc, r1 = pcall(ImGui.Selectable, ctx, disp, current_idx == (ii - 1), sel_flags, sel_w, row_h)
         if ok_sc then
           clicked = r1 and true or false
         else
-          clicked = ImGui.Selectable(ctx, disp, current_idx == (i - 1))
+          clicked = ImGui.Selectable(ctx, disp, current_idx == (ii - 1))
+        end
+      end
+      if pushed then
+        if ImGui.PopFont then
+          pcall(ImGui.PopFont, ctx)
+        elseif r.ImGui_PopFont then
+          pcall(r.ImGui_PopFont, ctx)
         end
       end
       if clicked then
-        current_idx = i - 1
+        current_idx = ii - 1
         changed = true
       end
+      if popup_row_delete_fn and del_slot > 0 then
+        if ImGui.SameLine then
+          ImGui.SameLine(ctx, 0, 4)
+        end
+        if ImGui.InvisibleButton(ctx, "##mlst_del", del_slot, row_h) then
+          local ok_del = popup_row_delete_fn(ii, item_str)
+          if ok_del and ImGui.CloseCurrentPopup then
+            ImGui.CloseCurrentPopup(ctx)
+          end
+        end
+        local hov_del = ImGui.IsItemHovered and ImGui.IsItemHovered(ctx)
+        if ImGui.GetItemRectMin and ImGui.GetItemRectMax and ImGui.GetWindowDrawList then
+          local ix0, iy0 = ImGui.GetItemRectMin(ctx)
+          local ix1, iy1 = ImGui.GetItemRectMax(ctx)
+          if ix0 and iy0 and ix1 and iy1 then
+            local dl_tr = ImGui.GetWindowDrawList(ctx)
+            local icol = hov_del and accent or knob
+            wx_draw_combo_popup_trash_icon(dl_tr, ix0, iy0, ix1 - ix0, iy1 - iy0, icol)
+          end
+        end
+        if hov_del and ImGui.SetItemTooltip then
+          ImGui.SetItemTooltip(ctx, "Delete preset")
+        elseif hov_del and ImGui.SetTooltip then
+          ImGui.SetTooltip(ctx, "Delete preset")
+        end
+      end
       ImGui.PopID(ctx)
+    end
+
+    --- Font dropdown: optional 3‑column sortable table; else capped scroll region + ListClipper.
+    --- ReaImGui requires ImGui.Attach(ctx, clipper) after CreateListClipper or Begin sees an invalid clipper (cf. demo.lua).
+    local handled_font_table = false
+    local sel_idx_ft = { v = current_idx }
+    if use_font_table_ui then
+      local ok_pf2, drew_tbl = pcall(
+        popup_custom_font_table_fn,
+        ctx,
+        items,
+        inner_w,
+        row_h,
+        preview_fn_active,
+        sel_idx_ft,
+        id,
+        popup_id,
+        style_idx
+      )
+      if ok_pf2 and drew_tbl then
+        handled_font_table = true
+      end
+    end
+    if handled_font_table then
+      if sel_idx_ft.v ~= current_idx then
+        current_idx = sel_idx_ft.v
+        changed = true
+      end
+    elseif item_preview_font_fn then
+      local list_rows_vis = math.min(math.max(#items, 1), 26)
+      local scroll_h = math.max(1, list_rows_vis * row_h + 8)
+      local child_flags = 0
+      if ImGui.ChildFlags_Border then
+        child_flags = ImGui.ChildFlags_Border
+      end
+      local ch_open = ImGui.BeginChild(ctx, tostring(popup_id) .. "_lst", 0, scroll_h, child_flags, 0)
+      if ch_open == nil then
+        ch_open = true
+      end
+      if ch_open then
+        local drawn_with_clipper = false
+        local clipper = state.font_combo_list_clipper_v2
+        if clipper == nil and ImGui.CreateListClipper then
+          local ok_lc, lc = pcall(ImGui.CreateListClipper, ctx)
+          if ok_lc and lc then
+            if ImGui.Attach then
+              pcall(ImGui.Attach, ctx, lc)
+            end
+            clipper = lc
+            state.font_combo_list_clipper_v2 = lc
+          end
+        end
+        if clipper and ImGui.ListClipper_Begin and ImGui.ListClipper_Step and ImGui.ListClipper_GetDisplayRange then
+          local ok_lb = pcall(ImGui.ListClipper_Begin, clipper, #items)
+          if ok_lb then
+            drawn_with_clipper = true
+            local clip_err = false
+            while true do
+              local ok_step, more = pcall(ImGui.ListClipper_Step, clipper)
+              if not ok_step or not more then
+                if not ok_step then
+                  clip_err = true
+                end
+                break
+              end
+              local ok_rng, d0, d1 = pcall(ImGui.ListClipper_GetDisplayRange, clipper)
+              if not ok_rng then
+                clip_err = true
+                break
+              end
+              d0 = tonumber(d0)
+              d1 = tonumber(d1)
+              if d0 and d1 then
+                for row = d0, d1 - 1 do
+                  draw_combo_selectable_row(row + 1)
+                end
+              end
+            end
+            if ImGui.ListClipper_End then
+              pcall(ImGui.ListClipper_End, clipper)
+            end
+            if clip_err then
+              drawn_with_clipper = false
+              state.font_combo_list_clipper_v2 = nil
+            end
+          end
+        end
+        if not drawn_with_clipper then
+          if preview_fn_active and #items > 160 then
+            preview_fn_active = nil
+            ImGui.TextColored(ctx, 0x8899AAFF, "Large font list — row previews off (clipper unavailable). Filter to narrow.")
+          end
+          for ii = 1, #items do
+            draw_combo_selectable_row(ii)
+          end
+        end
+        ImGui.EndChild(ctx)
+      else
+        if preview_fn_active and #items > 160 then
+          preview_fn_active = nil
+        end
+        for ii = 1, #items do
+          draw_combo_selectable_row(ii)
+        end
+      end
+    else
+      for ii = 1, #items do
+        draw_combo_selectable_row(ii)
+      end
     end
 
     while n_style_pop > 0 and ImGui.PopStyleColor do
@@ -7961,7 +9686,7 @@ function anim_graph_inverse_ease_u(curve_id, target_e, blend_bias)
   return (lo + hi) * 0.5
 end
 
-local function anim_graph_draw_arrowhead(dl, cx, cy, dx, dy, col, ah, hw, thick)
+function anim_graph_draw_arrowhead(dl, cx, cy, dx, dy, col, ah, hw, thick)
   if not (dl and ImGui.DrawList_AddLine) then
     return
   end
@@ -8132,7 +9857,7 @@ function anim_graph_curve_hotkey_step(ctx)
 end
 
 --- Segment curve families for path editor: drag + Tab stay inside family; X cycles which family (1→2→3→1).
-local function anim_graph_seg_family_snap(cc, mode)
+function anim_graph_seg_family_snap(cc, mode)
   cc = math.max(0, math.min(ANIM_GRAPH_CURVE_MAX, math.floor(tonumber(cc) or 0)))
   mode = math.max(1, math.min(3, math.floor(tonumber(mode) or 1)))
   if mode == 1 then
@@ -8165,14 +9890,14 @@ function anim_graph_seg_family_cycle_x(ctx)
   return ok and v and true or false
 end
 
-local function wx_imgui_member(name)
+function wx_imgui_member(name)
   local ok, v = pcall(function()
     return ImGui[name]
   end)
   return ok and v or nil
 end
 
-local function wx_imgui_key(name)
+function wx_imgui_key(name)
   local key = wx_imgui_member(name)
   if type(key) == "function" then
     key = key()
@@ -8180,7 +9905,7 @@ local function wx_imgui_key(name)
   return key
 end
 
-local function wx_wants_text_input(ctx)
+function wx_wants_text_input(ctx)
   local get_io = wx_imgui_member("GetIO")
   if get_io then
     local ok, io = pcall(get_io, ctx)
@@ -8203,7 +9928,7 @@ local function wx_wants_text_input(ctx)
   return false
 end
 
-local function wx_bridge_transport_spacebar(ctx)
+function wx_bridge_transport_spacebar(ctx)
   local is_key_pressed = wx_imgui_member("IsKeyPressed")
   if not (ctx and is_key_pressed and r.Main_OnCommand) then
     return
@@ -8221,7 +9946,7 @@ local function wx_bridge_transport_spacebar(ctx)
   end
 end
 
-local function anim_graph_seg_family_advance_tab(curves, blends, si, direction)
+function anim_graph_seg_family_advance_tab(curves, blends, si, direction)
   direction = (tonumber(direction) or 1) >= 0 and 1 or -1
   local mode = math.max(1, math.min(3, math.floor(tonumber(state.anim_graph_seg_family_mode) or 1)))
   local fam
@@ -8361,9 +10086,18 @@ function anim_graph_auto_lanes_ui(ctx, side_key)
   local changed = false
   local graph_w = 520
   local label_w = 140
+  local axis_drag_w = 138
+  local lane_canvas_w = math.max(120, graph_w - label_w - axis_drag_w)
   local lane_h = 38
   local function to_px(t, x0, x1)
     return x0 + math.max(0, math.min(1, t)) * math.max(1, x1 - x0)
+  end
+  local function auto_val_outside_reasonable(spec, val)
+    local v = tonumber(val)
+    if not v then
+      return false
+    end
+    return v < spec.min - 1e-12 or v > spec.max + 1e-12
   end
   for i = 1, #ANIM_AUTO_LANES do
     local spec = ANIM_AUTO_LANES[i]
@@ -8373,7 +10107,7 @@ function anim_graph_auto_lanes_ui(ctx, side_key)
       changed = true
     end
     ImGui.SameLine(ctx, 0, 8)
-    ImGui.InvisibleButton(ctx, "##lane_canvas_" .. side_key .. "_" .. spec.key, graph_w - label_w, lane_h)
+    ImGui.InvisibleButton(ctx, "##lane_canvas_" .. side_key .. "_" .. spec.key, lane_canvas_w, lane_h)
     local x0, y0 = ImGui.GetItemRectMin(ctx)
     local x1, y1 = ImGui.GetItemRectMax(ctx)
     local dl = ImGui.GetWindowDrawList and ImGui.GetWindowDrawList(ctx)
@@ -8383,23 +10117,111 @@ function anim_graph_auto_lanes_ui(ctx, side_key)
       mx, my = ImGui.GetMousePos(ctx)
     end
     local lmx, lmy = mx, my
+    local ymin = tonumber(lane.graph_min)
+    local ymax = tonumber(lane.graph_max)
+    if not ymin or not ymax or ymax <= ymin then
+      ymin = spec.min
+      ymax = spec.max
+    end
+    ImGui.SameLine(ctx, 0, 4)
+    if ImGui.PushItemWidth then
+      pcall(ImGui.PushItemWidth, ctx, 58)
+    end
+    local dg_spd = math.max(1e-9, math.abs(ymax - ymin) * 0.02)
+    local gmn, gmx = ymin, ymax
+    local graph_range_dragged = false
+    local stc = 0
+    if ImGui.PushStyleColor and ImGui.Col_Text and auto_val_outside_reasonable(spec, gmn) then
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFF4444FF)
+      stc = stc + 1
+    end
+    local r_lo, gmn2 = ImGui.DragDouble(ctx, "min##alane_ymin_" .. side_key .. "_" .. spec.key, gmn, dg_spd, -1e6, 1e6, "%.4g")
+    if stc > 0 and ImGui.PopStyleColor then
+      ImGui.PopStyleColor(ctx, stc)
+    end
+    if r_lo then
+      lane.graph_min = gmn2
+      changed = true
+      graph_range_dragged = true
+      if (tonumber(lane.graph_max) or gmx) <= gmn2 then
+        lane.graph_max = gmn2 + math.max(1e-4, math.abs(gmn2) * 1e-6)
+      end
+    end
+    ymin = tonumber(lane.graph_min) or ymin
+    ymax = tonumber(lane.graph_max) or ymax
+    if not ymin or not ymax or ymax <= ymin then
+      ymin = spec.min
+      ymax = spec.max
+    end
+    gmx = ymax
+    stc = 0
+    ImGui.SameLine(ctx, 0, 2)
+    if ImGui.PushStyleColor and ImGui.Col_Text and auto_val_outside_reasonable(spec, gmx) then
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFF4444FF)
+      stc = stc + 1
+    end
+    local r_hi, gmx2 = ImGui.DragDouble(ctx, "max##alane_ymax_" .. side_key .. "_" .. spec.key, gmx, dg_spd, -1e6, 1e6, "%.4g")
+    if stc > 0 and ImGui.PopStyleColor then
+      ImGui.PopStyleColor(ctx, stc)
+    end
+    if r_hi then
+      lane.graph_max = gmx2
+      changed = true
+      graph_range_dragged = true
+      if (tonumber(lane.graph_min) or ymin) >= gmx2 then
+        lane.graph_min = gmx2 - math.max(1e-4, math.abs(gmx2) * 1e-6)
+      end
+    end
+    ymin = tonumber(lane.graph_min) or spec.min
+    ymax = tonumber(lane.graph_max) or spec.max
+    if not ymin or not ymax or ymax <= ymin then
+      ymin = spec.min
+      ymax = spec.max + math.max(1e-6, math.abs(spec.max) * 1e-6)
+    end
+    if ImGui.PopItemWidth then
+      pcall(ImGui.PopItemWidth, ctx)
+    end
+    local min_v, max_v = ymin, ymax
+    local vr = math.max(1e-9, max_v - min_v)
+    if graph_range_dragged then
+      for pidx = 1, #lane.points do
+        local p = lane.points[pidx]
+        local pv = tonumber(p.v) or min_v
+        pv = math.max(min_v, math.min(max_v, pv))
+        if spec.integer then
+          pv = math.floor(pv + 0.5)
+        end
+        if spec.key == "dupes" then
+          pv = math.max(spec.min, math.min(spec.max, pv))
+        end
+        p.v = pv
+      end
+      changed = true
+    end
+    local function v_to_py(v)
+      local vv = tonumber(v) or min_v
+      vv = math.max(min_v, math.min(max_v, vv))
+      local u = (vv - min_v) / vr
+      return y1 - u * (y1 - y0)
+    end
+    local function py_to_v(py)
+      local u = (y1 - py) / math.max(1, (y1 - y0))
+      u = math.max(0, math.min(1, u))
+      local v = min_v + u * vr
+      if spec.integer then
+        v = math.floor(v + 0.5)
+      end
+      v = math.max(min_v, math.min(max_v, v))
+      if spec.key == "dupes" then
+        v = math.max(spec.min, math.min(spec.max, v))
+      end
+      return v
+    end
     if dl and ImGui.DrawList_AddRectFilled then
       ImGui.DrawList_AddRectFilled(dl, x0, y0, x1, y1, lane.enabled and 0x1A1F1AFF or 0x141414FF, 3)
       if ImGui.DrawList_AddRect then
         ImGui.DrawList_AddRect(dl, x0, y0, x1, y1, lane.enabled and 0x395C39FF or 0x303030FF, 3)
       end
-    end
-    local min_v, max_v = spec.min, spec.max
-    local vr = math.max(1e-9, max_v - min_v)
-    local function v_to_py(v)
-      local u = (math.max(min_v, math.min(max_v, v)) - min_v) / vr
-      return y1 - u * (y1 - y0)
-    end
-    local function py_to_v(py)
-      local u = (y1 - py) / math.max(1, (y1 - y0))
-      local v = min_v + math.max(0, math.min(1, u)) * vr
-      if spec.integer then v = math.floor(v + 0.5) end
-      return math.max(min_v, math.min(max_v, v))
     end
     local nearest_idx, nearest_d = nil, 9999
     for pidx = 1, #lane.points do
@@ -8584,6 +10406,13 @@ function anim_graph_auto_lanes_ui(ctx, side_key)
         if ImGui.DrawList_AddCircleFilled then
           ImGui.DrawList_AddCircleFilled(dl, px, py, 4.4, lane.enabled and 0xF0F0F0FF or 0x8A8A8AFF)
         end
+      end
+      if hovered and lane.enabled and nearest_idx and nearest_d <= 12 and ImGui.DrawList_AddText then
+        local pv = lane.points[nearest_idx].v or 0
+        local tpx = to_px(lane.points[nearest_idx].t or 0, x0, x1)
+        local tpy = v_to_py(pv)
+        local tcol = auto_val_outside_reasonable(spec, pv) and 0xFF4444FF or 0xD8D8D8FF
+        ImGui.DrawList_AddText(dl, tpx + 6, tpy - 16, tcol, string.format("%.5g", pv))
       end
     end
   end
@@ -9246,7 +11075,8 @@ function anim_look_row_ui(ctx, side_label, side_key, enabled, typ, curve)
   return true, changed
 end
 
-do
+--- IIFE (not `do`): Lua 5.1 counts all locals in the main chunk toward 200; this closure gets its own limit.
+(function()
   local ctx = ImGui.CreateContext(WINDOW_TITLE)
 
   --- One row index `li` (1..6): size + randomize on one line; moving Randomize respawns that row’s jitter only.
@@ -9297,11 +11127,7 @@ do
     end
   end
 
-  local function loop()
-  local flags = ImGui.WindowFlags_NoCollapse
-  ImGui.SetNextWindowSize(ctx, 700, 720, ImGui.Cond_FirstUseEver)
-  local visible, open = ImGui.Begin(ctx, WINDOW_TITLE, true, flags)
-  if visible then
+  local function wx_overlay_main_window_ui(ctx)
     local rv
     wx_bridge_transport_spacebar(ctx)
     local item = nil
@@ -9339,16 +11165,32 @@ do
       key = state.overlay_source_key
     end
     if key ~= state.overlay_source_key then
+      local leaving_guid = state.tracked_item_guid
+      if leaving_guid ~= "" and leaving_guid ~= guid and state.prev_words_count > 0 then
+        local old_item = find_media_item_by_guid(leaving_guid)
+        if old_item then
+          local _ot, old_words = W.find_take_and_wx_words(old_item)
+          if old_words and #old_words > 0 and auto_persist_layout and editor_text_parse_ok(old_words, state.editor_text or "") then
+            local sig = overlay_autosave_state_sig(old_words)
+            if sig ~= (state.overlay_autosave_sig_saved or "") then
+              auto_persist_layout(old_item, old_words, ctx)
+            end
+          end
+        end
+      end
       state.overlay_source_key = key
       state.overlay_autosave_sig_saved = nil
       if words and #words > 0 then
         local same_item = (guid ~= "" and guid == state.tracked_item_guid)
         if same_item and (state.ml_word_n or 0) > 0 then
-          ml_preserve_layout_for_new_count(#words)
+          if not ml_preserve_layout_for_new_count(words, state.prev_words_snapshot) then
+            ml_load_layout_for_item(item, words)
+          else
+            ml_sync_editor_text(words)
+          end
         else
-          ml_load_for_word_count(#words, item)
+          ml_load_layout_for_item(item, words)
         end
-        ml_sync_editor_text(words)
         state.tracked_item_guid = guid
       else
         state.editor_text = ""
@@ -9393,6 +11235,20 @@ do
           word_grid_ui(ctx, item, words)
         end
 
+        if has_marker_words then
+          ImGui.Spacing(ctx)
+          separator_text(ctx, "Word spacing")
+          local wg_pct = math.floor(ml_word_gap_effective(words) * 100 + 0.5)
+          local rv_wg, wg2 = wx_custom_slider_int(ctx, "##mlwordgap_ov", "Word gap (% fontPx)", wg_pct, -95, 150, "%d", 280, state.wx_slider_style)
+          if rv_wg then
+            state.ml_word_gap = math.max(-0.95, math.min(1.5, wg2 / 100))
+            r.SetExtState(SECTION, "ML_WORD_GAP", string.format("%.17g", state.ml_word_gap), true)
+            refresh_preview_here()
+            overlay_request_autosave()
+          end
+          wx_note_std_widget_vp(ctx)
+        end
+
         ImGui.Spacing(ctx)
         separator_text(ctx, "Sync & apply tools")
         if wx_custom_button(ctx, "Save layout to item", 200, 0, state.wx_slider_style) then
@@ -9433,6 +11289,9 @@ do
             for i = 1, #words do
               state.ml_word_scales[i] = 1
               state.ml_row_spacings[i] = nil
+            end
+            for i = 1, math.max(0, #words - 1) do
+              state.ml_word_spacings[i] = nil
             end
             ml_sync_editor_text(words)
             refresh_preview_here()
@@ -9477,6 +11336,7 @@ do
 
         ImGui.Spacing(ctx)
         separator_text(ctx, "Video ratio guides")
+        ImGui.TextColored(ctx, 0x9A9A9AFF, "Preview only — guides are hidden when rendering video to disk.")
         local changed_guides = false
         local guide_flags = 0
         if ImGui.TableFlags_SizingStretchProp then
@@ -9513,6 +11373,8 @@ do
           state._last_vp_body = nil
           refresh_preview_here()
           overlay_request_autosave()
+          wx_ensure_video_guides_gmem_defer()
+          wx_sync_video_guides_gmem_now()
         end
 
         ImGui.Spacing(ctx)
@@ -9936,40 +11798,51 @@ do
               break
             end
           end
-          if #state.ml_preset_names ~= 0 then
-            local rv_mp, mp_idx = wx_custom_combo(ctx, "##layout_preset_wx", "Layout preset", ml_preset_idx, table.concat(state.ml_preset_names, "\0") .. "\0", 260, state.wx_slider_style)
-            if rv_mp then
-              local nm = state.ml_preset_names[(mp_idx or 0) + 1]
-              local okp, perr = ml_preset_apply_named(nm)
-              if okp then
-                changed_layout = true
-                state.status = "Loaded triple-stack preset: " .. nm
-                state.status_err = false
-              else
-                state.status = perr or "Could not load preset."
-                state.status_err = true
-              end
+          local save_ml_lbl = ml_dirty and "Save layout preset *" or "Save layout preset"
+          local save_bw = 168
+          local preset_row_gap = 8
+          local function ml_layout_preset_try_delete(_ii, nm)
+            nm = trim(tostring(nm or ""))
+            if nm == "" then
+              return false
+            end
+            local okd, derr = ml_preset_delete_named(nm)
+            if okd then
+              state.status = "Deleted triple-stack preset: " .. nm
+              state.status_err = false
+              changed_layout = true
+              wx_request_vp_sync()
+              return true
+            else
+              state.status = derr or "Could not delete preset."
+              state.status_err = true
+              return false
             end
           end
-          local save_ml_lbl = ml_dirty and "Save layout preset *" or "Save layout preset"
-          if wx_custom_button(ctx, save_ml_lbl, 160, 0, state.wx_slider_style) then
+          if #state.ml_preset_names ~= 0 then
+            local aw = ml_content_region_avail_x(ctx)
+            local combo_w = math.max(120, aw - save_bw - preset_row_gap)
+            local rv_mp, mp_idx = wx_custom_combo(ctx, "##layout_preset_wx", "Layout preset", ml_preset_idx, table.concat(state.ml_preset_names, "\0") .. "\0", combo_w, state.wx_slider_style, nil, nil, nil, ml_layout_preset_try_delete, nil)
+            if rv_mp then
+              local nm = state.ml_preset_names[(mp_idx or 0) + 1]
+              if nm then
+                local okp, perr = ml_preset_apply_named(nm)
+                if okp then
+                  changed_layout = true
+                  state.status = "Loaded triple-stack preset: " .. nm
+                  state.status_err = false
+                else
+                  state.status = perr or "Could not load preset."
+                  state.status_err = true
+                end
+              end
+            end
+            ImGui.SameLine(ctx, 0, preset_row_gap)
+          end
+          if wx_custom_button(ctx, save_ml_lbl, save_bw, 0, state.wx_slider_style) then
             state.ml_preset_save_name = trim(state.ml_preset_name or "")
             if ImGui.OpenPopup then
               ImGui.OpenPopup(ctx, "##ml_save_preset_popup")
-            end
-          end
-          if #state.ml_preset_names > 0 and trim(state.ml_preset_name or "") ~= "" then
-            ImGui.SameLine(ctx)
-            if wx_custom_small_button(ctx, "Delete layout preset", state.wx_slider_style) then
-              local del_name = state.ml_preset_name
-              local okd, derr = ml_preset_delete_named(del_name)
-              if okd then
-                state.status = "Deleted triple-stack preset: " .. del_name
-                state.status_err = false
-              else
-                state.status = derr or "Could not delete preset."
-                state.status_err = true
-              end
             end
           end
           if ImGui.BeginPopup and ImGui.BeginPopup(ctx, "##ml_save_preset_popup") then
@@ -10027,7 +11900,21 @@ do
             end
             local valign_items = "Top\0Middle\0Bottom\0"
             iw = ml_layout_flow_next_cell(ctx)
-            local rv_va, va2 = wx_custom_combo(ctx, "##mlva", "##mlva_cap", state.ml_row_v_align or 0, valign_items, iw, state.wx_slider_style, nil, "Row V-align")
+            local rv_va, va2 = wx_custom_combo(
+              ctx,
+              "##mlva",
+              "##mlva_cap",
+              state.ml_row_v_align or 0,
+              valign_items,
+              iw,
+              state.wx_slider_style,
+              nil,
+              "Row V-align",
+              nil,
+              nil,
+              nil,
+              wx_combo_external_label_placement(true)
+            )
             if rv_va then
               state.ml_row_v_align = math.max(0, math.min(2, va2 or 0))
               changed_layout = true
@@ -10130,8 +12017,18 @@ do
     end
 
     wx_flush_pending_vp_sync(ctx, item, take, words)
+    wx_sync_video_guides_gmem_now()
 
     state.prev_words_count = (words and #words) or 0
+    if words and #words > 0 then
+      local snap = {}
+      for wi = 1, #words do
+        snap[wi] = { t = words[wi].t, w = words[wi].w }
+      end
+      state.prev_words_snapshot = snap
+    else
+      state.prev_words_snapshot = nil
+    end
     if item and words and #words > 0 then
       ImGui.Text(
         ctx,
@@ -10172,13 +12069,25 @@ do
       overlay_request_autosave()
     end
     wx_draw_settings_modal(ctx)
-    ImGui.End(ctx)
   end
 
-  if open and not state.should_close then
-    r.defer(loop)
-  end
+  local function loop()
+    local flags = ImGui.WindowFlags_NoCollapse
+    ImGui.SetNextWindowSize(ctx, 700, 720, ImGui.Cond_FirstUseEver)
+    local visible, open = ImGui.Begin(ctx, WINDOW_TITLE, true, flags)
+    if visible then
+      wx_overlay_main_window_ui(ctx)
+      ImGui.End(ctx)
+    end
+
+    if open and not state.should_close then
+      r.defer(loop)
+    else
+      if W.sync_video_ratio_guides_gmem and not video_guides_any_on_state() then
+        W.sync_video_ratio_guides_gmem(false)
+      end
+    end
   end
 
   r.defer(loop)
-end
+end)()

@@ -1,0 +1,19 @@
+---
+description: WhisperX / REAPER Lua — Lua 5.1 local variable limit (200) and how to stay under it
+globs: WhisperX Lyrics/**/*.lua
+alwaysApply: false
+---
+
+# Lua 5.1 local variable limit (REAPER / WhisperX)
+
+REAPER scripts use **Lua 5.1**. The VM allows at most **200 local variables visible at once in a single function scope** (the main chunk counts as one function).
+
+## Always keep this in mind when editing WhisperX Lyrics `.lua` files
+
+- Prefer **splitting huge UI/layout code** into `local function name(...)` helpers so each function gets its own 200-local budget.
+- **`do ... end` does not fix the limit** for the main chunk: block locals in a file still belong to the same chunk function. When the main chunk nears 200 locals, the parser errors on the next `local` / `function` (often near the bottom of the file).
+- **Mitigations that work:**
+  - **Nested named functions** – move large bodies into `local function helper()` blocks.
+  - **IIFE for startup/defer** – e.g. `(function() local ctx = ... r.defer(loop) end)()` so `ctx`, inner `local function`s, and their logic live in a **child** function, not the main chunk.
+  - **Extra file + `dofile`** – if one module is still too large after splitting.
+- After adding many `local` declarations or a big new UI block, **check whether the file still parses**; if you see `too many local variables (limit is 200) in main function`, apply one of the mitigations above.

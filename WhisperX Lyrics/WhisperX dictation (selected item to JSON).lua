@@ -1,5 +1,5 @@
 -- @description WhisperX dictation: transcribe selected item(s) (JSON + in-project lyrics)
--- @version 1.15
+-- @version 1.16
 -- @author Bryan
 -- @about
 --   Runs WhisperX via ../.venv_whisperx, writes .whisperx.json plus sidecars
@@ -24,14 +24,10 @@
 --   Plus TIMEOUT_MS, USE_BACKGROUND, DEVICE, COMPUTE_TYPE, WRITE_ITEM_NOTES, WRITE_TAKE_MARKERS,
 --   MAX_WORD_MARKERS. Optional GUI: “WhisperX dictation settings (ReaImGui).lua”.
 --   When writing take markers, all existing markers on that take are removed first; each word is one plain-named marker.
+--   Optional persistent model server: load models once in “WhisperX dictation settings” (Load model) for faster repeat
+--   dictation; Unload frees RAM. While loaded, dictation skips ASR/align reload on each run.
 
 local r = reaper
-
-local LOG_PREFIX = "[WhisperX dictation] "
-
-local function log_line(msg)
-  r.ShowConsoleMsg(LOG_PREFIX .. tostring(msg) .. "\n")
-end
 
 local function script_path()
   local info = debug.getinfo(1, "S")
@@ -65,13 +61,30 @@ local function get_paths()
   local scripts_dir = dirname(lyrics_dir)
   local py = join_path(scripts_dir, ".venv_whisperx/bin/python")
   local transcribe_py = join_path(lyrics_dir, "reaper_whisperx_transcribe.py")
-  return py, transcribe_py, lyrics_dir
+  return py, transcribe_py, lyrics_dir, scripts_dir
 end
 
 local function file_exists_io(p)
   local f = io.open(p, "r")
   if f then f:close() return true end
   return false
+end
+
+local WXServer = nil
+local function load_server_lib(lyrics_dir)
+  if WXServer then
+    return WXServer
+  end
+  local lib_path = join_path(lyrics_dir, "WhisperX server lib.lua")
+  if not file_exists_io(lib_path) then
+    return nil
+  end
+  local ok, mod = pcall(dofile, lib_path)
+  if ok and type(mod) == "table" then
+    WXServer = mod
+    return WXServer
+  end
+  return nil
 end
 
 local function path_exists(p)
@@ -158,9 +171,9 @@ local function sidecar_paths_from_whisperx_json(json_path)
   return base .. ".words.tsv", base .. ".plain.txt"
 end
 
---- Each entry: { item, take, media_path, out_json, out_tsv, out_plain, inner_cmd }
+--- Each entry: { item, take, media_path, out_json, out_tsv, out_plain, inner_cmd, job_fields }
 --- Skips invalid selected items (logged); returns nil, err if nothing usable.
-local function collect_selected_dictation_jobs(inner_cmd_builder)
+local function collect_selected_dictation_jobs(inner_cmd_builder, job_fields_builder)
   local n = r.CountSelectedMediaItems(0)
   if n < 1 then
     return nil, "Select at least one media item with an audio take."
@@ -193,7 +206,8 @@ local function collect_selected_dictation_jobs(inner_cmd_builder)
             seen_paths[lk] = true
             local out_json = default_output_json(path)
             local out_tsv, out_plain = sidecar_paths_from_whisperx_json(out_json)
-            local inner_cmd = inner_cmd_builder(path, out_json)
+            local inner_cmd = inner_cmd_builder and inner_cmd_builder(path, out_json) or nil
+            local job_fields = job_fields_builder and job_fields_builder(path, out_json) or nil
             jobs[#jobs + 1] = {
               item = item,
               take = take,
@@ -202,6 +216,7 @@ local function collect_selected_dictation_jobs(inner_cmd_builder)
               out_tsv = out_tsv,
               out_plain = out_plain,
               inner_cmd = inner_cmd,
+              job_fields = job_fields,
             }
           end
         end
@@ -215,10 +230,6 @@ local function collect_selected_dictation_jobs(inner_cmd_builder)
     local detail = (#skips > 0) and table.concat(skips, "\n") or "Unknown error."
     return nil, "No usable media items in selection.\n\n" .. detail
   end
-  if #skips > 0 then
-    log_line("WhisperX batch: skipping " .. tostring(#skips) .. " selected row(s):\n" .. table.concat(skips, "\n"))
-  end
-  log_line("WhisperX batch: " .. tostring(#jobs) .. " item(s) queued (processed one after another).")
   return jobs, nil
 end
 
@@ -296,7 +307,6 @@ local function run_whisperx_shell(inner_cmd, timeout_ms)
     local sh_cmd = "/bin/sh -c " .. shell_quote(inner_cmd .. " 2>&1")
     local h = io.popen(sh_cmd, "r")
     if not h then
-      log_line("io.popen failed; falling back to reaper.ExecProcess")
       return r.ExecProcess(wrap_exec_command(inner_cmd), timeout_ms)
     end
     local body = h:read("*a") or ""
@@ -311,7 +321,6 @@ local function run_whisperx_shell(inner_cmd, timeout_ms)
     elseif a == nil and type(c) == "number" then
       exit_code = c
     end
-    log_line("io.popen close: a=" .. tostring(a) .. " b=" .. tostring(b) .. " c=" .. tostring(c))
     return tostring(exit_code) .. "\n" .. body
   end
   return r.ExecProcess(wrap_exec_command(inner_cmd), timeout_ms)
@@ -424,19 +433,12 @@ local function apply_transcript_to_item(item, take, tsv_path, plain_path)
     return
   end
 
-  log_line(
-    "take markers: MARKER_AT="
-      .. tostring(r.GetExtState("BRYAN_WHISPERX", "MARKER_AT"))
-      .. " (empty=start; start|mid|end)"
-  )
-
   local max_m = ext_int("MAX_WORD_MARKERS", 1500)
   local count = 0
   local f = io.open(tsv_path, "rb")
   if f then
     for line in f:lines() do
       if count >= max_m then
-        log_line("take markers capped at " .. tostring(max_m) .. " (BRYAN_WHISPERX MAX_WORD_MARKERS)")
         break
       end
       local st_s, en_s, word = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
@@ -517,18 +519,8 @@ local function whisperx_finalize(st, exit_code, stdout, finalize_opts)
   local batch_total = finalize_opts.batch_total
 
   local dbg_txt = read_all_utf8(st.debug_log)
-  if dbg_txt and dbg_txt ~= "" then
-    local cap = 48000
-    if #dbg_txt > cap then
-      dbg_txt = dbg_txt:sub(1, cap) .. "\n… (_whisperx_run.log truncated for console)\n"
-    end
-    log_line("---- _whisperx_run.log ----\n" .. dbg_txt)
-  else
-    log_line("no debug log at " .. st.debug_log .. " (Python may not have started)")
-  end
 
   if exit_code ~= 0 then
-    log_line("FAILED exit " .. tostring(exit_code))
     r.Undo_EndBlock("WhisperX dictation (failed)", -1)
     local err_detail = (stdout and stdout ~= "") and stdout:sub(1, 4000) or ""
     if err_detail == "" and dbg_txt and dbg_txt ~= "" then
@@ -541,14 +533,6 @@ local function whisperx_finalize(st, exit_code, stdout, finalize_opts)
     return false
   end
 
-  if stdout and stdout ~= "" then
-    local preview = stdout
-    if #preview > 12000 then
-      preview = preview:sub(1, 12000) .. "\n… (truncated)\n"
-    end
-    log_line("---- subprocess output ----\n" .. preview)
-  end
-
   local json_ok = path_exists(st.out_json)
   local tsv_ok = path_exists(st.out_tsv)
   local plain_ok = path_exists(st.out_plain)
@@ -556,17 +540,11 @@ local function whisperx_finalize(st, exit_code, stdout, finalize_opts)
   local m_tsv_ok = path_exists(st.mirror_tsv)
   local m_plain_ok = path_exists(st.mirror_plain)
 
-  log_line("after run: json=" .. tostring(json_ok) .. " tsv=" .. tostring(tsv_ok) .. " plain=" .. tostring(plain_ok))
-  log_line(
-    "mirror: json=" .. tostring(m_json_ok) .. " tsv=" .. tostring(m_tsv_ok) .. " plain=" .. tostring(m_plain_ok)
-  )
-
   local use_json = json_ok and st.out_json or (m_json_ok and st.mirror_json or nil)
   local use_tsv = tsv_ok and st.out_tsv or (m_tsv_ok and st.mirror_tsv or nil)
   local use_plain = plain_ok and st.out_plain or (m_plain_ok and st.mirror_plain or nil)
 
   if not use_tsv then
-    log_line("ERROR: words TSV missing at both primary and mirror paths")
     r.Undo_EndBlock("WhisperX dictation (no output files)", -1)
     r.MB(
       "WhisperX reported success but no .words.tsv was found.\n\n"
@@ -574,7 +552,7 @@ local function whisperx_finalize(st, exit_code, stdout, finalize_opts)
         .. st.out_tsv
         .. "\n\nMirror:\n"
         .. st.mirror_tsv
-        .. "\n\nOpen the REAPER console and/or this log:\n"
+        .. "\n\nLog:\n"
         .. st.debug_log,
       "WhisperX dictation",
       0
@@ -583,7 +561,6 @@ local function whisperx_finalize(st, exit_code, stdout, finalize_opts)
   end
 
   if not whisperx_ptr_item_take_ok(st.item, st.take) then
-    log_line("item/take no longer valid after run; skipping apply")
     r.Undo_EndBlock("WhisperX dictation (stale selection)", -1)
     r.MB(
       "The original media item is no longer selected or was removed before transcription finished.\n\n"
@@ -663,7 +640,6 @@ local function wx_poll()
       local ch = gfx.getchar and gfx.getchar() or 0
       if ch == -1 then
         j.gfx_on = false
-        log_line("progress window closed; still waiting for WhisperX (see console / log)…")
       else
         local pct, msg = wx_read_progress_lines(j.progress_file)
         -- gfx.clear is a color value in REAPER Lua, not a function (see gfx.update).
@@ -715,7 +691,14 @@ local function wx_poll()
       pcall(os.remove, j.done_flag)
     end
     r.Undo_BeginBlock()
-    if not whisperx_spawn_unix_detached(next_job.inner_cmd, j.done_flag) then
+    local started = false
+    if j.via_server and j.wx_server then
+      local ok = j.wx_server.submit_transcribe(next_job.job_fields)
+      started = ok == true
+    else
+      started = whisperx_spawn_unix_detached(next_job.inner_cmd, j.done_flag)
+    end
+    if not started then
       r.Undo_EndBlock("WhisperX dictation (failed)", -1)
       if j.gfx_on and gfx and gfx.quit then
         gfx.quit()
@@ -743,6 +726,7 @@ local function main()
   end
 
   local py, transcribe_py, lyrics_dir = get_paths()
+  local wxsrv = load_server_lib(lyrics_dir)
   if not file_exists_io(py) then
     r.MB(
       "Python venv not found:\n" .. py .. "\n\n"
@@ -875,7 +859,25 @@ local function main()
     return table.concat(parts, " ")
   end
 
-  local jobs, collect_err = collect_selected_dictation_jobs(build_inner)
+  local function build_job_fields(media_path, out_json)
+    return {
+      input = media_path,
+      output = out_json,
+      mirror_json = mirror_json,
+      mirror_tsv = mirror_tsv,
+      mirror_plain = mirror_plain,
+      debug_log = debug_log,
+      progress_file = progress_file,
+      done_flag = done_flag,
+    }
+  end
+
+  local use_server = wxsrv and wxsrv.models_ready_for_dictation()
+
+  local jobs, collect_err = collect_selected_dictation_jobs(
+    use_server and nil or build_inner,
+    build_job_fields
+  )
   if not jobs then
     r.MB(collect_err or "Unknown error", "WhisperX dictation", 0)
     return
@@ -883,57 +885,10 @@ local function main()
 
   local timeout_ms = parse_timeout_ms()
 
-  r.SetExtState("BRYAN_WHISPERX", "LAST_INNER", jobs[1].inner_cmd, false)
-  r.SetExtState("BRYAN_WHISPERX", "LAST_CMD", "/bin/sh -c " .. shell_quote(jobs[1].inner_cmd .. " 2>&1"), false)
-
-  log_line("======== run ========")
-  log_line("batch: " .. tostring(#jobs) .. " job(s)")
-  for ji, jb in ipairs(jobs) do
-    log_line(
-      "job "
-        .. tostring(ji)
-        .. "/" .. tostring(#jobs)
-        .. " media: "
-        .. jb.media_path
-        .. " exists="
-        .. tostring(path_exists(jb.media_path))
-    )
-    log_line("  out_json: " .. jb.out_json)
-    log_line("  words TSV: " .. jb.out_tsv)
+  r.SetExtState("BRYAN_WHISPERX", "LAST_INNER", jobs[1].inner_cmd or "(model server)", false)
+  if jobs[1].inner_cmd then
+    r.SetExtState("BRYAN_WHISPERX", "LAST_CMD", "/bin/sh -c " .. shell_quote(jobs[1].inner_cmd .. " 2>&1"), false)
   end
-  log_line("python: " .. py)
-  log_line("transcribe script: " .. transcribe_py)
-  log_line("mirror (ASCII names): " .. mirror_json)
-  log_line("debug log: " .. debug_log)
-  log_line("progress file: " .. progress_file)
-  log_line("done flag: " .. done_flag)
-  log_line("device: " .. device .. " compute_type: " .. compute_type)
-  log_line("model: " .. model)
-  if lang and lang ~= "" then
-    log_line("LANGUAGE extstate: " .. lang)
-  end
-  if interp and interp ~= "" then
-    log_line("INTERPOLATE_METHOD extstate: " .. interp)
-  end
-  if chunk_sz and chunk_sz >= 4 and chunk_sz <= 120 then
-    log_line("CHUNK_SIZE extstate: " .. tostring(math.floor(chunk_sz + 0.5)))
-  end
-  if vad_m == "silero" or vad_m == "pyannote" then
-    log_line("VAD_METHOD extstate: " .. vad_m)
-  end
-  if vad_os and vad_os >= 0.01 and vad_os <= 0.99 then
-    log_line("VAD_ONSET extstate: " .. tostring(vad_os))
-  end
-  if vad_off and vad_off >= 0.01 and vad_off <= 0.99 then
-    log_line("VAD_OFFSET extstate: " .. tostring(vad_off))
-  end
-  if beam_n and beam_n >= 1 and beam_n <= 50 then
-    log_line("BEAM_SIZE extstate: " .. tostring(math.floor(beam_n + 0.5)))
-  end
-  if align_m ~= "" then
-    log_line("ALIGN_MODEL extstate: " .. align_m)
-  end
-  log_line("ExecProcess timeout_ms (ignored on macOS when using io.popen): " .. tostring(timeout_ms))
 
   local os_str = r.GetOS() or ""
   local is_win = os_str:match("Win") ~= nil
@@ -953,15 +908,19 @@ local function main()
     }
   end
 
-  if try_bg and whisperx_spawn_unix_detached(jobs[1].inner_cmd, done_flag) then
-    log_line("background WhisperX spawn OK; defer polling " .. done_flag)
+  local function start_first_job()
+    if use_server and wxsrv then
+      return wxsrv.submit_transcribe(jobs[1].job_fields)
+    end
+    return whisperx_spawn_unix_detached(jobs[1].inner_cmd, done_flag)
+  end
+
+  if try_bg and start_first_job() then
     r.Undo_BeginBlock()
     local gfx_on = false
     if gfx and gfx.init then
-      gfx.init("WhisperX transcription", 420, 74, 0, 120, 120)
+      gfx.init(use_server and "WhisperX transcription (cached model)" or "WhisperX transcription", 420, 74, 0, 120, 120)
       gfx_on = true
-    else
-      log_line("gfx not available; running in background without progress window")
     end
     WX_job = {
       batch_jobs = jobs,
@@ -976,45 +935,47 @@ local function main()
       t0 = r.time_precise(),
       max_wait = 4 * 3600 * math.max(1, #jobs),
       gfx_on = gfx_on,
+      via_server = use_server,
+      wx_server = wxsrv,
     }
     r.defer(wx_poll)
     return
   end
 
-  if try_bg then
-    log_line("background spawn failed; falling back to blocking subprocess")
-  end
-
   local n_jobs = #jobs
   for idx, jb in ipairs(jobs) do
     r.Undo_BeginBlock()
-    log_line("starting subprocess (blocking) job " .. tostring(idx) .. "/" .. tostring(n_jobs) .. " …")
-    local ret = run_whisperx_shell(jb.inner_cmd, timeout_ms)
 
-    log_line("subprocess capture len=" .. tostring(ret and #ret or 0))
+    local exit_code = 1
+    local stdout = ""
 
-    if not ret or ret == "" then
-      log_line("ERROR: empty ExecProcess return")
-      r.Undo_EndBlock("WhisperX dictation (failed)", -1)
-      r.MB("ExecProcess returned empty output (see REAPER console).", "WhisperX dictation", 0)
-      return
+    if use_server and wxsrv then
+      local ok, err, resp = wxsrv.transcribe_via_server(jb.job_fields, timeout_ms > 0 and timeout_ms / 1000 or 4 * 3600)
+      exit_code = (resp and resp.exit_code) or (ok and 0 or 1)
+      if err then
+        stdout = tostring(err)
+      end
+    else
+      local ret = run_whisperx_shell(jb.inner_cmd, timeout_ms)
+      if not ret or ret == "" then
+        r.Undo_EndBlock("WhisperX dictation (failed)", -1)
+        r.MB("ExecProcess returned empty output.", "WhisperX dictation", 0)
+        return
+      end
+      if ret == "-999" then
+        r.Undo_EndBlock("WhisperX dictation (failed)", -1)
+        r.MB(
+          "Timed out waiting for WhisperX.\nSet BRYAN_WHISPERX / TIMEOUT_MS to 0 for no limit.",
+          "WhisperX dictation",
+          0
+        )
+        return
+      end
+      local first_nl = ret:find("\n", 1, true)
+      local exit_str = first_nl and ret:sub(1, first_nl - 1) or ret
+      stdout = first_nl and ret:sub(first_nl + 1) or ""
+      exit_code = tonumber(exit_str:match("^%s*(%-?%d+)%s*$")) or 1
     end
-
-    if ret == "-999" then
-      log_line("ERROR: -999 timeout")
-      r.Undo_EndBlock("WhisperX dictation (failed)", -1)
-      r.MB(
-        "Timed out waiting for WhisperX.\nSet BRYAN_WHISPERX / TIMEOUT_MS to 0 for no limit.",
-        "WhisperX dictation",
-        0
-      )
-      return
-    end
-
-    local first_nl = ret:find("\n", 1, true)
-    local exit_str = first_nl and ret:sub(1, first_nl - 1) or ret
-    local stdout = first_nl and ret:sub(first_nl + 1) or ""
-    local exit_code = tonumber(exit_str:match("^%s*(%-?%d+)%s*$")) or 1
 
     local st = job_state(jb)
     local ok =

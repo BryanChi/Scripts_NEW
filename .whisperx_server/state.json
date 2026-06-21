@@ -1,0 +1,11 @@
+{
+  "phase": "stopped",
+  "pid": 15310,
+  "loaded": false,
+  "load_config": null,
+  "progress_pct": 0,
+  "progress_msg": "stopped",
+  "last_error": "",
+  "busy": false,
+  "server_dir": "/Users/b/Library/Application Support/REAPER/Scripts/Bryan's Scripts/.whisperx_server"
+}

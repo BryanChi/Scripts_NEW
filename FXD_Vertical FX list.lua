@@ -3892,6 +3892,14 @@ local function getTrackPosAndHeight(track)
   end
 end -- getTrackPosAndHeight()
 
+local function GetOpenProjectTabCount()
+  local count = 0
+  for i = 0, 127 do
+    if r.EnumProjects(i) then count = count + 1 else break end
+  end
+  return count
+end
+
 function DB2VAL(x) return math.exp((x) * 0.11512925464970228420089957273422) end
 
 function VAL2DB(x)
@@ -6782,6 +6790,7 @@ function loop()
   PatchLineShift = (PatchLineShift + PatchLineSpeed) % (Patch_Thick * 2)
 
   Top_Arrang = tonumber(select(2, r.BR_Win32_GetPrivateProfileString("REAPER", "toppane", "", r.get_ini_file()))) + 5
+  if GetOpenProjectTabCount() == 1 then Top_Arrang = Top_Arrang + 5 end
   KeyboardShortcuts(ctx)
   -- Reset/update per-frame UI suppression flags
   if WetDryKnobDragging and not im.IsMouseDown(ctx, 0) then WetDryKnobDragging = false end

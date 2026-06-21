@@ -1,5 +1,5 @@
 -- @description WhisperX: toggle live VP sync when take markers change
--- @version 1.02
+-- @version 1.03
 -- @author Bryan
 -- @about
 --   Run once to start, run again to stop. While active, if exactly one item is selected and its active take has
@@ -91,6 +91,10 @@ local function tick()
     if ok then
       r.UpdateArrange()
     end
+  end
+
+  if W.sync_video_ratio_guides_gmem and W.video_guides_enabled_for_section then
+    W.sync_video_ratio_guides_gmem(W.video_guides_enabled_for_section(SECTION))
   end
 
   r.defer(tick)

@@ -1,0 +1,95 @@
+2026-05-22 21:20:24 WhisperX server pid=15310 dir="/Users/b/Library/Application Support/REAPER/Scripts/Bryan's Scripts/.whisperx_server"
+2026-05-22 21:20:24 command: 'load'
+2026-05-22 21:20:25 models unloaded
+2026-05-22 21:20:25 load_model… model='large-v2' device='cpu' compute_type='int8' (first run may download multi-GB weights into the Hugging Face cache)
+2026-05-22 21:20:34 load complete
+2026-05-22 21:22:01 command: 'transcribe'
+2026-05-22 21:22:01 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-22 21:22:01 loading audio from '/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-10Pm)2026.wav'
+2026-05-22 21:22:17 align model cached for language='en'
+2026-05-22 21:22:17 sidecars: words_tsv='/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-10Pm)2026.words.tsv' plain='/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-10Pm)2026.plain.txt'
+2026-05-22 21:22:17 transcribe done exit 0
+2026-05-22 21:22:18 command: 'transcribe'
+2026-05-22 21:22:18 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-22 21:22:18 loading audio from '/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-11Pm)2026-01.wav'
+2026-05-22 21:22:32 sidecars: words_tsv='/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-11Pm)2026-01.words.tsv' plain='/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-11Pm)2026-01.plain.txt'
+2026-05-22 21:22:32 transcribe done exit 0
+2026-05-22 21:22:33 command: 'transcribe'
+2026-05-22 21:22:33 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-22 21:22:33 loading audio from '/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-11Pm)2026-02.wav'
+2026-05-22 21:22:47 sidecars: words_tsv='/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-11Pm)2026-02.words.tsv' plain='/Users/b/Documents/REAPER Media/Media/[Voc]---May22(12-11Pm)2026-02.plain.txt'
+2026-05-22 21:22:47 transcribe done exit 0
+2026-05-22 21:23:15 command: 'transcribe'
+2026-05-22 21:23:15 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-22 21:23:15 loading audio from '/Users/b/Reaper projects/die with a smile/[Voc]---May22(12-11Pm)2026-03-glued.wav'
+2026-05-22 21:23:35 sidecars: words_tsv='/Users/b/Reaper projects/die with a smile/[Voc]---May22(12-11Pm)2026-03-glued.words.tsv' plain='/Users/b/Reaper projects/die with a smile/[Voc]---May22(12-11Pm)2026-03-glued.plain.txt'
+2026-05-22 21:23:35 transcribe done exit 0
+2026-05-22 21:25:12 command: 'transcribe'
+2026-05-22 21:25:12 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-22 21:25:12 loading audio from '/Users/b/Reaper projects/die with a smile/[Voc]---May22(12-36Pm)2026-01-glued.wav'
+2026-05-22 21:25:31 sidecars: words_tsv='/Users/b/Reaper projects/die with a smile/[Voc]---May22(12-36Pm)2026-01-glued.words.tsv' plain='/Users/b/Reaper projects/die with a smile/[Voc]---May22(12-36Pm)2026-01-glued.plain.txt'
+2026-05-22 21:25:31 transcribe done exit 0
+2026-05-28 21:57:09 command: 'transcribe'
+2026-05-28 21:57:09 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-28 21:57:09 loading audio from '/Users/b/Reaper projects/I really want to stay at your house/I really want to stay at your house_stems_Voc.wav'
+2026-05-28 21:57:55 sidecars: words_tsv='/Users/b/Reaper projects/I really want to stay at your house/I really want to stay at your house_stems_Voc.words.tsv' plain='/Users/b/Reaper projects/I really want to stay at your house/I really want to stay at your house_stems_Voc.plain.txt'
+2026-05-28 21:57:55 transcribe done exit 0
+2026-05-30 00:03:53 command: 'transcribe'
+2026-05-30 00:03:53 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-30 00:03:53 loading audio from '/Users/b/Reaper projects/拝啓\u3000十五の君へ/拝啓\u3000十五の君へ_stems_Voc.wav'
+2026-05-30 00:04:31 align model cached for language='ja'
+2026-05-30 00:04:34 sidecars: words_tsv='/Users/b/Reaper projects/拝啓\u3000十五の君へ/拝啓\u3000十五の君へ_stems_Voc.words.tsv' plain='/Users/b/Reaper projects/拝啓\u3000十五の君へ/拝啓\u3000十五の君へ_stems_Voc.plain.txt'
+2026-05-30 00:04:34 transcribe done exit 0
+2026-05-30 00:04:34 command: 'transcribe'
+2026-05-30 00:04:34 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-05-30 00:04:34 loading audio from '/Users/b/Reaper projects/拝啓\u3000十五の君へ/Voc - stem-glued.wav'
+2026-05-30 00:04:55 sidecars: words_tsv='/Users/b/Reaper projects/拝啓\u3000十五の君へ/Voc - stem-glued.words.tsv' plain='/Users/b/Reaper projects/拝啓\u3000十五の君へ/Voc - stem-glued.plain.txt'
+2026-05-30 00:04:55 transcribe done exit 0
+2026-06-03 11:51:21 command: 'transcribe'
+2026-06-03 11:51:21 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-03 11:51:21 loading audio from '/Users/b/Reaper projects/who says/[Voc]---Jun01(12-25Pm)2026-glued.wav'
+2026-06-03 11:51:58 sidecars: words_tsv='/Users/b/Reaper projects/who says/[Voc]---Jun01(12-25Pm)2026-glued.words.tsv' plain='/Users/b/Reaper projects/who says/[Voc]---Jun01(12-25Pm)2026-glued.plain.txt'
+2026-06-03 11:51:58 transcribe done exit 0
+2026-06-03 12:36:48 command: 'transcribe'
+2026-06-03 12:36:48 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-03 12:36:48 loading audio from '/Users/b/Reaper projects/who says/[Voc]---Jun01(12-25Pm)2026-glued.wav'
+2026-06-03 12:37:23 sidecars: words_tsv='/Users/b/Reaper projects/who says/[Voc]---Jun01(12-25Pm)2026-glued.words.tsv' plain='/Users/b/Reaper projects/who says/[Voc]---Jun01(12-25Pm)2026-glued.plain.txt'
+2026-06-03 12:37:23 transcribe done exit 0
+2026-06-03 22:56:49 command: 'transcribe'
+2026-06-03 22:56:49 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-03 22:56:49 loading audio from '/Users/b/Reaper projects/talking to the moon/[Voc]---Jun02(02-10Pm)2026-03-glued.wav'
+2026-06-03 22:57:30 merged per-letter Latin tokens into words: net −1 rows
+2026-06-03 22:57:30 sidecars: words_tsv='/Users/b/Reaper projects/talking to the moon/[Voc]---Jun02(02-10Pm)2026-03-glued.words.tsv' plain='/Users/b/Reaper projects/talking to the moon/[Voc]---Jun02(02-10Pm)2026-03-glued.plain.txt'
+2026-06-03 22:57:30 transcribe done exit 0
+2026-06-05 20:49:02 command: 'transcribe'
+2026-06-05 20:49:02 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-05 20:49:02 loading audio from '/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-15Pm)2026-01-glued.wav'
+2026-06-05 20:49:20 sidecars: words_tsv='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-15Pm)2026-01-glued.words.tsv' plain='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-15Pm)2026-01-glued.plain.txt'
+2026-06-05 20:49:20 transcribe done exit 0
+2026-06-05 20:49:21 command: 'transcribe'
+2026-06-05 20:49:21 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-05 20:49:21 loading audio from '/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued.wav'
+2026-06-05 20:49:32 sidecars: words_tsv='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued.words.tsv' plain='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued.plain.txt'
+2026-06-05 20:49:32 transcribe done exit 0
+2026-06-05 21:43:56 command: 'transcribe'
+2026-06-05 21:43:56 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-05 21:43:56 loading audio from '/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued-01.wav'
+2026-06-05 21:44:06 sidecars: words_tsv='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued-01.words.tsv' plain='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued-01.plain.txt'
+2026-06-05 21:44:06 transcribe done exit 0
+2026-06-05 21:44:07 command: 'transcribe'
+2026-06-05 21:44:07 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-05 21:44:07 loading audio from '/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued-02.wav'
+2026-06-05 21:44:18 sidecars: words_tsv='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued-02.words.tsv' plain='/Users/b/Reaper projects/しわあわせ/[Voc]---Jun05(12-52Pm)2026-01-glued-02.plain.txt'
+2026-06-05 21:44:18 transcribe done exit 0
+2026-06-06 22:37:20 command: 'transcribe'
+2026-06-06 22:37:20 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-06 22:37:20 loading audio from '/Users/b/Reaper projects/粉雪\u3000CHORUS/[Voc]---Jun05(03-20Pm)2026-glued.wav'
+2026-06-06 22:37:35 sidecars: words_tsv='/Users/b/Reaper projects/粉雪\u3000CHORUS/[Voc]---Jun05(03-20Pm)2026-glued.words.tsv' plain='/Users/b/Reaper projects/粉雪\u3000CHORUS/[Voc]---Jun05(03-20Pm)2026-glued.plain.txt'
+2026-06-06 22:37:35 transcribe done exit 0
+2026-06-06 22:37:35 command: 'transcribe'
+2026-06-06 22:37:35 PATH augmented; shutil.which(ffmpeg)='/opt/homebrew/bin/ffmpeg'
+2026-06-06 22:37:35 loading audio from '/Users/b/Reaper projects/粉雪\u3000CHORUS/[Voc]---Jun05(03-11Pm)2026-01-glued.wav'
+2026-06-06 22:37:51 sidecars: words_tsv='/Users/b/Reaper projects/粉雪\u3000CHORUS/[Voc]---Jun05(03-11Pm)2026-01-glued.words.tsv' plain='/Users/b/Reaper projects/粉雪\u3000CHORUS/[Voc]---Jun05(03-11Pm)2026-01-glued.plain.txt'
+2026-06-06 22:37:51 transcribe done exit 0
+2026-06-16 13:30:58 models unloaded
+2026-06-16 13:30:58 server loop exited

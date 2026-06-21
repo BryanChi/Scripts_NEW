@@ -80,6 +80,7 @@ local state = {
   pending_waveform_drop = nil,  -- Sample waiting to be dropped (global drag operation)
   last_mouse_time_pos = nil,  -- Last known mouse time position during drag
   last_mouse_track = nil,     -- Last known mouse track during drag
+  seq_drop_target_idx = nil,  -- Sequencer track row hovered during sample drag
   external_disabled = false,  -- Stop trying analyzer after first hard failure
   analyzer_warned = false,
   folder_filter_path = nil,  -- Filter by folder path (nil = no filter)
@@ -133,6 +134,35 @@ local state = {
   last_save_time = 0.0,             -- Timestamp of last cache save
   preview_volume = 1.0,             -- Preview volume (0.0 to 1.0)
   preview_paused = false,           -- Whether preview is paused
+  -- Sequencer track slots (linked to project tracks + assigned samples)
+  seq_tracks = {},                  -- { id, name, reaper_track_guid, sample_path, sample_name }
+  selected_seq_track = nil,         -- 1-based index into seq_tracks
+  seq_swap_track_idx = nil,         -- Track slot in sample swap mode (1-based)
+  seq_swap_track_id = nil,          -- Stable track slot id in sample swap mode
+  seq_swap_backup_path = nil,       -- Original sample path when swap mode started
+  seq_swap_backup_name = nil,       -- Original sample name when swap mode started
+  block_swap_bar_input = false,     -- Prevent same-frame click bleed from map to bar
+  seq_track_next_id = 1,
+  seq_panel_width = 240,
+  active_view = "sample_map",       -- "sample_map" | "sequencer"
+  seq_timeline_drop_track_idx = nil,-- Sequencer timeline row hovered during sample drag
+  seq_timeline_drop_time = nil,     -- Sequencer timeline time hovered during sample drag
+  seq_follow_arrange = true,        -- Sequencer view follows arrange view when true
+  seq_view_start_qn = nil,          -- Manual sequencer view start (QN)
+  seq_view_span_qn = nil,           -- Sequencer view span in QN
+  seq_grid_qn = 0.25,               -- Musical sequencer cell size in quarter notes
+  seq_regions = {},                 -- { id, name, start_qn, length_bars, pool_id, pattern_id }
+  seq_patterns = {},                -- pattern_id -> { notes = { track_slot_id -> step_key -> note } }
+  seq_region_next_id = 1,
+  seq_pattern_next_id = 1,
+  seq_pool_next_id = 1,
+  selected_seq_region_id = nil,
+  selected_seq_note = nil,          -- { region_id, track_id, step_key }
+  seq_drag_paint = false,
+  seq_drag_mode = nil,              -- "paint" | "erase"
+  seq_drag_last_cell = nil,
+  seq_expanded_tracks = {},         -- track slot id -> true when parameter lanes are visible
+  seq_param_drag = nil,             -- { track_id, param }
 }
 
 local ctx = nil
@@ -756,6 +786,70 @@ local function load_config()
             end
           end
         end
+        if cfg.seq_tracks and type(cfg.seq_tracks) == "table" then
+          state.seq_tracks = {}
+          for _, entry in ipairs(cfg.seq_tracks) do
+            if type(entry) == "table" and entry.id then
+              table.insert(state.seq_tracks, {
+                id = entry.id,
+                name = entry.name or "Track",
+                reaper_track_guid = entry.reaper_track_guid,
+                sample_path = entry.sample_path,
+                sample_name = entry.sample_name,
+              })
+              if type(entry.id) == "number" and entry.id >= state.seq_track_next_id then
+                state.seq_track_next_id = entry.id + 1
+              end
+            end
+          end
+        end
+        if cfg.selected_seq_track and type(cfg.selected_seq_track) == "number" then
+          state.selected_seq_track = cfg.selected_seq_track
+        end
+        if cfg.seq_panel_width and type(cfg.seq_panel_width) == "number" then
+          state.seq_panel_width = cfg.seq_panel_width
+        end
+        if cfg.active_view == "sample_map" or cfg.active_view == "sequencer" then
+          state.active_view = cfg.active_view
+        end
+        if type(cfg.seq_follow_arrange) == "boolean" then
+          state.seq_follow_arrange = cfg.seq_follow_arrange
+        end
+        if type(cfg.seq_view_start_qn) == "number" then
+          state.seq_view_start_qn = cfg.seq_view_start_qn
+        end
+        if type(cfg.seq_view_span_qn) == "number" and cfg.seq_view_span_qn > 0 then
+          state.seq_view_span_qn = cfg.seq_view_span_qn
+        end
+        if type(cfg.seq_grid_qn) == "number" and cfg.seq_grid_qn > 0 then
+          state.seq_grid_qn = cfg.seq_grid_qn
+        end
+        if cfg.seq_regions and type(cfg.seq_regions) == "table" then
+          state.seq_regions = cfg.seq_regions
+          for _, region in ipairs(state.seq_regions) do
+            if type(region) == "table" and type(region.id) == "number" and region.id >= state.seq_region_next_id then
+              state.seq_region_next_id = region.id + 1
+            end
+          end
+        end
+        if cfg.seq_patterns and type(cfg.seq_patterns) == "table" then
+          state.seq_patterns = cfg.seq_patterns
+        end
+        if type(cfg.seq_region_next_id) == "number" then
+          state.seq_region_next_id = math.max(state.seq_region_next_id, cfg.seq_region_next_id)
+        end
+        if type(cfg.seq_pattern_next_id) == "number" then
+          state.seq_pattern_next_id = cfg.seq_pattern_next_id
+        end
+        if type(cfg.seq_pool_next_id) == "number" then
+          state.seq_pool_next_id = cfg.seq_pool_next_id
+        end
+        if type(cfg.selected_seq_region_id) == "number" then
+          state.selected_seq_region_id = cfg.selected_seq_region_id
+        end
+        if cfg.seq_expanded_tracks and type(cfg.seq_expanded_tracks) == "table" then
+          state.seq_expanded_tracks = cfg.seq_expanded_tracks
+        end
         log("Loaded config: " .. #state.folders .. " folder(s)")
         if #state.folders > 0 then
           for i, folder in ipairs(state.folders) do
@@ -810,6 +904,21 @@ local function save_config()
     dot_detection_multiplier = state.dot_detection_multiplier,
     preview_volume = state.preview_volume,
     tag_colors = state.tag_colors,
+    seq_tracks = state.seq_tracks,
+    selected_seq_track = state.selected_seq_track,
+    seq_panel_width = state.seq_panel_width,
+    active_view = state.active_view,
+    seq_follow_arrange = state.seq_follow_arrange,
+    seq_view_start_qn = state.seq_view_start_qn,
+    seq_view_span_qn = state.seq_view_span_qn,
+    seq_grid_qn = state.seq_grid_qn,
+    seq_regions = state.seq_regions,
+    seq_patterns = state.seq_patterns,
+    seq_region_next_id = state.seq_region_next_id,
+    seq_pattern_next_id = state.seq_pattern_next_id,
+    seq_pool_next_id = state.seq_pool_next_id,
+    selected_seq_region_id = state.selected_seq_region_id,
+    seq_expanded_tracks = state.seq_expanded_tracks,
   }
   local file = io.open(CONFIG_PATH, "w")
   if file then
@@ -3715,6 +3824,103 @@ local function insert_sample_at_position(sample, time_pos, target_track)
   end
 end
 
+local function is_alt_down()
+  if r.ImGui_IsKeyDown and r.ImGui_Key_LeftAlt and r.ImGui_Key_RightAlt then
+    return r.ImGui_IsKeyDown(ctx, r.ImGui_Key_LeftAlt()) or r.ImGui_IsKeyDown(ctx, r.ImGui_Key_RightAlt())
+  end
+  return false
+end
+
+local function is_cmd_down()
+  if not r.ImGui_IsKeyDown then
+    return false
+  end
+  if r.ImGui_Key_LeftSuper and r.ImGui_Key_RightSuper then
+    return r.ImGui_IsKeyDown(ctx, r.ImGui_Key_LeftSuper()) or r.ImGui_IsKeyDown(ctx, r.ImGui_Key_RightSuper())
+  end
+  return false
+end
+
+local function update_pending_drop_tracking()
+  if not state.pending_waveform_drop then
+    return
+  end
+  local time_pos, track = get_drop_position()
+  if time_pos then
+    state.last_mouse_time_pos = time_pos
+    state.last_mouse_track = track
+  end
+end
+
+local function complete_pending_sample_drop()
+  if not state.pending_waveform_drop or r.ImGui_IsMouseDown(ctx, 0) then
+    return
+  end
+
+  local sample = state.pending_waveform_drop
+  log("Mouse released globally, completing drag operation")
+
+  if state.seq_timeline_drop_track_idx and state.seq_timeline_drop_time then
+    local slot = state.seq_tracks[state.seq_timeline_drop_track_idx]
+    local target_track = nil
+    if slot and slot.reaper_track_guid then
+      local n = r.CountTracks(0)
+      for i = 0, n - 1 do
+        local tr = r.GetTrack(0, i)
+        if r.GetTrackGUID(tr) == slot.reaper_track_guid then
+          target_track = tr
+          break
+        end
+      end
+    end
+    local success = insert_sample_at_position(sample, state.seq_timeline_drop_time, target_track)
+    if success then
+      state.selected_seq_track = state.seq_timeline_drop_track_idx
+      log("Inserted '" .. (sample.name or sample.path) .. "' via sequencer timeline")
+    else
+      log("Failed sequencer timeline insertion")
+    end
+  elseif state.seq_drop_target_idx then
+    local slot = state.seq_tracks[state.seq_drop_target_idx]
+    if slot and sample.path then
+      local in_swap = state.seq_swap_track_idx and state.seq_tracks[state.seq_swap_track_idx] == slot
+      slot.sample_path = sample.path
+      slot.sample_name = sample.name or basename(sample.path)
+      state.selected_seq_track = state.seq_drop_target_idx
+      if not in_swap then
+        save_config()
+      end
+      log("Assigned '" .. (sample.name or sample.path) .. "' to " .. slot.name)
+    end
+  elseif state.last_mouse_time_pos then
+    log("Dropping at tracked position: " .. string.format("%.3f", state.last_mouse_time_pos))
+    local success = insert_sample_at_position(sample, state.last_mouse_time_pos, state.last_mouse_track)
+    if success then
+      log("Successfully completed drag-and-drop")
+    else
+      log("Failed to complete drag-and-drop")
+    end
+  else
+    local drop_time, drop_track = get_drop_position()
+    if drop_time then
+      log("Dropping at release position: " .. string.format("%.3f", drop_time))
+      insert_sample_at_position(sample, drop_time, drop_track)
+    else
+      log("No tracked mouse position, using cursor position")
+      insert_sample_at_cursor(sample)
+    end
+  end
+
+  state.pending_waveform_drop = nil
+  state.last_mouse_time_pos = nil
+  state.last_mouse_track = nil
+  state.seq_drop_target_idx = nil
+  state.seq_timeline_drop_track_idx = nil
+  state.seq_timeline_drop_time = nil
+  state.is_left_dragging = false
+  state.last_dragged_sample_path = nil
+end
+
 local function render_playback_controls()
   -- Check if preview is currently playing
   local is_playing = preview_proc ~= nil and preview_sample_obj ~= nil
@@ -4042,13 +4248,7 @@ local function render_waveform()
     if hovered then
       r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_Hand())
     end
-
-    -- Continuously track mouse position during drag
-    local time_pos, track = get_drop_position()
-    if time_pos then
-      state.last_mouse_time_pos = time_pos
-      state.last_mouse_track = track
-    end
+    update_pending_drop_tracking()
   end
   
   -- Draw waveform background
@@ -4330,6 +4530,1848 @@ local function render_waveform()
     -- Show message if no tags
     r.ImGui_TextColored(ctx, 0xFF888888, "No tags")
   end
+end
+
+
+-- --- Sequencer track helpers -------------------------------------------------
+local function get_track_by_guid(track_guid)
+  if not track_guid or track_guid == "" then
+    return nil
+  end
+  local n = r.CountTracks(0)
+  for i = 0, n - 1 do
+    local tr = r.GetTrack(0, i)
+    if r.GetTrackGUID(tr) == track_guid then
+      return tr
+    end
+  end
+  return nil
+end
+
+local function get_project_tracks_list()
+  local tracks = {}
+  local n = r.CountTracks(0)
+  for i = 0, n - 1 do
+    local tr = r.GetTrack(0, i)
+    local _, name = r.GetTrackName(tr)
+    tracks[#tracks + 1] = {
+      track = tr,
+      guid = r.GetTrackGUID(tr),
+      name = name ~= "" and name or ("Track " .. (i + 1)),
+    }
+  end
+  return tracks
+end
+
+local function get_reaper_track_display_name(track_guid)
+  if not track_guid then
+    return nil
+  end
+  local tr = get_track_by_guid(track_guid)
+  if not tr then
+    return "(missing track)"
+  end
+  local _, name = r.GetTrackName(tr)
+  if name and name ~= "" then
+    return name
+  end
+  return "(unnamed track)"
+end
+
+local function find_sample_by_path(path)
+  if not path then
+    return nil
+  end
+  for _, s in ipairs(state.samples) do
+    if s.path == path then
+      return s
+    end
+  end
+  return nil
+end
+
+local function seq_track_has_guid(guid)
+  if not guid then
+    return false
+  end
+  for _, slot in ipairs(state.seq_tracks) do
+    if slot.reaper_track_guid == guid then
+      return true
+    end
+  end
+  return false
+end
+
+local function clamp_selected_seq_track()
+  if state.selected_seq_track and state.selected_seq_track > #state.seq_tracks then
+    state.selected_seq_track = #state.seq_tracks > 0 and #state.seq_tracks or nil
+  end
+  if state.selected_seq_track and state.selected_seq_track < 1 then
+    state.selected_seq_track = nil
+  end
+  if state.seq_swap_track_idx and state.seq_swap_track_idx > #state.seq_tracks then
+    state.seq_swap_track_idx = nil
+  end
+end
+
+local function add_seq_track_from_reaper_track(tr)
+  if not tr then
+    return nil
+  end
+  local guid = r.GetTrackGUID(tr)
+  if seq_track_has_guid(guid) then
+    return nil
+  end
+  local _, name = r.GetTrackName(tr)
+  local slot = {
+    id = state.seq_track_next_id,
+    name = name ~= "" and name or ("Track " .. (#state.seq_tracks + 1)),
+    reaper_track_guid = guid,
+    sample_path = nil,
+    sample_name = nil,
+  }
+  state.seq_track_next_id = state.seq_track_next_id + 1
+  table.insert(state.seq_tracks, slot)
+  state.selected_seq_track = #state.seq_tracks
+  return slot
+end
+
+local function add_empty_seq_track()
+  local slot = {
+    id = state.seq_track_next_id,
+    name = "Track " .. (#state.seq_tracks + 1),
+    reaper_track_guid = nil,
+    sample_path = nil,
+    sample_name = nil,
+  }
+  state.seq_track_next_id = state.seq_track_next_id + 1
+  table.insert(state.seq_tracks, slot)
+  state.selected_seq_track = #state.seq_tracks
+  return slot
+end
+
+local function remove_selected_seq_track()
+  if not state.selected_seq_track then
+    return
+  end
+  local removed_idx = state.selected_seq_track
+  local removed_slot = state.seq_tracks[removed_idx]
+  local removed_id = removed_slot and removed_slot.id
+  table.remove(state.seq_tracks, removed_idx)
+  if state.seq_swap_track_id and removed_id and state.seq_swap_track_id == removed_id then
+    state.seq_swap_track_idx = nil
+    state.seq_swap_track_id = nil
+    state.seq_swap_backup_path = nil
+    state.seq_swap_backup_name = nil
+  elseif state.seq_swap_track_idx and state.seq_swap_track_idx > removed_idx then
+    state.seq_swap_track_idx = state.seq_swap_track_idx - 1
+  end
+  if #state.seq_tracks == 0 then
+    state.selected_seq_track = nil
+  elseif state.selected_seq_track > #state.seq_tracks then
+    state.selected_seq_track = #state.seq_tracks
+  end
+  save_config()
+end
+
+local function assign_sample_to_seq_track(slot, sample, persist)
+  if not slot or not sample or not sample.path then
+    return false
+  end
+  slot.sample_path = sample.path
+  slot.sample_name = sample.name or basename(sample.path)
+  if persist == nil or persist then
+    save_config()
+  end
+  return true
+end
+
+local function seq_slot_in_swap_mode(slot)
+  if not state.seq_swap_track_id or not slot then
+    return false
+  end
+  return slot.id == state.seq_swap_track_id
+end
+
+local function find_seq_track_by_id(track_id)
+  if not track_id then
+    return nil, nil
+  end
+  for idx, slot in ipairs(state.seq_tracks) do
+    if slot.id == track_id then
+      return slot, idx
+    end
+  end
+  return nil, nil
+end
+
+local function begin_seq_swap_mode(idx)
+  local slot = state.seq_tracks[idx]
+  if not slot then
+    return
+  end
+  if state.seq_swap_track_id == slot.id then
+    state.seq_swap_track_idx = idx
+    return
+  end
+  if state.seq_swap_track_id and state.seq_swap_track_id ~= slot.id then
+    local prev_slot = find_seq_track_by_id(state.seq_swap_track_id)
+    if prev_slot then
+      prev_slot.sample_path = state.seq_swap_backup_path
+      prev_slot.sample_name = state.seq_swap_backup_name
+      save_config()
+    end
+    state.seq_swap_track_idx = nil
+    state.seq_swap_track_id = nil
+    state.seq_swap_backup_path = nil
+    state.seq_swap_backup_name = nil
+  end
+  state.seq_swap_track_idx = idx
+  state.seq_swap_track_id = slot.id
+  state.selected_seq_track = idx
+  state.seq_swap_backup_path = slot.sample_path
+  state.seq_swap_backup_name = slot.sample_name
+end
+
+local function end_seq_swap_mode(confirmed)
+  local slot, idx = find_seq_track_by_id(state.seq_swap_track_id)
+  if not slot then
+    state.seq_swap_track_idx = nil
+    state.seq_swap_track_id = nil
+    state.seq_swap_backup_path = nil
+    state.seq_swap_backup_name = nil
+    return
+  end
+  state.seq_swap_track_idx = idx
+  if confirmed then
+    save_config()
+  else
+    slot.sample_path = state.seq_swap_backup_path
+    slot.sample_name = state.seq_swap_backup_name
+    save_config()
+    if slot.sample_path then
+      local restored = find_sample_by_path(slot.sample_path)
+      if restored then
+        preview_sample(restored)
+      end
+    end
+  end
+  state.seq_swap_track_idx = nil
+  state.seq_swap_track_id = nil
+  state.seq_swap_backup_path = nil
+  state.seq_swap_backup_name = nil
+end
+
+local function get_active_swap_slot()
+  local slot, idx = find_seq_track_by_id(state.seq_swap_track_id)
+  if not slot then
+    return nil, nil
+  end
+  state.seq_swap_track_idx = idx
+  return slot, idx
+end
+
+local function complete_pending_sample_drop()
+  if not state.pending_waveform_drop or r.ImGui_IsMouseDown(ctx, 0) then
+    return
+  end
+
+  local sample = state.pending_waveform_drop
+  log("Mouse released globally, completing drag operation")
+
+  if state.seq_drop_target_idx then
+    local slot = state.seq_tracks[state.seq_drop_target_idx]
+    if slot and sample.path then
+      local in_swap = state.seq_swap_track_id and slot.id == state.seq_swap_track_id
+      slot.sample_path = sample.path
+      slot.sample_name = sample.name or basename(sample.path)
+      state.selected_seq_track = state.seq_drop_target_idx
+      if not in_swap then
+        save_config()
+      end
+      log("Assigned '" .. (sample.name or sample.path) .. "' to " .. slot.name)
+    end
+  elseif state.last_mouse_time_pos then
+    log("Dropping at tracked position: " .. string.format("%.3f", state.last_mouse_time_pos))
+    local success = insert_sample_at_position(sample, state.last_mouse_time_pos, state.last_mouse_track)
+    if success then
+      log("Successfully completed drag-and-drop")
+    else
+      log("Failed to complete drag-and-drop")
+    end
+  else
+    local drop_time, drop_track = get_drop_position()
+    if drop_time then
+      log("Dropping at release position: " .. string.format("%.3f", drop_time))
+      insert_sample_at_position(sample, drop_time, drop_track)
+    else
+      log("No tracked mouse position, using cursor position")
+      insert_sample_at_cursor(sample)
+    end
+  end
+
+  state.pending_waveform_drop = nil
+  state.last_mouse_time_pos = nil
+  state.last_mouse_track = nil
+  state.seq_drop_target_idx = nil
+  state.is_left_dragging = false
+  state.last_dragged_sample_path = nil
+end
+
+local function render_playback_controls()
+  -- Check if preview is currently playing
+  local is_playing = preview_proc ~= nil and preview_sample_obj ~= nil
+  local current_pos = get_preview_position()
+
+  -- Play/Pause button
+  if is_playing and current_pos ~= nil then
+    -- Show pause button (which will actually stop, since REAPER preview doesn't support pause)
+    if r.ImGui_Button(ctx, "Pause") then
+      stop_preview()
+      state.preview_paused = true
+    end
+  else
+    -- Show play button
+    if r.ImGui_Button(ctx, "Play") then
+      if preview_sample_obj then
+        -- Resume from current position if paused, otherwise start from beginning
+        local start_time = state.preview_paused and (current_pos or 0.0) or 0.0
+        preview_sample(preview_sample_obj, start_time)
+        state.preview_paused = false
+      end
+    end
+  end
+
+  r.ImGui_SameLine(ctx)
+
+  -- Stop button
+  if r.ImGui_Button(ctx, "Stop") then
+    stop_preview()
+    state.preview_paused = false
+  end
+
+  r.ImGui_SameLine(ctx)
+
+  -- Volume control
+  r.ImGui_Text(ctx, "Volume:")
+  r.ImGui_SameLine(ctx)
+  local ret, vol = r.ImGui_SliderDouble(ctx, "##volume", state.preview_volume, 0.0, 1.0, "%.2f", 0)
+  if ret then
+    state.preview_volume = math.max(0.0, math.min(1.0, vol))
+    save_config()  -- Save volume setting
+    -- If currently playing, restart with new volume (REAPER preview volume is set at start)
+    if is_playing and preview_sample_obj then
+      local resume_pos = current_pos or 0.0
+      local sample_to_resume = preview_sample_obj  -- Preserve sample object
+      stop_preview()
+      preview_sample(sample_to_resume, resume_pos)
+    end
+  end
+
+  -- Show current playback position and duration
+  if preview_sample_obj then
+    local duration = preview_sample_obj.duration or 0.0
+    local pos = current_pos or 0.0
+    if pos > duration then pos = duration end
+    r.ImGui_SameLine(ctx)
+    r.ImGui_Text(ctx, string.format("%.2fs / %.2fs", pos, duration))
+  end
+end
+local function clear_seq_track_sample(slot)
+  if not slot then
+    return
+  end
+  slot.sample_path = nil
+  slot.sample_name = nil
+  save_config()
+end
+
+local function add_seq_tracks_from_selection()
+  local count = r.CountSelectedTracks(0)
+  if count == 0 then
+    add_empty_seq_track()
+    save_config()
+    return
+  end
+  local added = 0
+  for i = 0, count - 1 do
+    local tr = r.GetSelectedTrack(0, i)
+    if add_seq_track_from_reaper_track(tr) then
+      added = added + 1
+    end
+  end
+  if added == 0 then
+    log("Selected project tracks are already in the sequencer track list")
+  else
+    save_config()
+  end
+end
+
+local function get_selected_seq_track()
+  clamp_selected_seq_track()
+  if not state.selected_seq_track then
+    return nil
+  end
+  return state.seq_tracks[state.selected_seq_track]
+end
+
+-- Exposed for the upcoming sequencer UI
+function SampleMapBrowser_GetSeqTracks()
+  return state.seq_tracks
+end
+
+function SampleMapBrowser_GetSelectedSeqTrack()
+  return get_selected_seq_track()
+end
+
+function SampleMapBrowser_GetSeqTrackSample(slot)
+  if not slot or not slot.sample_path then
+    return nil
+  end
+  return find_sample_by_path(slot.sample_path)
+end
+
+local function get_sample_dot_color(sample)
+  if not sample then
+    return build_color_rrgbbaa(96, 96, 96, 255)
+  end
+
+  local color = build_color_rrgbbaa(extract_rgb(state.dot_color or 0x44AA55))
+  if sample.tags and type(sample.tags) == "table" and #sample.tags > 0 then
+    local best_tag = nil
+    local best_weight = 0
+    for _, tag_name in ipairs(sample.tags) do
+      for _, keyword_entry in ipairs(TAG_KEYWORDS) do
+        if keyword_entry.tag == tag_name and keyword_entry.weight > best_weight then
+          best_weight = keyword_entry.weight
+          best_tag = tag_name
+        end
+      end
+    end
+    if best_tag and state.tag_colors[best_tag] then
+      local tr, tg, tb = extract_rgb(state.tag_colors[best_tag])
+      color = build_color_rrgbbaa(tr, tg, tb, 255)
+    end
+  end
+
+  if sample.channels == 1 then
+    local base_r, base_g, base_b = extract_rgb_rrgbbaa(color)
+    color = build_color_rrgbbaa(
+      math.min(255, math.floor(base_r * 1.5)),
+      math.min(255, math.floor(base_g * 1.5)),
+      math.min(255, math.floor(base_b * 1.5)),
+      255
+    )
+  end
+
+  return color
+end
+
+local function find_map_neighbor_sample(current, direction)
+  if not current or not current.path then
+    return nil
+  end
+
+  local cx = current.x or 0.5
+  local cy = current.y or 0.5
+  local best = nil
+  local best_dist = math.huge
+
+  for _, s in ipairs(state.samples) do
+    if s.path and s.path ~= current.path and s.x and s.y then
+      if direction < 0 then
+        local dx = cx - s.x
+        if dx > 1e-5 then
+          local dist = dx * dx + (cy - s.y) * (cy - s.y)
+          if dist < best_dist then
+            best_dist = dist
+            best = s
+          end
+        end
+      else
+        local dx = s.x - cx
+        if dx > 1e-5 then
+          local dist = dx * dx + (cy - s.y) * (cy - s.y)
+          if dist < best_dist then
+            best_dist = dist
+            best = s
+          end
+        end
+      end
+    end
+  end
+
+  return best
+end
+
+local function swap_seq_track_sample_neighbor(slot, direction)
+  if not slot or not slot.sample_path then
+    return false
+  end
+
+  local current = find_sample_by_path(slot.sample_path)
+  if not current then
+    return false
+  end
+
+  local neighbor = find_map_neighbor_sample(current, direction)
+  if not neighbor then
+    log("No similar sample " .. (direction < 0 and "to the left" or "to the right") .. " on the map")
+    return false
+  end
+
+  assign_sample_to_seq_track(slot, neighbor, not seq_slot_in_swap_mode(slot))
+  preview_sample(neighbor)
+  return true
+end
+
+local swap_bar_open = true
+
+local function render_swap_mode_bar(main_x, main_y, main_w)
+  if not state.seq_swap_track_id then
+    return
+  end
+
+  local slot = nil
+  local idx = nil
+  if get_active_swap_slot then
+    slot, idx = get_active_swap_slot()
+  end
+  if not slot then
+    state.seq_swap_track_idx = nil
+    state.seq_swap_track_id = nil
+    state.seq_swap_backup_path = nil
+    state.seq_swap_backup_name = nil
+    return
+  end
+  state.seq_swap_track_idx = idx
+
+  local bar_x = main_x + main_w * 0.5
+  local bar_y = main_y + 72
+  r.ImGui_SetNextWindowPos(ctx, bar_x, bar_y, r.ImGui_Cond_Always(), 0.5, 0.0)
+
+  local flags = r.ImGui_WindowFlags_NoDecoration() | r.ImGui_WindowFlags_AlwaysAutoResize() |
+                r.ImGui_WindowFlags_NoSavedSettings() | r.ImGui_WindowFlags_NoNav()
+  if r.ImGui_WindowFlags_NoDocking then
+    flags = flags | r.ImGui_WindowFlags_NoDocking()
+  end
+  if r.ImGui_WindowFlags_NoFocusOnAppearing then
+    flags = flags | r.ImGui_WindowFlags_NoFocusOnAppearing()
+  end
+  r.ImGui_PushStyleColor(ctx, r.ImGui_Col_WindowBg(), 0x2A2A2AF0)
+  r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowRounding(), 8)
+  r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), 10, 8)
+
+  swap_bar_open = true
+  if r.ImGui_Begin(ctx, "Sample Swap Bar##sample_swap_bar", swap_bar_open, flags) then
+    r.ImGui_Text(ctx, "Swap sample:")
+    r.ImGui_SameLine(ctx)
+    r.ImGui_TextColored(ctx, 0xFF88CCFF, slot.name)
+    r.ImGui_SameLine(ctx)
+
+    if state.block_swap_bar_input then
+      r.ImGui_BeginDisabled(ctx)
+    end
+
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0xAA3333FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), 0xCC4444FF)
+    if r.ImGui_Button(ctx, "X##swap_cancel", 28, 26) then
+      end_seq_swap_mode(false)
+    end
+    r.ImGui_PopStyleColor(ctx, 2)
+    if r.ImGui_IsItemHovered(ctx) then
+      r.ImGui_SetTooltip(ctx, "Cancel and restore original sample")
+    end
+
+    r.ImGui_SameLine(ctx)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x338833FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), 0x44AA44FF)
+    if r.ImGui_Button(ctx, "✓##swap_confirm", 28, 26) then
+      end_seq_swap_mode(true)
+    end
+    r.ImGui_PopStyleColor(ctx, 2)
+    if r.ImGui_IsItemHovered(ctx) then
+      r.ImGui_SetTooltip(ctx, "Confirm sample assignment")
+    end
+
+    if state.block_swap_bar_input then
+      r.ImGui_EndDisabled(ctx)
+    end
+  end
+  r.ImGui_End(ctx)
+  r.ImGui_PopStyleVar(ctx, 2)
+  r.ImGui_PopStyleColor(ctx, 1)
+end
+
+local function draw_sample_dot_control(sample, id_suffix, is_swap_active)
+  local size = 22.0
+  r.ImGui_InvisibleButton(ctx, "seq_dot_" .. id_suffix, size, size)
+  local clicked = r.ImGui_IsItemClicked(ctx, 0)
+  local hovered = r.ImGui_IsItemHovered(ctx)
+  local dl = r.ImGui_GetWindowDrawList(ctx)
+  local min_x, min_y = r.ImGui_GetItemRectMin(ctx)
+  local max_x, max_y = r.ImGui_GetItemRectMax(ctx)
+  local cx = (min_x + max_x) * 0.5
+  local cy = (min_y + max_y) * 0.5
+  local radius = 6.0
+  local fill = get_sample_dot_color(sample)
+  local ring_color = is_swap_active and 0xFFFFFFFF or 0x666666FF
+  local ring_radius = radius + (is_swap_active and 2.5 or 1.0)
+  local ring_thickness = is_swap_active and 2.0 or 1.0
+
+  if sample then
+    r.ImGui_DrawList_AddCircleFilled(dl, cx, cy, radius, fill, 24)
+  end
+  r.ImGui_DrawList_AddCircle(dl, cx, cy, ring_radius, ring_color, 24, ring_thickness)
+
+  if hovered then
+    if is_swap_active then
+      r.ImGui_SetTooltip(ctx, "Sample swap mode active\nClick map samples to swap")
+    elseif sample then
+      r.ImGui_SetTooltip(ctx, (sample.name or basename(sample.path)) .. "\nClick for sample swap mode")
+    else
+      r.ImGui_SetTooltip(ctx, "No sample assigned\nClick for sample swap mode")
+    end
+  end
+
+  return clicked, hovered
+end
+
+
+local function render_seq_tracks_panel()
+  r.ImGui_Text(ctx, "Sequencer Tracks")
+  r.ImGui_Separator(ctx)
+
+  if r.ImGui_Button(ctx, "Add selected##seq_add_sel") then
+    add_seq_tracks_from_selection()
+  end
+  if r.ImGui_IsItemHovered(ctx) then
+    r.ImGui_SetTooltip(ctx, "Add slot(s) from selected project track(s)")
+  end
+
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "Add##seq_add_empty") then
+    add_empty_seq_track()
+    save_config()
+  end
+  if r.ImGui_IsItemHovered(ctx) then
+    r.ImGui_SetTooltip(ctx, "Add an empty track slot")
+  end
+
+  r.ImGui_SameLine(ctx)
+  local remove_disabled = not state.selected_seq_track
+  if remove_disabled then
+    r.ImGui_BeginDisabled(ctx)
+  end
+  if r.ImGui_Button(ctx, "Remove##seq_remove") then
+    remove_selected_seq_track()
+  end
+  if remove_disabled then
+    r.ImGui_EndDisabled(ctx)
+  end
+
+  r.ImGui_Separator(ctx)
+
+  state.seq_drop_target_idx = nil
+
+  local child_flags = 0
+  if r.ImGui_ChildFlags_Border then
+    child_flags = r.ImGui_ChildFlags_Border
+  end
+  local list_height = r.ImGui_GetContentRegionAvail(ctx)
+  if r.ImGui_BeginChild(ctx, "seq_track_list", 0, list_height, child_flags) then
+    if #state.seq_tracks == 0 then
+      r.ImGui_TextColored(ctx, 0xFF888888, "No tracks yet.\nAdd from project or empty slot.\n\nAlt+drag a sample dot here to assign.")
+    else
+      for idx, slot in ipairs(state.seq_tracks) do
+        local selected = state.selected_seq_track == idx
+        local swap_active = state.seq_swap_track_id and state.seq_swap_track_id == slot.id
+        local assigned_sample = slot.sample_path and find_sample_by_path(slot.sample_path) or nil
+        local linked_name = get_reaper_track_display_name(slot.reaper_track_guid)
+        local sample_label = slot.sample_name or "(no sample)"
+        if #sample_label > 22 then
+          sample_label = sample_label:sub(1, 19) .. "..."
+        end
+
+        r.ImGui_PushID(ctx, slot.id)
+
+        local row_x, row_y = r.ImGui_GetCursorScreenPos(ctx)
+        local row_drop_hovered = false
+
+        if swap_active then
+          r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), 0x335588AA)
+        end
+
+        local avail_w = r.ImGui_GetContentRegionAvail(ctx)
+
+        if r.ImGui_Selectable(ctx, slot.name .. "##seq_name_" .. slot.id, selected and not swap_active, 0, avail_w, 0) then
+          if not state.pending_waveform_drop then
+            state.selected_seq_track = idx
+            save_config()
+          end
+        end
+        if state.pending_waveform_drop and r.ImGui_IsItemHovered(ctx) then
+          row_drop_hovered = true
+        end
+
+        if linked_name and linked_name ~= slot.name then
+          r.ImGui_TextColored(ctx, 0xFF888888, "  " .. linked_name)
+          if state.pending_waveform_drop and r.ImGui_IsItemHovered(ctx) then
+            row_drop_hovered = true
+          end
+        end
+
+        local ctrl_size = 20.0
+        local can_nav = assigned_sample ~= nil
+        if not can_nav then
+          r.ImGui_BeginDisabled(ctx)
+        end
+        if r.ImGui_Button(ctx, "<##seq_left_" .. slot.id, ctrl_size, ctrl_size) then
+          swap_seq_track_sample_neighbor(slot, -1)
+        end
+        if r.ImGui_IsItemHovered(ctx) then
+          r.ImGui_SetTooltip(ctx, "Previous similar sample on map")
+        end
+        if state.pending_waveform_drop and r.ImGui_IsItemHovered(ctx) then
+          row_drop_hovered = true
+        end
+        if not can_nav then
+          r.ImGui_EndDisabled(ctx)
+        end
+
+        r.ImGui_SameLine(ctx)
+        local dot_clicked, dot_hovered = draw_sample_dot_control(assigned_sample, slot.id, swap_active)
+        if dot_clicked and not state.pending_waveform_drop then
+          if not swap_active then
+            begin_seq_swap_mode(idx)
+          end
+        end
+        if state.pending_waveform_drop and dot_hovered then
+          row_drop_hovered = true
+        end
+
+        r.ImGui_SameLine(ctx)
+        if not can_nav then
+          r.ImGui_BeginDisabled(ctx)
+        end
+        if r.ImGui_Button(ctx, ">##seq_right_" .. slot.id, ctrl_size, ctrl_size) then
+          swap_seq_track_sample_neighbor(slot, 1)
+        end
+        if r.ImGui_IsItemHovered(ctx) then
+          r.ImGui_SetTooltip(ctx, "Next similar sample on map")
+        end
+        if state.pending_waveform_drop and r.ImGui_IsItemHovered(ctx) then
+          row_drop_hovered = true
+        end
+        if not can_nav then
+          r.ImGui_EndDisabled(ctx)
+        end
+
+        r.ImGui_SameLine(ctx)
+        r.ImGui_AlignTextToFramePadding(ctx)
+        r.ImGui_TextColored(ctx, assigned_sample and 0xFFCCCCCC or 0xFF666666, sample_label)
+        if state.pending_waveform_drop and r.ImGui_IsItemHovered(ctx) then
+          row_drop_hovered = true
+        end
+
+        if swap_active then
+          r.ImGui_PopStyleColor(ctx, 1)
+        end
+
+        local _, row_end_y = r.ImGui_GetCursorScreenPos(ctx)
+        if state.pending_waveform_drop and row_drop_hovered then
+          state.seq_drop_target_idx = idx
+          local row_dl = r.ImGui_GetWindowDrawList(ctx)
+          r.ImGui_DrawList_AddRectFilled(row_dl, row_x, row_y, row_x + avail_w, row_end_y, 0x4488FF55, 4)
+        end
+
+        r.ImGui_Separator(ctx)
+        r.ImGui_PopID(ctx)
+      end
+    end
+    r.ImGui_EndChild(ctx)
+  end
+end
+
+local function get_arrange_view_range()
+  if r.GetSet_ArrangeView2 then
+    local a, b, c, d = r.GetSet_ArrangeView2(0, false, 0, 0, 0, 0)
+    local start_time = nil
+    local end_time = nil
+    if type(a) == "number" and type(b) == "number" then
+      start_time, end_time = a, b
+    elseif type(c) == "number" and type(d) == "number" then
+      start_time, end_time = c, d
+    end
+    if start_time and end_time and end_time > start_time then
+      return start_time, end_time
+    end
+  end
+  local cursor = r.GetCursorPosition()
+  return math.max(0.0, cursor - 4.0), cursor + 12.0
+end
+
+local function get_project_grid_step_qn()
+  local step_qn = 0.25
+  if r.GetSetProjectGrid then
+    local _, div = r.GetSetProjectGrid(0, false)
+    if type(div) == "number" and div > 0.000001 then
+      step_qn = math.abs(div)
+    end
+  end
+  return step_qn
+end
+
+local function time_to_qn(time_pos)
+  if r.TimeMap2_timeToQN then
+    return r.TimeMap2_timeToQN(0, time_pos)
+  elseif r.TimeMap_timeToQN then
+    return r.TimeMap_timeToQN(time_pos)
+  end
+  return nil
+end
+
+local function qn_to_time(qn)
+  if r.TimeMap2_QNToTime then
+    return r.TimeMap2_QNToTime(0, qn)
+  elseif r.TimeMap_QNToTime then
+    return r.TimeMap_QNToTime(qn)
+  end
+  return nil
+end
+
+local function get_visible_qn_grid_range(qn_start_raw, qn_end_raw)
+  local step_qn = (type(state.seq_grid_qn) == "number" and state.seq_grid_qn > 0) and state.seq_grid_qn or get_project_grid_step_qn()
+  qn_start_raw = qn_start_raw or 0.0
+  qn_end_raw = qn_end_raw or (qn_start_raw + step_qn * 16.0)
+  if qn_end_raw <= qn_start_raw then
+    qn_end_raw = qn_start_raw + step_qn * 16.0
+  end
+
+  local start_qn = math.floor((qn_start_raw / step_qn) + 1e-9) * step_qn
+  local end_qn = math.ceil((qn_end_raw / step_qn) - 1e-9) * step_qn
+  if end_qn <= start_qn then
+    end_qn = start_qn + step_qn
+  end
+
+  local step_count = math.max(1, math.floor(((end_qn - start_qn) / step_qn) + 0.5))
+  local max_steps = 768
+  if step_count > max_steps then
+    local mult = math.ceil(step_count / max_steps)
+    step_qn = step_qn * mult
+    start_qn = math.floor((qn_start_raw / step_qn) + 1e-9) * step_qn
+    end_qn = math.ceil((qn_end_raw / step_qn) - 1e-9) * step_qn
+    if end_qn <= start_qn then
+      end_qn = start_qn + step_qn
+    end
+    step_count = math.max(1, math.floor(((end_qn - start_qn) / step_qn) + 0.5))
+  end
+
+  return start_qn, end_qn, step_qn, step_count
+end
+
+local function get_seq_slot_target_track(slot)
+  if not slot then
+    return nil
+  end
+  if slot.reaper_track_guid then
+    local tr = get_track_by_guid(slot.reaper_track_guid)
+    if tr then
+      return tr
+    end
+  end
+  local tr = r.GetSelectedTrack(0, 0)
+  if tr then
+    return tr
+  end
+  if r.CountTracks(0) > 0 then
+    return r.GetTrack(0, 0)
+  end
+  return nil
+end
+
+local function collect_seq_item_cells(start_qn, end_qn, step_qn, step_count)
+  local occupied_any = {}
+  local occupied_match = {}
+
+  for idx, slot in ipairs(state.seq_tracks) do
+    occupied_any[idx] = {}
+    occupied_match[idx] = {}
+
+    local tr = get_seq_slot_target_track(slot)
+    if tr then
+      local item_count = r.CountTrackMediaItems(tr)
+      local expected_path = nil
+      if slot.sample_path and slot.sample_path ~= "" then
+        expected_path = normalize_path(slot.sample_path)
+      end
+
+      for item_idx = 0, item_count - 1 do
+        local item = r.GetTrackMediaItem(tr, item_idx)
+        if item then
+          local item_time = r.GetMediaItemInfo_Value(item, "D_POSITION")
+          local item_qn = time_to_qn(item_time)
+          if item_qn then
+            local col = math.floor(((item_qn - start_qn) / step_qn) + 0.5)
+            if col >= 0 and col < step_count then
+              occupied_any[idx][col] = true
+              if not expected_path then
+                occupied_match[idx][col] = true
+              else
+                local take = r.GetActiveTake(item)
+                local src = take and r.GetMediaItemTake_Source(take) or nil
+                if src and r.GetMediaSourceFileName then
+                  local _, src_path = r.GetMediaSourceFileName(src, "")
+                  if src_path and normalize_path(src_path) == expected_path then
+                    occupied_match[idx][col] = true
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  return occupied_any, occupied_match
+end
+
+local function remove_seq_items_in_cell(slot, start_qn, step_qn, col)
+  local tr = get_seq_slot_target_track(slot)
+  if not tr then
+    return 0
+  end
+
+  local removed = 0
+
+  for item_idx = r.CountTrackMediaItems(tr) - 1, 0, -1 do
+    local item = r.GetTrackMediaItem(tr, item_idx)
+    if item then
+      local item_time = r.GetMediaItemInfo_Value(item, "D_POSITION")
+      local item_qn = time_to_qn(item_time)
+      if item_qn then
+        local item_col = math.floor(((item_qn - start_qn) / step_qn) + 0.5)
+        if item_col == col then
+          if r.DeleteTrackMediaItem(tr, item) then
+            removed = removed + 1
+          end
+        end
+      end
+    end
+  end
+
+  if removed > 0 then
+    r.UpdateArrange()
+  end
+  return removed
+end
+
+local SEQ_EXT_FLAG = "P_EXT:SampleMapSeq"
+local SEQ_EXT_REGION = "P_EXT:SampleMapSeqRegion"
+local SEQ_EXT_PATTERN = "P_EXT:SampleMapSeqPattern"
+local SEQ_EXT_TRACK = "P_EXT:SampleMapSeqTrack"
+local SEQ_EXT_STEP = "P_EXT:SampleMapSeqStep"
+
+local function get_item_ext(item, key)
+  if not item or not r.GetSetMediaItemInfo_String then
+    return nil
+  end
+  local ok, value = r.GetSetMediaItemInfo_String(item, key, "", false)
+  if ok then
+    return value
+  end
+  return nil
+end
+
+local function set_item_ext(item, key, value)
+  if item and r.GetSetMediaItemInfo_String then
+    r.GetSetMediaItemInfo_String(item, key, tostring(value or ""), true)
+  end
+end
+
+local function begin_seq_undo(label)
+  if r.Undo_BeginBlock2 then
+    r.Undo_BeginBlock2(0)
+  elseif r.Undo_BeginBlock then
+    r.Undo_BeginBlock()
+  end
+  return label or "Sample Map Sequencer edit"
+end
+
+local function end_seq_undo(label)
+  if r.Undo_EndBlock2 then
+    r.Undo_EndBlock2(0, label or "Sample Map Sequencer edit", -1)
+  elseif r.Undo_EndBlock then
+    r.Undo_EndBlock(label or "Sample Map Sequencer edit", -1)
+  end
+end
+
+local function alloc_seq_pattern()
+  local id = state.seq_pattern_next_id
+  state.seq_pattern_next_id = state.seq_pattern_next_id + 1
+  state.seq_patterns[tostring(id)] = state.seq_patterns[tostring(id)] or { notes = {} }
+  return id
+end
+
+local function alloc_seq_pool()
+  local id = state.seq_pool_next_id
+  state.seq_pool_next_id = state.seq_pool_next_id + 1
+  return id
+end
+
+local function get_seq_pattern(pattern_id, create)
+  if not pattern_id then
+    return nil
+  end
+  local key = tostring(pattern_id)
+  if not state.seq_patterns[key] and create then
+    state.seq_patterns[key] = { notes = {} }
+  end
+  local pattern = state.seq_patterns[key]
+  if pattern and type(pattern.notes) ~= "table" then
+    pattern.notes = {}
+  end
+  return pattern
+end
+
+local function get_seq_region_by_id(region_id)
+  if not region_id then
+    return nil
+  end
+  for _, region in ipairs(state.seq_regions) do
+    if region.id == region_id then
+      return region
+    end
+  end
+  return nil
+end
+
+local function get_seq_region_length_qn(region)
+  if not region then
+    return 16.0
+  end
+  local bars = math.max(1, math.floor(region.length_bars or 4))
+  if r.TimeMap_GetMeasureInfo and r.TimeMap2_timeToBeats then
+    local start_time = qn_to_time(region.start_qn or 0.0)
+    if start_time then
+      local _, measure = r.TimeMap2_timeToBeats(0, start_time)
+      if measure then
+        local _, qn_start = r.TimeMap_GetMeasureInfo(0, measure)
+        local _, qn_end = r.TimeMap_GetMeasureInfo(0, measure + bars)
+        if qn_start and qn_end and qn_end > qn_start then
+          return qn_end - qn_start
+        end
+      end
+    end
+  end
+  return bars * 4.0
+end
+
+local function ensure_default_seq_region()
+  if #state.seq_regions > 0 then
+    if not get_seq_region_by_id(state.selected_seq_region_id) then
+      state.selected_seq_region_id = state.seq_regions[1].id
+    end
+    return state.seq_regions[1]
+  end
+
+  local arrange_start, arrange_end = get_arrange_view_range()
+  local start_qn = time_to_qn(arrange_start) or 0.0
+  local pattern_id = alloc_seq_pattern()
+  local region = {
+    id = state.seq_region_next_id,
+    name = "Region 1",
+    start_qn = start_qn,
+    length_bars = 4,
+    pool_id = alloc_seq_pool(),
+    pattern_id = pattern_id,
+  }
+  state.seq_region_next_id = state.seq_region_next_id + 1
+  table.insert(state.seq_regions, region)
+  state.selected_seq_region_id = region.id
+  state.seq_view_start_qn = start_qn
+  local span_qn = math.max(get_project_grid_step_qn(), (time_to_qn(arrange_end) or (start_qn + 16.0)) - start_qn)
+  state.seq_view_span_qn = span_qn
+  save_config()
+  return region
+end
+
+local function get_selected_seq_region()
+  ensure_default_seq_region()
+  return get_seq_region_by_id(state.selected_seq_region_id) or state.seq_regions[1]
+end
+
+local function get_track_note_table(pattern, track_id, create)
+  if not pattern then
+    return nil
+  end
+  pattern.notes = pattern.notes or {}
+  local key = tostring(track_id)
+  if not pattern.notes[key] and create then
+    pattern.notes[key] = {}
+  end
+  return pattern.notes[key]
+end
+
+local function get_seq_track_settings(pattern, track_id, create)
+  if not pattern then
+    return nil
+  end
+  pattern.track_settings = pattern.track_settings or {}
+  local key = tostring(track_id)
+  if not pattern.track_settings[key] and create then
+    pattern.track_settings[key] = {
+      probability = 1.0,
+      humanize_ms = 0.0,
+      seed = math.floor((r.time_precise() or os.clock()) * 1000000) % 1000000,
+    }
+  end
+  return pattern.track_settings[key]
+end
+
+local function get_seq_note(region, track_id, step_key)
+  local pattern = region and get_seq_pattern(region.pattern_id, false)
+  local notes = get_track_note_table(pattern, track_id, false)
+  return notes and notes[tostring(step_key)] or nil
+end
+
+local function set_seq_note(region, track_id, step_key, note)
+  local pattern = region and get_seq_pattern(region.pattern_id, true)
+  local notes = get_track_note_table(pattern, track_id, true)
+  notes[tostring(step_key)] = note
+end
+
+local function delete_seq_note(region, track_id, step_key)
+  local pattern = region and get_seq_pattern(region.pattern_id, false)
+  local notes = get_track_note_table(pattern, track_id, false)
+  if notes then
+    notes[tostring(step_key)] = nil
+  end
+end
+
+local function clone_table_deep(src)
+  if type(src) ~= "table" then
+    return src
+  end
+  local out = {}
+  for k, v in pairs(src) do
+    out[k] = clone_table_deep(v)
+  end
+  return out
+end
+
+local function seq_item_is_owned(item, region_id)
+  if get_item_ext(item, SEQ_EXT_FLAG) ~= "1" then
+    return false
+  end
+  if region_id and tonumber(get_item_ext(item, SEQ_EXT_REGION) or "") ~= region_id then
+    return false
+  end
+  return true
+end
+
+local function remove_seq_rendered_items(region)
+  local removed = 0
+  local region_id = region and region.id or nil
+  local tr_count = r.CountTracks(0)
+  for tr_idx = 0, tr_count - 1 do
+    local tr = r.GetTrack(0, tr_idx)
+    for item_idx = r.CountTrackMediaItems(tr) - 1, 0, -1 do
+      local item = r.GetTrackMediaItem(tr, item_idx)
+      if item and seq_item_is_owned(item, region_id) then
+        if r.DeleteTrackMediaItem(tr, item) then
+          removed = removed + 1
+        end
+      end
+    end
+  end
+  return removed
+end
+
+local function apply_seq_note_params(item, take, note)
+  if item then
+    r.SetMediaItemInfo_Value(item, "D_VOL", note.volume or 1.0)
+  end
+  if take then
+    r.SetMediaItemTakeInfo_Value(take, "D_VOL", note.volume or 1.0)
+    r.SetMediaItemTakeInfo_Value(take, "D_PAN", note.pan or 0.0)
+    r.SetMediaItemTakeInfo_Value(take, "D_PITCH", note.pitch or 0.0)
+  end
+end
+
+local function insert_seq_note_item(region, slot, track_id, step_key, note)
+  if not region or not slot or not note or not note.sample_path then
+    return nil
+  end
+  if not r.file_exists(note.sample_path) then
+    log("Sequencer sample missing: " .. tostring(note.sample_path))
+    return nil
+  end
+
+  local tr = get_seq_slot_target_track(slot)
+  if not tr then
+    log("No target track for sequencer note")
+    return nil
+  end
+
+  local pattern = get_seq_pattern(region.pattern_id, false)
+  local track_settings = get_seq_track_settings(pattern, track_id, false) or {}
+  local probability = track_settings.probability or 1.0
+  local random_seed = track_settings.seed or 0
+  if probability < 1.0 then
+    local seed = random_seed + (region.id or 1) * 73856093 + (tonumber(track_id) or 1) * 19349663 + (tonumber(step_key) or 1) * 83492791
+    local pseudo = math.abs(math.sin(seed) * 10000.0) % 1.0
+    if pseudo > probability then
+      return nil
+    end
+  end
+
+  local start_qn = (region.start_qn or 0.0) + (note.qn_offset or 0.0) + (note.offset_qn or 0.0)
+  local end_qn = start_qn + math.max(0.001, note.length_qn or state.seq_grid_qn or 0.25)
+  local start_time = qn_to_time(start_qn)
+  local end_time = qn_to_time(end_qn)
+  if not start_time or not end_time or end_time <= start_time then
+    return nil
+  end
+
+  local humanize_ms = track_settings.humanize_ms or 0.0
+  if humanize_ms > 0.0 then
+    local seed = random_seed + (region.id or 1) * 2654435761 + (tonumber(track_id) or 1) * 1013904223 + (tonumber(step_key) or 1) * 374761393
+    local centered = ((math.abs(math.sin(seed) * 10000.0) % 1.0) * 2.0) - 1.0
+    start_time = math.max(0.0, start_time + centered * (humanize_ms / 1000.0))
+  end
+
+  local item = r.AddMediaItemToTrack(tr)
+  if not item then
+    return nil
+  end
+  r.SetMediaItemPosition(item, start_time, false)
+  r.SetMediaItemLength(item, end_time - start_time, false)
+
+  local take = r.AddTakeToMediaItem(item)
+  if take then
+    local src = r.PCM_Source_CreateFromFile(note.sample_path)
+    if src then
+      r.SetMediaItemTake_Source(take, src)
+      set_item_name(item, take, note.sample_path)
+      apply_seq_note_params(item, take, note)
+    end
+  end
+
+  set_item_ext(item, SEQ_EXT_FLAG, "1")
+  set_item_ext(item, SEQ_EXT_REGION, region.id)
+  set_item_ext(item, SEQ_EXT_PATTERN, region.pattern_id)
+  set_item_ext(item, SEQ_EXT_TRACK, track_id)
+  set_item_ext(item, SEQ_EXT_STEP, step_key)
+  rebuild_peaks_for_item(item)
+  return item
+end
+
+local function sync_seq_region(region)
+  if not region then
+    return
+  end
+  remove_seq_rendered_items(region)
+
+  local pattern = get_seq_pattern(region.pattern_id, false)
+  if not pattern or type(pattern.notes) ~= "table" then
+    r.UpdateArrange()
+    return
+  end
+
+  for _, slot in ipairs(state.seq_tracks) do
+    local track_notes = get_track_note_table(pattern, slot.id, false)
+    if track_notes then
+      for step_key, note in pairs(track_notes) do
+        if type(note) == "table" and note.enabled ~= false then
+          insert_seq_note_item(region, slot, slot.id, step_key, note)
+        end
+      end
+    end
+  end
+  r.UpdateArrange()
+end
+
+local function sync_seq_pattern_regions(pattern_id)
+  for _, region in ipairs(state.seq_regions) do
+    if region.pattern_id == pattern_id then
+      sync_seq_region(region)
+    end
+  end
+end
+
+local function sync_selected_seq_region()
+  local region = get_selected_seq_region()
+  if region then
+    sync_seq_pattern_regions(region.pattern_id)
+  end
+end
+
+local function create_seq_region(length_bars, copy_from, pooled)
+  local start_qn = 0.0
+  if copy_from then
+    start_qn = (copy_from.start_qn or 0.0) + get_seq_region_length_qn(copy_from)
+  else
+    local arrange_start = select(1, get_arrange_view_range())
+    start_qn = time_to_qn(arrange_start) or 0.0
+  end
+
+  local pattern_id
+  local pool_id
+  if copy_from and pooled then
+    pattern_id = copy_from.pattern_id
+    pool_id = copy_from.pool_id or alloc_seq_pool()
+    copy_from.pool_id = pool_id
+  else
+    pattern_id = alloc_seq_pattern()
+    pool_id = alloc_seq_pool()
+    if copy_from then
+      local src_pattern = get_seq_pattern(copy_from.pattern_id, false)
+      state.seq_patterns[tostring(pattern_id)] = clone_table_deep(src_pattern or { notes = {} })
+    end
+  end
+
+  local region = {
+    id = state.seq_region_next_id,
+    name = "Region " .. tostring(state.seq_region_next_id),
+    start_qn = start_qn,
+    length_bars = length_bars or (copy_from and copy_from.length_bars) or 4,
+    pool_id = pool_id,
+    pattern_id = pattern_id,
+  }
+  state.seq_region_next_id = state.seq_region_next_id + 1
+  table.insert(state.seq_regions, region)
+  table.sort(state.seq_regions, function(a, b) return (a.start_qn or 0) < (b.start_qn or 0) end)
+  state.selected_seq_region_id = region.id
+  state.seq_view_start_qn = region.start_qn
+  state.seq_view_span_qn = get_seq_region_length_qn(region)
+  save_config()
+  sync_seq_region(region)
+  return region
+end
+
+local function unpool_selected_seq_region()
+  local region = get_selected_seq_region()
+  if not region then
+    return
+  end
+  local old_pattern = get_seq_pattern(region.pattern_id, false)
+  local new_pattern_id = alloc_seq_pattern()
+  state.seq_patterns[tostring(new_pattern_id)] = clone_table_deep(old_pattern or { notes = {} })
+  region.pattern_id = new_pattern_id
+  region.pool_id = alloc_seq_pool()
+  save_config()
+  sync_seq_region(region)
+end
+
+local function clear_selected_seq_region()
+  local region = get_selected_seq_region()
+  if not region then
+    return
+  end
+  local pattern = get_seq_pattern(region.pattern_id, true)
+  pattern.notes = {}
+  state.selected_seq_note = nil
+  save_config()
+  sync_seq_pattern_regions(region.pattern_id)
+end
+
+local function make_default_seq_note(slot, step_key, qn_offset)
+  local sample = slot and slot.sample_path and find_sample_by_path(slot.sample_path) or nil
+  if not sample then
+    return nil
+  end
+  return {
+    enabled = true,
+    step = tonumber(step_key) or 0,
+    qn_offset = qn_offset or 0.0,
+    sample_path = sample.path,
+    sample_name = sample.name or basename(sample.path),
+    volume = 1.0,
+    pan = 0.0,
+    pitch = 0.0,
+    length_qn = state.seq_grid_qn or 0.25,
+    offset_qn = 0.0,
+  }
+end
+
+local function toggle_seq_note(region, slot, step_key, qn_offset, force_mode)
+  if not region or not slot then
+    return false
+  end
+
+  local existing = get_seq_note(region, slot.id, step_key)
+  if existing and force_mode ~= "paint" then
+    delete_seq_note(region, slot.id, step_key)
+    if state.selected_seq_note and state.selected_seq_note.region_id == region.id and
+       state.selected_seq_note.track_id == slot.id and state.selected_seq_note.step_key == tostring(step_key) then
+      state.selected_seq_note = nil
+    end
+  elseif not existing and force_mode ~= "erase" then
+    local note = make_default_seq_note(slot, step_key, qn_offset)
+    if not note then
+      log("Sequencer slot has no assigned sample")
+      return false
+    end
+    set_seq_note(region, slot.id, step_key, note)
+    state.selected_seq_note = { region_id = region.id, track_id = slot.id, step_key = tostring(step_key) }
+  else
+    return false
+  end
+
+  save_config()
+  sync_seq_pattern_regions(region.pattern_id)
+  return true
+end
+
+local function get_selected_seq_note()
+  if not state.selected_seq_note then
+    return nil, nil
+  end
+  local region = get_seq_region_by_id(state.selected_seq_note.region_id)
+  if not region then
+    return nil, nil
+  end
+  return get_seq_note(region, state.selected_seq_note.track_id, state.selected_seq_note.step_key), region
+end
+
+local SEQ_PARAM_LANES = {
+  { key = "volume", label = "Vol", min = 0.0, max = 2.0, default = 1.0, fmt = "%.2f" },
+  { key = "pan", label = "Pan", min = -1.0, max = 1.0, default = 0.0, fmt = "%.2f" },
+  { key = "pitch", label = "Pitch", min = -24.0, max = 24.0, default = 0.0, fmt = "%.1f" },
+  { key = "length_qn", label = "Len", min = 0.03125, max = 8.0, default = 0.25, fmt = "%.3f" },
+  { key = "offset_qn", label = "Off", min = -1.0, max = 1.0, default = 0.0, fmt = "%.3f" },
+}
+
+local function get_param_lane_def(param_key)
+  for _, def in ipairs(SEQ_PARAM_LANES) do
+    if def.key == param_key then
+      return def
+    end
+  end
+  return nil
+end
+
+local function seq_param_value_from_y(def, y, y0, y1, step_qn)
+  local t = 1.0 - ((y - y0) / math.max(1.0, y1 - y0))
+  t = math.max(0.0, math.min(1.0, t))
+  local min_v = def.min
+  local max_v = def.max
+  if def.key == "length_qn" then
+    min_v = math.min(step_qn or state.seq_grid_qn or 0.25, def.min)
+    max_v = math.max(step_qn or state.seq_grid_qn or 0.25, def.max)
+  elseif def.key == "offset_qn" then
+    local range = step_qn or state.seq_grid_qn or 0.25
+    min_v = -range
+    max_v = range
+  end
+  return min_v + (max_v - min_v) * t
+end
+
+local function seq_param_y_from_value(def, value, y0, y1, step_qn)
+  local min_v = def.min
+  local max_v = def.max
+  if def.key == "length_qn" then
+    min_v = math.min(step_qn or state.seq_grid_qn or 0.25, def.min)
+    max_v = math.max(step_qn or state.seq_grid_qn or 0.25, def.max)
+  elseif def.key == "offset_qn" then
+    local range = step_qn or state.seq_grid_qn or 0.25
+    min_v = -range
+    max_v = range
+  end
+  local t = ((value or def.default) - min_v) / math.max(0.000001, max_v - min_v)
+  t = math.max(0.0, math.min(1.0, t))
+  return y1 - t * (y1 - y0)
+end
+
+local function collect_measure_guides_qn(start_qn, end_qn, max_guides)
+  local guides = {}
+  if not r.TimeMap_GetMeasureInfo or not r.TimeMap2_timeToBeats then
+    return guides
+  end
+
+  local start_time = qn_to_time(start_qn)
+  if not start_time then
+    return guides
+  end
+
+  max_guides = max_guides or 1024
+  local _, start_measure = r.TimeMap2_timeToBeats(0, start_time)
+  if start_measure == nil then
+    return guides
+  end
+
+  local measure = math.max(0, start_measure)
+  local guard = 0
+  while guard < max_guides do
+    local meas_time, qn_start, qn_end, ts_num, ts_den = r.TimeMap_GetMeasureInfo(0, measure)
+    if not meas_time or not qn_start then
+      break
+    end
+    if qn_start > end_qn + 0.000001 then
+      break
+    end
+
+    local out_num = (type(ts_num) == "number" and ts_num > 0) and ts_num or 4
+    local out_den = (type(ts_den) == "number" and ts_den > 0) and ts_den or 4
+    local out_qn_end = qn_end
+    if type(out_qn_end) ~= "number" or out_qn_end <= qn_start then
+      out_qn_end = qn_start + out_num * (4.0 / out_den)
+    end
+
+    if out_qn_end >= start_qn - 0.000001 then
+      guides[#guides + 1] = {
+        measure = measure,
+        qn_start = qn_start,
+        qn_end = out_qn_end,
+        time = meas_time,
+        ts_num = out_num,
+        ts_den = out_den,
+      }
+    end
+
+    measure = measure + 1
+    guard = guard + 1
+  end
+
+  return guides
+end
+
+local function render_sequencer_map()
+  local region = get_selected_seq_region()
+  local avail_x, avail_y = r.ImGui_GetContentRegionAvail(ctx)
+  local width = math.max(720.0, avail_x)
+  local note_lane_h = 34.0
+  local param_lane_h = 22.0
+  local header_h = 30.0
+  local strip_h = 30.0
+  local visual_rows = {}
+  for _, slot in ipairs(state.seq_tracks) do
+    visual_rows[#visual_rows + 1] = { type = "note", slot = slot, h = note_lane_h }
+    if state.seq_expanded_tracks[tostring(slot.id)] then
+      for _, def in ipairs(SEQ_PARAM_LANES) do
+        visual_rows[#visual_rows + 1] = { type = "param", slot = slot, param = def, h = param_lane_h }
+      end
+    end
+  end
+  if #visual_rows == 0 then
+    visual_rows[#visual_rows + 1] = { type = "empty", h = note_lane_h }
+  end
+  local rows_h = 0.0
+  for _, row in ipairs(visual_rows) do
+    rows_h = rows_h + row.h
+  end
+  local map_h = math.max(header_h + rows_h, 210.0)
+
+  local child_flags = 0
+  if r.ImGui_ChildFlags_Border then child_flags = r.ImGui_ChildFlags_Border end
+  if not r.ImGui_BeginChild(ctx, "sequencer_map_area", 0, math.max(0, avail_y), child_flags) then
+    r.ImGui_EndChild(ctx)
+    return
+  end
+
+  local function grid_button(label, qn)
+    local active = math.abs((state.seq_grid_qn or 0.25) - qn) < 0.0001
+    if active then r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x3E7CB1FF) end
+    if r.ImGui_Button(ctx, label) then
+      state.seq_grid_qn = qn
+      save_config()
+    end
+    if active then r.ImGui_PopStyleColor(ctx, 1) end
+    r.ImGui_SameLine(ctx)
+  end
+
+  r.ImGui_TextColored(ctx, 0xD7E8FFFF, "Sequencer")
+  r.ImGui_SameLine(ctx)
+  grid_button("1/4##grid4", 1.0)
+  grid_button("1/8##grid8", 0.5)
+  grid_button("1/16##grid16", 0.25)
+  grid_button("1/32##grid32", 0.125)
+  grid_button("1/8T##grid8t", 1.0 / 3.0)
+  grid_button("1/16T##grid16t", 1.0 / 6.0)
+  r.ImGui_Separator(ctx)
+
+  if r.ImGui_Button(ctx, "New 4 bars##seq_new4") then create_seq_region(4, nil, false) end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "New 8##seq_new8") then create_seq_region(8, nil, false) end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "New 16##seq_new16") then create_seq_region(16, nil, false) end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "Copy##seq_copy_region") then create_seq_region(region.length_bars, region, false) end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "Pool Copy##seq_pool_region") then create_seq_region(region.length_bars, region, true) end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "Unpool##seq_unpool") then unpool_selected_seq_region() end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "Clear##seq_clear_region") then
+    local label = begin_seq_undo("Clear sequencer region")
+    clear_selected_seq_region()
+    end_seq_undo(label)
+  end
+  r.ImGui_SameLine(ctx)
+  if r.ImGui_Button(ctx, "Sync to Arrange##seq_sync") then
+    state.seq_follow_arrange = true
+    local arrange_start, arrange_end = get_arrange_view_range()
+    local arrange_start_qn = time_to_qn(arrange_start) or 0.0
+    local arrange_end_qn = time_to_qn(arrange_end) or (arrange_start_qn + (state.seq_grid_qn or 0.25) * 16.0)
+    state.seq_view_start_qn = arrange_start_qn
+    state.seq_view_span_qn = math.max(state.seq_grid_qn or 0.25, arrange_end_qn - arrange_start_qn)
+    save_config()
+  end
+  r.ImGui_SameLine(ctx)
+  r.ImGui_TextColored(ctx, state.seq_follow_arrange and 0x88DDAAFF or 0xFFCC88FF,
+    state.seq_follow_arrange and "Synced" or "Manual")
+  r.ImGui_SameLine(ctx)
+  r.ImGui_TextColored(ctx, 0xA0A0A0FF, "Wheel scrolls | Cmd+Wheel zooms | Right-drag erases")
+
+  local strip_x, strip_y = r.ImGui_GetCursorScreenPos(ctx)
+  r.ImGui_InvisibleButton(ctx, "seq_region_strip", width, strip_h)
+  local strip_dl = r.ImGui_GetWindowDrawList(ctx)
+  r.ImGui_DrawList_AddRectFilled(strip_dl, strip_x, strip_y, strip_x + width, strip_y + strip_h, 0x181D24FF, 4.0)
+  r.ImGui_DrawList_AddRect(strip_dl, strip_x, strip_y, strip_x + width, strip_y + strip_h, 0x35455CFF, 4.0, 0, 1.0)
+  local min_qn = state.seq_regions[1] and state.seq_regions[1].start_qn or region.start_qn
+  local max_qn = min_qn + 1.0
+  for _, reg in ipairs(state.seq_regions) do
+    min_qn = math.min(min_qn, reg.start_qn or 0.0)
+    max_qn = math.max(max_qn, (reg.start_qn or 0.0) + get_seq_region_length_qn(reg))
+  end
+  local strip_span = math.max(1.0, max_qn - min_qn)
+  for _, reg in ipairs(state.seq_regions) do
+    local rx0 = strip_x + ((reg.start_qn - min_qn) / strip_span) * width
+    local rx1 = strip_x + (((reg.start_qn or 0.0) + get_seq_region_length_qn(reg) - min_qn) / strip_span) * width
+    local selected = reg.id == state.selected_seq_region_id
+    local clr = selected and 0x4A8BD6CC or 0x34506699
+    r.ImGui_DrawList_AddRectFilled(strip_dl, rx0 + 2, strip_y + 4, rx1 - 2, strip_y + strip_h - 4, clr, 4.0)
+    r.ImGui_DrawList_AddText(strip_dl, rx0 + 6, strip_y + 8, 0xFFFFFFFF,
+      (reg.name or ("Region " .. reg.id)) .. " P" .. tostring(reg.pool_id or "-"))
+  end
+  if r.ImGui_IsItemClicked(ctx, 0) then
+    local mx = select(1, r.ImGui_GetMousePos(ctx))
+    local clicked_qn = min_qn + ((mx - strip_x) / math.max(1.0, width)) * strip_span
+    for _, reg in ipairs(state.seq_regions) do
+      if clicked_qn >= reg.start_qn and clicked_qn <= reg.start_qn + get_seq_region_length_qn(reg) then
+        state.selected_seq_region_id = reg.id
+        state.seq_view_start_qn = reg.start_qn
+        state.seq_view_span_qn = get_seq_region_length_qn(reg)
+        state.seq_follow_arrange = false
+        save_config()
+        region = reg
+        break
+      end
+    end
+  end
+
+  r.ImGui_Separator(ctx)
+
+  local x0, y0 = r.ImGui_GetCursorScreenPos(ctx)
+  r.ImGui_InvisibleButton(ctx, "sequencer_timeline_surface", width, map_h)
+  local hovered = r.ImGui_IsItemHovered(ctx)
+  local left_clicked = r.ImGui_IsMouseClicked(ctx, 0)
+  local right_clicked = r.ImGui_IsMouseClicked(ctx, 1)
+  local left_down = r.ImGui_IsMouseDown(ctx, 0)
+  local right_down = r.ImGui_IsMouseDown(ctx, 1)
+  local dl = r.ImGui_GetWindowDrawList(ctx)
+  local mx, my = r.ImGui_GetMousePos(ctx)
+
+  local view_start, view_end = get_arrange_view_range()
+  local arrange_start_qn = time_to_qn(view_start) or 0.0
+  local arrange_end_qn = time_to_qn(view_end) or (arrange_start_qn + (state.seq_grid_qn or 0.25) * 16.0)
+  local arrange_span_qn = math.max(state.seq_grid_qn or 0.25, arrange_end_qn - arrange_start_qn)
+  if state.seq_follow_arrange or not state.seq_view_start_qn then
+    state.seq_view_start_qn = arrange_start_qn
+    state.seq_view_span_qn = arrange_span_qn
+  elseif not state.seq_view_span_qn or state.seq_view_span_qn <= 0 then
+    state.seq_view_span_qn = get_seq_region_length_qn(region)
+  end
+
+  local start_qn, end_qn, step_qn, step_count = get_visible_qn_grid_range(
+    state.seq_view_start_qn,
+    state.seq_view_start_qn + (state.seq_view_span_qn or get_seq_region_length_qn(region))
+  )
+  local qn_span = math.max(step_qn, end_qn - start_qn)
+  local label_w = math.min(300.0, math.max(220.0, width * 0.32))
+  local timeline_x0 = x0 + label_w
+  local timeline_w = math.max(120.0, width - label_w)
+
+  if hovered then
+    local wheel = r.ImGui_GetMouseWheel(ctx)
+    if wheel ~= 0 then
+      state.seq_follow_arrange = false
+      local base_span = state.seq_view_span_qn or qn_span
+      if is_cmd_down() then
+        local ratio = math.max(0.0, math.min(1.0, (mx - timeline_x0) / math.max(1.0, timeline_w)))
+        local anchor = start_qn + base_span * ratio
+        local new_span = math.max(step_qn * 8.0, math.min(step_qn * 4096.0, base_span * math.exp(-wheel * 0.2)))
+        state.seq_view_start_qn = math.max(0.0, anchor - new_span * ratio)
+        state.seq_view_span_qn = new_span
+      else
+        state.seq_view_start_qn = math.max(0.0, (state.seq_view_start_qn or start_qn) - wheel * step_qn * 8.0)
+        state.seq_view_span_qn = base_span
+      end
+      start_qn, end_qn, step_qn, step_count = get_visible_qn_grid_range(state.seq_view_start_qn, state.seq_view_start_qn + state.seq_view_span_qn)
+      qn_span = math.max(step_qn, end_qn - start_qn)
+    end
+  end
+
+  local cell_w = timeline_w / step_count
+  local measure_guides = collect_measure_guides_qn(start_qn, end_qn, 1024)
+  local pattern = get_seq_pattern(region.pattern_id, true)
+  local active_cells = {}
+  for _, slot in ipairs(state.seq_tracks) do
+    active_cells[slot.id] = {}
+    local notes = get_track_note_table(pattern, slot.id, false)
+    if notes then
+      for step_key, note in pairs(notes) do
+        if type(note) == "table" and note.enabled ~= false then
+          local abs_qn = (region.start_qn or 0.0) + (note.qn_offset or 0.0)
+          local col = math.floor(((abs_qn - start_qn) / step_qn) + 0.5)
+          if col >= 0 and col < step_count then
+            active_cells[slot.id][col] = { key = step_key, note = note }
+          end
+        end
+      end
+    end
+  end
+
+  local function qn_to_x(qn) return timeline_x0 + ((qn - start_qn) / qn_span) * timeline_w end
+  local function label_for_step(step)
+    local denom = math.floor((4.0 / step) + 0.5)
+    if denom > 0 and math.abs(step - (4.0 / denom)) < 0.0001 then return "1/" .. tostring(denom) end
+    return string.format("%.3f QN", step)
+  end
+
+  r.ImGui_DrawList_AddRectFilled(dl, x0, y0, x0 + width, y0 + map_h, 0x111318FF, 6.0)
+  r.ImGui_DrawList_AddRect(dl, x0, y0, x0 + width, y0 + map_h, 0x40516AFF, 6.0, 0, 1.2)
+  r.ImGui_DrawList_AddRectFilled(dl, x0, y0, x0 + width, y0 + header_h, 0x202838FF, 0)
+  r.ImGui_DrawList_AddLine(dl, timeline_x0, y0, timeline_x0, y0 + map_h, 0x607086FF, 1.0)
+  r.ImGui_DrawList_AddText(dl, x0 + 8, y0 + 7, 0xE8E8E8FF, "Track / Sample")
+  r.ImGui_DrawList_AddText(dl, timeline_x0 + 8, y0 + 7, 0xE8E8E8FF,
+    (region.name or "Region") .. " | " .. label_for_step(step_qn) .. " cells")
+
+  for i = 1, row_count do
+    local row_y0 = y0 + header_h + (i - 1) * lane_h
+    local row_y1 = row_y0 + lane_h
+    local row_color = (i % 2 == 0) and 0x171B23FF or 0x1D222CFF
+    r.ImGui_DrawList_AddRectFilled(dl, x0, row_y0, x0 + width, row_y1, row_color, 0)
+    r.ImGui_DrawList_AddLine(dl, x0, row_y1, x0 + width, row_y1, 0x2B3442FF, 1.0)
+    local slot = state.seq_tracks[i]
+    if slot then
+      local sample_label = slot.sample_name or "(no sample)"
+      if #sample_label > 20 then sample_label = sample_label:sub(1, 17) .. "..." end
+      r.ImGui_DrawList_AddText(dl, x0 + 8, row_y0 + 6, 0xFFFFFFFF, slot.name or ("Track " .. i))
+      r.ImGui_DrawList_AddText(dl, x0 + 140, row_y0 + 6, slot.sample_path and 0xB6F2B6FF or 0x777777FF, sample_label)
+      for col = 0, step_count - 1 do
+        local cx0 = timeline_x0 + col * cell_w
+        local cx1 = cx0 + cell_w
+        if col % 2 == 1 then r.ImGui_DrawList_AddRectFilled(dl, cx0, row_y0, cx1, row_y1, 0xFFFFFF08, 0) end
+        local active = active_cells[slot.id] and active_cells[slot.id][col]
+        if active then
+          local note = active.note
+          local fill = get_sample_dot_color({ path = note.sample_path, tags = {} })
+          r.ImGui_DrawList_AddRectFilled(dl, cx0 + 2, row_y0 + 3, cx1 - 2, row_y1 - 3, fill, 3.0)
+          local vel_h = (row_y1 - row_y0 - 8) * math.max(0.05, math.min(1.0, note.volume or 1.0))
+          r.ImGui_DrawList_AddRectFilled(dl, cx0 + 3, row_y1 - 4 - vel_h, cx0 + 6, row_y1 - 4, 0xFFFFFFFF, 1.0)
+        end
+      end
+    else
+      r.ImGui_DrawList_AddText(dl, x0 + 8, row_y0 + 8, 0x888888FF, "No sequencer tracks configured")
+    end
+  end
+
+  for col = 0, step_count do
+    local qn = start_qn + col * step_qn
+    local px = qn_to_x(qn)
+    local clr = (math.abs(qn - math.floor(qn + 0.5)) < 0.0001) and 0x45505EFF or 0x2A303AFF
+    r.ImGui_DrawList_AddLine(dl, px, y0 + header_h, px, y0 + map_h, clr, 1.0)
+  end
+  for i, guide in ipairs(measure_guides) do
+    local px = qn_to_x(guide.qn_start)
+    if px >= timeline_x0 - 1 and px <= timeline_x0 + timeline_w + 1 then
+      r.ImGui_DrawList_AddLine(dl, px, y0, px, y0 + map_h, 0x4A8BD6FF, 2.0)
+      if i % 2 == 1 then r.ImGui_DrawList_AddText(dl, px + 4, y0 + 7, 0xBFD7F2FF, "M" .. tostring(guide.measure + 1)) end
+    end
+  end
+
+  local hovered_slot, hovered_col, hovered_qn = nil, nil, nil
+  if hovered and mx >= timeline_x0 and mx <= timeline_x0 + timeline_w and my >= y0 + header_h and my <= y0 + map_h then
+    local lane = math.floor((my - (y0 + header_h)) / lane_h) + 1
+    if lane >= 1 and lane <= #state.seq_tracks then
+      hovered_slot = state.seq_tracks[lane]
+      hovered_col = math.max(0, math.min(step_count - 1, math.floor((mx - timeline_x0) / cell_w)))
+      hovered_qn = start_qn + hovered_col * step_qn
+      local hx0 = timeline_x0 + hovered_col * cell_w
+      local hy0 = y0 + header_h + (lane - 1) * lane_h
+      r.ImGui_DrawList_AddRectFilled(dl, hx0, hy0, hx0 + cell_w, hy0 + lane_h, 0xFFE59933, 0)
+      r.ImGui_DrawList_AddRect(dl, hx0, hy0, hx0 + cell_w, hy0 + lane_h, 0xFFE599FF, 0, 0, 1.5)
+    end
+  end
+
+  local mouse_released = r.ImGui_IsMouseReleased(ctx, 0) or r.ImGui_IsMouseReleased(ctx, 1)
+  if mouse_released then
+    state.seq_drag_paint = false
+    state.seq_drag_mode = nil
+    state.seq_drag_last_cell = nil
+  end
+  if hovered_slot and hovered_qn then
+    local step_idx = math.floor(((hovered_qn - region.start_qn) / step_qn) + 0.5)
+    local in_region = hovered_qn >= region.start_qn and hovered_qn < region.start_qn + get_seq_region_length_qn(region)
+    local step_key = tostring(step_idx)
+    local cell_id = tostring(hovered_slot.id) .. ":" .. step_key
+    if state.pending_waveform_drop then
+      state.seq_timeline_drop_track_idx = nil
+      state.seq_timeline_drop_time = qn_to_time(hovered_qn)
+    elseif in_region and (left_clicked or right_clicked) then
+      local label = begin_seq_undo(left_clicked and "Toggle sequencer note" or "Erase sequencer note")
+      toggle_seq_note(region, hovered_slot, step_key, hovered_qn - region.start_qn, right_clicked and "erase" or nil)
+      end_seq_undo(label)
+      state.seq_drag_paint = true
+      state.seq_drag_mode = right_clicked and "erase" or "paint"
+      state.seq_drag_last_cell = cell_id
+    elseif in_region and state.seq_drag_paint and (left_down or right_down) and state.seq_drag_last_cell ~= cell_id then
+      local label = begin_seq_undo(state.seq_drag_mode == "erase" and "Erase sequencer notes" or "Paint sequencer notes")
+      toggle_seq_note(region, hovered_slot, step_key, hovered_qn - region.start_qn, state.seq_drag_mode)
+      end_seq_undo(label)
+      state.seq_drag_last_cell = cell_id
+    end
+
+    r.ImGui_BeginTooltip(ctx)
+    r.ImGui_Text(ctx, in_region and "Sequencer cell" or "Outside selected region")
+    r.ImGui_Text(ctx, "Left-click/drag: paint or toggle")
+    r.ImGui_Text(ctx, "Right-click/drag: erase")
+    r.ImGui_Text(ctx, string.format("QN %.3f", hovered_qn))
+    r.ImGui_EndTooltip(ctx)
+  end
+
+  r.ImGui_Dummy(ctx, width, 0)
+
+  local note, note_region = get_selected_seq_note()
+  if note then
+    r.ImGui_Separator(ctx)
+    r.ImGui_TextColored(ctx, 0xD7E8FFFF, "Note Inspector")
+    r.ImGui_SameLine(ctx)
+    r.ImGui_Text(ctx, note.sample_name or basename(note.sample_path))
+    local changed = false
+    local ret
+    ret, note.volume = r.ImGui_SliderDouble(ctx, "Volume##seq_note_vol", note.volume or 1.0, 0.0, 2.0, "%.2f", 0); changed = changed or ret
+    ret, note.pan = r.ImGui_SliderDouble(ctx, "Pan##seq_note_pan", note.pan or 0.0, -1.0, 1.0, "%.2f", 0); changed = changed or ret
+    ret, note.pitch = r.ImGui_SliderDouble(ctx, "Pitch##seq_note_pitch", note.pitch or 0.0, -24.0, 24.0, "%.1f st", 0); changed = changed or ret
+    ret, note.length_qn = r.ImGui_SliderDouble(ctx, "Length QN##seq_note_len", note.length_qn or step_qn, 0.03125, 8.0, "%.3f", 0); changed = changed or ret
+    ret, note.offset_qn = r.ImGui_SliderDouble(ctx, "Offset QN##seq_note_off", note.offset_qn or 0.0, -step_qn, step_qn, "%.3f", 0); changed = changed or ret
+    ret, note.probability = r.ImGui_SliderDouble(ctx, "Probability##seq_note_prob", note.probability or 1.0, 0.0, 1.0, "%.2f", 0); changed = changed or ret
+    ret, note.humanize_ms = r.ImGui_SliderDouble(ctx, "Humanize ms##seq_note_hum", note.humanize_ms or 0.0, 0.0, 50.0, "%.1f", 0); changed = changed or ret
+    if r.ImGui_Button(ctx, "Reset Note##seq_note_reset") then
+      note.volume, note.pan, note.pitch = 1.0, 0.0, 0.0
+      note.length_qn, note.offset_qn, note.probability, note.humanize_ms = state.seq_grid_qn or 0.25, 0.0, 1.0, 0.0
+      changed = true
+    end
+    if changed and note_region then
+      save_config()
+      sync_seq_pattern_regions(note_region.pattern_id)
+    end
+  end
+
+  r.ImGui_EndChild(ctx)
 end
 
 
@@ -4701,10 +6743,45 @@ local function render_settings()
 end
 
 
+local function draw_map_status_overlay(dl, x0, y0, width, height)
+  if #state.scan_queue > 0 then
+    return
+  end
+
+  local lines = {}
+  if #state.samples == 0 then
+    lines[#lines + 1] = "Press Rescan to populate the map."
+    if #state.folders > 0 then
+      lines[#lines + 1] = "Folders configured: " .. #state.folders
+    end
+  else
+    lines[#lines + 1] = string.format("Showing %d samples on map (Zoom: %.1fx)", #state.samples, state.zoom)
+    if state.selected then
+      lines[#lines + 1] = "Selected: " .. state.selected.name
+    end
+  end
+
+  if #lines == 0 then
+    return
+  end
+
+  local line_h = 16.0
+  local padding = 8.0
+  local text_y = y0 + height - (#lines * line_h) - padding
+  for i, line in ipairs(lines) do
+    local ty = text_y + (i - 1) * line_h
+    r.ImGui_DrawList_AddText(dl, x0 + padding + 1, ty + 1, 0x000000AA, line)
+    r.ImGui_DrawList_AddText(dl, x0 + padding, ty, 0xCCCCCCFF, line)
+  end
+end
+
 local function render_map()
   local avail_x, avail_y = r.ImGui_GetContentRegionAvail(ctx)
-  local width = math.max(640, avail_x)
-  local height = math.max(320, avail_y)
+  local width = math.max(0, avail_x)
+  local height = math.max(0, avail_y)
+  if width <= 0 or height <= 0 then
+    return
+  end
   
   local pos_x, pos_y = r.ImGui_GetCursorScreenPos(ctx)
   local x0, y0 = pos_x, pos_y
@@ -5202,16 +7279,40 @@ local function render_map()
     if s.tags and #s.tags > 0 then
       r.ImGui_Text(ctx, "Tags: " .. table.concat(s.tags, ", "))
     end
+    if state.seq_swap_track_id then
+      r.ImGui_Text(ctx, "Click to assign (swap mode)")
+    else
+      r.ImGui_Text(ctx, "Alt+drag to assign or insert")
+    end
     r.ImGui_EndTooltip(ctx)
     
     -- Handle click or drag selection (only for closest sample)
     if not click_handled_this_frame and r.ImGui_IsMouseClicked(ctx, 0) then
-      clicked_sample = s
-      click_handled_this_frame = true
-      -- Start drag state so users can drag to preview different samples even if drag starts on a dot
-      state.is_left_dragging = true
-      state.last_dragged_sample_path = s.path
-    elseif state.is_left_dragging and s.path ~= state.last_dragged_sample_path then
+      if is_alt_down() then
+        state.pending_waveform_drop = s
+        state.is_left_dragging = false
+        state.last_dragged_sample_path = nil
+        click_handled_this_frame = true
+        log("Alt+drag started for sample: " .. (s.name or s.path))
+      elseif state.seq_swap_track_id then
+        local slot = nil
+        if find_seq_track_by_id then
+          slot = find_seq_track_by_id(state.seq_swap_track_id)
+        end
+        if slot and assign_sample_to_seq_track(slot, s, false) then
+          preview_sample(s)
+          log("Swapped to '" .. (s.name or s.path) .. "' on " .. slot.name .. " (swap mode)")
+        end
+        state.block_swap_bar_input = true
+        click_handled_this_frame = true
+      else
+        clicked_sample = s
+        click_handled_this_frame = true
+        -- Start drag state so users can drag to preview different samples even if drag starts on a dot
+        state.is_left_dragging = true
+        state.last_dragged_sample_path = s.path
+      end
+    elseif state.is_left_dragging and not state.pending_waveform_drop and s.path ~= state.last_dragged_sample_path then
       -- While left-dragging, preview newly hovered samples
       clicked_sample = s
       state.last_dragged_sample_path = s.path
@@ -5220,6 +7321,11 @@ local function render_map()
   
   if clicked_sample then
     preview_sample(clicked_sample)
+  end
+
+  if state.pending_waveform_drop then
+    r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_Hand())
+    update_pending_drop_tracking()
   end
   
   -- Draw scanning progress overlay on the map (foreground drawing)
@@ -5279,21 +7385,7 @@ local function render_map()
     end
   end
   
-  r.ImGui_Dummy(ctx, width, 0.0)
-  
-  if #state.scan_queue == 0 then
-    if #state.samples == 0 then
-      r.ImGui_Text(ctx, "Press Rescan to populate the map.")
-      if #state.folders > 0 then
-        r.ImGui_Text(ctx, "Folders configured: " .. #state.folders)
-      end
-    else
-      r.ImGui_Text(ctx, string.format("Showing %d samples on map (Zoom: %.1fx)", #state.samples, state.zoom))
-      if state.selected then
-        r.ImGui_Text(ctx, "Selected: " .. state.selected.name)
-      end
-    end
-  end
+  draw_map_status_overlay(dl, x0, y0, width, height)
 end
 
 
@@ -5312,7 +7404,15 @@ local function loop()
   process_scan_slice()
   
   local visible, open = begin_window()
+  local main_win_x, main_win_y = 0, 0
+  local main_win_w = 0
   if visible then
+    main_win_x, main_win_y = r.ImGui_GetWindowPos(ctx)
+    main_win_w = r.ImGui_GetWindowWidth(ctx)
+    state.block_swap_bar_input = false
+    state.seq_timeline_drop_track_idx = nil
+    state.seq_timeline_drop_time = nil
+
     -- Handle keyboard input for history navigation (only when window is visible)
     if r.ImGui_IsKeyPressed and r.ImGui_Key_UpArrow and r.ImGui_Key_DownArrow then
       local up_pressed = r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_UpArrow(), false)
@@ -5325,55 +7425,72 @@ local function loop()
       end
     end
 
-    -- Handle global mouse release for waveform drag-and-drop
-    if state.pending_waveform_drop and not r.ImGui_IsMouseDown(ctx, 0) then
-      -- Mouse was released - complete the drag operation
-      log("Mouse released globally, completing drag operation")
+    render_header()
 
-      -- Use the last tracked mouse position
-      if state.last_mouse_time_pos then
-        log("Dropping at tracked position: " .. string.format("%.3f", state.last_mouse_time_pos))
-        local success = insert_sample_at_position(state.pending_waveform_drop, state.last_mouse_time_pos, state.last_mouse_track)
-        if success then
-          log("Successfully completed drag-and-drop")
-        else
-          log("Failed to complete drag-and-drop")
-        end
-      else
-        -- Try to get position at release time (in case tracking missed it)
-        local drop_time, drop_track = get_drop_position()
-        if drop_time then
-          log("Dropping at release position: " .. string.format("%.3f", drop_time))
-          local success = insert_sample_at_position(state.pending_waveform_drop, drop_time, drop_track)
-          if success then
-            log("Successfully completed drag-and-drop at release position")
-          else
-            log("Failed to complete drag-and-drop at release position")
-          end
-        else
-          -- Fallback to cursor position
-          log("No tracked mouse position, using cursor position")
-          local success = insert_sample_at_cursor(state.pending_waveform_drop)
-          if success then
-            log("Successfully completed drag-and-drop at cursor")
-          else
-            log("Failed to complete drag-and-drop")
-          end
-        end
-      end
+    local avail_x, avail_y = r.ImGui_GetContentRegionAvail(ctx)
+    local panel_width = state.seq_panel_width or 240
 
-      -- Reset drag state
-      state.pending_waveform_drop = nil
-      state.last_mouse_time_pos = nil
-      state.last_mouse_track = nil
+    local child_flags = 0
+    if r.ImGui_ChildFlags_Border then
+      child_flags = r.ImGui_ChildFlags_Border
+    end
+    local no_scroll_flags = r.ImGui_WindowFlags_NoScrollbar() | r.ImGui_WindowFlags_NoScrollWithMouse()
+
+    if r.ImGui_BeginChild(ctx, "seq_tracks_panel", panel_width, avail_y, child_flags) then
+      render_seq_tracks_panel()
+      r.ImGui_EndChild(ctx)
     end
 
-    render_header()
-    render_playback_controls()
-    render_waveform()
-    render_map()
+    r.ImGui_SameLine(ctx)
+
+    if r.ImGui_BeginChild(ctx, "main_content", 0, avail_y, child_flags) then
+      if r.ImGui_BeginTabBar(ctx, "main_view_tabs") then
+        local function draw_sample_map_tab()
+          if r.ImGui_BeginTabItem(ctx, "Sample Map") then
+            if state.active_view ~= "sample_map" then
+              state.active_view = "sample_map"
+              save_config()
+            end
+            render_playback_controls()
+            render_waveform()
+            local _, map_avail_y = r.ImGui_GetContentRegionAvail(ctx)
+            if r.ImGui_BeginChild(ctx, "sample_map_area", 0, math.max(0, map_avail_y), child_flags, no_scroll_flags) then
+              render_map()
+              r.ImGui_EndChild(ctx)
+            end
+            r.ImGui_EndTabItem(ctx)
+          end
+        end
+        local function draw_sequencer_tab()
+          if r.ImGui_BeginTabItem(ctx, "Sequencer") then
+            if state.active_view ~= "sequencer" then
+              state.active_view = "sequencer"
+              save_config()
+            end
+            render_sequencer_map()
+            r.ImGui_EndTabItem(ctx)
+          end
+        end
+
+        if state.active_view == "sequencer" then
+          draw_sequencer_tab()
+          draw_sample_map_tab()
+        else
+          draw_sample_map_tab()
+          draw_sequencer_tab()
+        end
+        r.ImGui_EndTabBar(ctx)
+      end
+      r.ImGui_EndChild(ctx)
+    end
+
+    complete_pending_sample_drop()
   end
   r.ImGui_End(ctx)
+
+  if visible and state.seq_swap_track_id then
+    render_swap_mode_bar(main_win_x, main_win_y, main_win_w)
+  end
   
   -- Pop the style colors we pushed in begin_window (must match every push)
   r.ImGui_PopStyleColor(ctx, 3)  -- WindowBg, ChildBg, FrameBg

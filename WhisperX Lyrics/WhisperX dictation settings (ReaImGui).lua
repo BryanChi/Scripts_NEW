@@ -1,15 +1,26 @@
 -- @description WhisperX dictation — settings (ReaImGui)
--- @version 1.06
+-- @version 1.07
 -- @author Bryan
 -- @about
 --   Edits global extstate BRYAN_WHISPERX used by "WhisperX dictation (selected item to JSON).lua".
 --   Requires the ReaImGui extension. Save, then run the dictation action.
 --   Model presets show Hugging Face hub cache status (Systran/faster-whisper-*) and on-disk size when present.
+--   Load model keeps WhisperX ASR (and align when language is set) in RAM until Unload — repeat dictation skips reload.
 
 local r = reaper
 
 local SECTION = "BRYAN_WHISPERX"
 local WINDOW_TITLE = "WhisperX dictation — settings"
+
+local function script_dir()
+  local info = debug.getinfo(1, "S")
+  if not info or not info.source then
+    return ""
+  end
+  return info.source:match("^@(.*)$") or ""
+end
+
+local WXServer = nil
 
 package.path = r.ImGui_GetBuiltinPath() .. "/?.lua"
 local ok_imgui, ImGui = pcall(function()
@@ -108,6 +119,24 @@ local function path_exists(p)
     return true
   end
   return false
+end
+
+local function load_server_lib()
+  if WXServer then
+    return WXServer
+  end
+  local sd = script_dir()
+  local lyrics_dir = sd:match("^(.*)[/\\][^/\\]-$") or sd
+  local lib_path = join_path(lyrics_dir, "WhisperX server lib.lua")
+  if not path_exists(lib_path) then
+    return nil
+  end
+  local ok, mod = pcall(dofile, lib_path)
+  if ok and type(mod) == "table" then
+    WXServer = mod
+    return WXServer
+  end
+  return nil
 end
 
 --- Hugging Face hub directory (contains models--org--repo folders).
@@ -259,6 +288,9 @@ local state = {
   hub_dir_display = "",
   model_combo_str = MODEL_ITEMS_STR,
   custom_cache_note = "",
+  server_status = "",
+  server_busy = false,
+  server_poll_load = false,
 }
 
 local function build_model_combo_str()
@@ -455,6 +487,17 @@ local function save_settings()
   state.status_err = false
 end
 
+local function refresh_server_status()
+  local wx = load_server_lib()
+  if not wx then
+    state.server_status = "Server library not found"
+    return
+  end
+  state.server_status = wx.status_text()
+end
+
+refresh_server_status()
+
 refresh_hf_cache_status()
 
 local ctx = ImGui.CreateContext(WINDOW_TITLE)
@@ -521,6 +564,63 @@ local function loop()
 
     rv, state.interp_idx = ImGui.Combo(ctx, "Align interpolation", state.interp_idx, INTERP_ITEMS_STR)
     rv, state.marker_idx = ImGui.Combo(ctx, "Take marker time", state.marker_idx, MARKER_ITEMS_STR)
+
+    ImGui.Spacing(ctx)
+    ImGui.Text(ctx, "Model in memory (faster repeat dictation)")
+    ImGui.TextWrapped(
+      ctx,
+      "Load once before a dictation session — skips ASR reload on each run. Unload when done to free RAM. Save settings first so the loaded config matches."
+    )
+    refresh_server_status()
+    ImGui.TextWrapped(ctx, state.server_status or "")
+    if state.server_poll_load then
+      ImGui.TextColored(ctx, 0xA0C8FFFF, "Loading models… (this window stays open; large models on CPU can take several minutes)")
+    end
+    if ImGui.BeginDisabled then
+      ImGui.BeginDisabled(ctx, state.server_busy or state.server_poll_load)
+    end
+    if ImGui.Button(ctx, "Load model", 120, 0) then
+      save_settings()
+      if state.status_err then
+        refresh_server_status()
+      else
+        local wx = load_server_lib()
+        if not wx then
+          state.status = "WhisperX server lib missing."
+          state.status_err = true
+        else
+          local ok, err = wx.submit_load()
+          if ok then
+            state.server_poll_load = true
+            state.status = "Loading models… (see status below)"
+            state.status_err = false
+          else
+            state.status = err or "Could not start load"
+            state.status_err = true
+          end
+        end
+      end
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, "Unload model", 120, 0) then
+      local wx = load_server_lib()
+      if wx then
+        state.server_busy = true
+        local ok, err = wx.unload_models(120)
+        state.server_busy = false
+        if ok then
+          state.status = "Models unloaded from memory."
+          state.status_err = false
+        else
+          state.status = err or "Unload failed"
+          state.status_err = true
+        end
+        refresh_server_status()
+      end
+    end
+    if ImGui.EndDisabled then
+      ImGui.EndDisabled(ctx)
+    end
 
     ImGui.Spacing(ctx)
     ImGui.Text(ctx, "Segmentation / WhisperX pipeline")
@@ -593,6 +693,24 @@ local function loop()
   end
 
   if open and not state.should_close then
+    if state.server_poll_load then
+      local wx = load_server_lib()
+      if wx then
+        refresh_server_status()
+        if wx.load_complete() then
+          state.server_poll_load = false
+          state.status = "Models loaded — run dictation without reload wait."
+          state.status_err = false
+        elseif not wx.load_in_progress() and not wx.load_complete() then
+          local st = wx.read_state()
+          if st and st.phase == "error" then
+            state.server_poll_load = false
+            state.status = st.last_error or "Load failed (see .whisperx_server/server.log)"
+            state.status_err = true
+          end
+        end
+      end
+    end
     r.defer(loop)
   end
   -- Do not call DestroyContext: ReaImGui/imgui.lua builds differ; omitting avoids close errors. Context ends with script.

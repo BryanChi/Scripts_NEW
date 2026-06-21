@@ -2,161 +2,23 @@
 """
 Transcribe audio with WhisperX (word-level timestamps) and write JSON for REAPER / lyric tooling.
 
-Typical Mac / no-GPU:
-  python reaper_whisperx_transcribe.py --input vocal.wav --output out.json --device cpu --compute_type int8
-
-CUDA (Linux/Windows):
-  python reaper_whisperx_transcribe.py --input vocal.wav --output out.json --device cuda --compute_type float16
-
-Tuning (no post-hoc timing hacks — these map to WhisperX / faster-whisper):
-  Word timings are forced-aligned inside each Whisper *segment*. Very long segments (default VAD chunks up to ~30s)
-  stress CTC alignment; Japanese lyrics often improve with a smaller --chunk-size (e.g. 10–18) and/or silero VAD.
-  See whisperx.load_model(... vad_options=..., asr_options=...) in WhisperX’s whisperx/asr.py.
+One-shot mode: loads models, transcribes, exits.
+For repeat dictation without reload time, use reaper_whisperx_server.py (Load model in settings GUI).
 """
 
 from __future__ import annotations
 
 import argparse
 import atexit
-import gc
-import json
-import os
-import shutil
 import sys
-import threading
-import time
-from typing import Any
 
-
-def _sidecar_paths(json_out: str) -> tuple[str, str]:
-    """Match REAPER Lua: foo.whisperx.json -> foo.words.tsv / foo.plain.txt (not foo.whisperx.words.tsv)."""
-    suf = ".whisperx.json"
-    if json_out.endswith(suf):
-        stem = json_out[: -len(suf)]
-    else:
-        stem = os.path.splitext(json_out)[0]
-    return stem + ".words.tsv", stem + ".plain.txt"
-
-
-def _ensure_ffmpeg_on_path(dlog) -> bool:
-    """REAPER / GUI launches often inherit a tiny PATH; WhisperX calls `ffmpeg` via subprocess."""
-    if sys.platform == "win32":
-        dirs = [
-            os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin"),
-            os.path.expandvars(r"%LocalAppData%\Microsoft\WinGet\Links"),
-            r"C:\ffmpeg\bin",
-        ]
-        prefix = os.pathsep.join(d for d in dirs if d) + os.pathsep
-    else:
-        prefix = (
-            "/opt/homebrew/bin"
-            + os.pathsep
-            + "/usr/local/bin"
-            + os.pathsep
-            + "/usr/bin"
-            + os.pathsep
-        )
-    os.environ["PATH"] = prefix + os.environ.get("PATH", "")
-    resolved = shutil.which("ffmpeg")
-    dlog(f"PATH augmented; shutil.which(ffmpeg)={resolved!r}")
-    if not resolved:
-        msg = (
-            "ffmpeg not found in PATH. WhisperX needs ffmpeg to decode audio.\n"
-            "macOS: brew install ffmpeg (then re-run; this script prepends Homebrew bin dirs).\n"
-            "Windows: install ffmpeg and add its bin folder to the system PATH, or use WinGet/Chocolatey."
-        )
-        dlog(msg)
-        print(msg, file=sys.stderr, flush=True)
-        return False
-    return True
-
-
-def _serialize_segment(seg: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "start": float(seg.get("start", 0.0)),
-        "end": float(seg.get("end", 0.0)),
-        "text": (seg.get("text") or "").strip(),
-    }
-    if "speaker" in seg and seg["speaker"] is not None:
-        out["speaker"] = seg["speaker"]
-    words_in = seg.get("words")
-    words_out: list[dict[str, Any]] = []
-    if isinstance(words_in, list):
-        for w in words_in:
-            if not isinstance(w, dict):
-                continue
-            word = (w.get("word") or "").strip()
-            entry: dict[str, Any] = {
-                "word": word,
-                "start": float(w.get("start", 0.0)),
-                "end": float(w.get("end", 0.0)),
-            }
-            if w.get("score") is not None:
-                try:
-                    entry["score"] = float(w["score"])
-                except (TypeError, ValueError):
-                    pass
-            if w.get("speaker") is not None:
-                entry["speaker"] = w["speaker"]
-            words_out.append(entry)
-    out["words"] = words_out
-    return out
-def _is_single_ascii_letter(s: str) -> bool:
-    s = s.strip()
-    return len(s) == 1 and s.isascii() and s.isalpha()
-
-
-def _merge_latin_letter_runs_in_words(
-    words: list[dict[str, Any]], *, max_gap_s: float = 0.22
-) -> list[dict[str, Any]]:
-    """WhisperX alignment sometimes emits one timing row per Latin letter; REAPER then gets one marker per letter.
-
-    Merge consecutive single-letter ASCII tokens when their starts are close in time (same spoken word).
-    Standalone one-letter words (\"I\", \"a\") stay a single row when not followed by another letter token
-    within the gap threshold.
-    """
-    if len(words) < 2:
-        return words
-    out: list[dict[str, Any]] = []
-    i = 0
-    n = len(words)
-    while i < n:
-        w = words[i]
-        text = (w.get("word") or "").replace("\t", " ").replace("\n", " ").strip()
-        if not _is_single_ascii_letter(text):
-            out.append(dict(w))
-            i += 1
-            continue
-        start = float(w.get("start", 0.0))
-        end = float(w.get("end", 0.0))
-        chars = [text]
-        j = i + 1
-        while j < n:
-            w2 = words[j]
-            t2 = (w2.get("word") or "").replace("\t", " ").replace("\n", " ").strip()
-            if not _is_single_ascii_letter(t2):
-                break
-            t2_start = float(w2.get("start", 0.0))
-            if t2_start - end > max_gap_s:
-                break
-            chars.append(t2)
-            end = max(end, float(w2.get("end", 0.0)))
-            j += 1
-        if len(chars) >= 2:
-            merged: dict[str, Any] = {"word": "".join(chars), "start": start, "end": end}
-            if w.get("score") is not None:
-                try:
-                    merged["score"] = float(w["score"])
-                except (TypeError, ValueError):
-                    pass
-            if w.get("speaker") is not None:
-                merged["speaker"] = w["speaker"]
-            out.append(merged)
-            i = j
-        else:
-            out.append(dict(w))
-            i += 1
-    return out
+from reaper_whisperx_core import (
+    PipelineConfig,
+    TranscribeJob,
+    WhisperXPipeline,
+    ensure_ffmpeg_on_path,
+    write_progress,
+)
 
 
 def main() -> int:
@@ -271,289 +133,66 @@ def main() -> int:
             df.write("=== whisperx reaper script ===\n")
 
     def report_progress(pct: int, msg: str) -> None:
-        path = args.progress_file
-        if not path:
-            return
-        pct = max(0, min(100, int(pct)))
-        try:
-            with open(path, "w", encoding="utf-8") as pf:
-                pf.write(f"{pct}\n{msg}\n")
-        except OSError:
-            pass
-
-    def start_progress_pulse(pct: int, prefix: str) -> tuple[threading.Event, threading.Thread]:
-        """WhisperX has no hooks inside load_model/transcribe/align; pulse so REAPER UI does not look frozen."""
-
-        stop = threading.Event()
-        t0 = time.monotonic()
-
-        def _body() -> None:
-            while not stop.wait(3.0):
-                elapsed = int(time.monotonic() - t0)
-                hint = ""
-                if elapsed > 20:
-                    hint = " — large models on CPU or first-time Hugging Face download can take many minutes"
-                if elapsed > 120:
-                    hint = " — if still here, check RAM/swap and ~/.cache/huggingface (HF_HOME); try a smaller MODEL"
-                report_progress(pct, f"{prefix} ({elapsed}s){hint}")
-
-        th = threading.Thread(target=_body, daemon=True, name="whisperx-reaper-pulse")
-        th.start()
-        return stop, th
-
-    def stop_progress_pulse(stop: threading.Event, th: threading.Thread) -> None:
-        stop.set()
-        th.join(timeout=2.0)
+        write_progress(args.progress_file, pct, msg)
 
     dlog(f"argv={sys.argv!r}")
-    dlog(f"input={args.input!r} exists={os.path.isfile(args.input)}")
+    dlog(f"input={args.input!r} exists={__import__('os').path.isfile(args.input)}")
     dlog(f"output={args.output!r}")
 
-    print(f"reaper_whisperx_transcribe: input={args.input!r}", flush=True)
-    print(f"reaper_whisperx_transcribe: output={args.output!r}", flush=True)
-
     report_progress(1, "starting")
-    if not _ensure_ffmpeg_on_path(dlog):
+    if not ensure_ffmpeg_on_path(dlog):
         return 1
 
     report_progress(4, "importing WhisperX")
     try:
-        import whisperx
+        import whisperx  # noqa: F401
     except BaseException:
         import traceback
 
         dlog(traceback.format_exc())
         raise
 
-    device = args.device
-    compute_type = args.compute_type
-    batch_size = max(1, int(args.batch_size))
-
-    vad_options: dict[str, Any] = {}
-    if args.chunk_size is not None:
-        cz = max(4, min(int(args.chunk_size), 120))
-        vad_options["chunk_size"] = cz
-    if args.vad_onset is not None:
-        vad_options["vad_onset"] = float(args.vad_onset)
-    if args.vad_offset is not None:
-        vad_options["vad_offset"] = float(args.vad_offset)
-
-    asr_options: dict[str, Any] | None = None
-    if args.beam_size is not None:
-        bs = max(1, min(int(args.beam_size), 50))
-        asr_options = {"beam_size": bs}
-
-    vad_method = (args.vad_method or "pyannote").strip().lower()
-    if vad_method not in ("pyannote", "silero"):
-        vad_method = "pyannote"
-
-    dlog(
-        "pipeline tuning: "
-        f"vad_method={vad_method!r} vad_options={vad_options!r} "
-        f"transcribe_chunk_size={args.chunk_size!r} asr_options={asr_options!r} "
-        f"align_model={args.align_model!r}"
+    cfg = PipelineConfig(
+        model=args.model,
+        device=args.device,
+        compute_type=args.compute_type,
+        batch_size=max(1, int(args.batch_size)),
+        language=(args.language or "").strip() or None,
+        interpolate_method=args.interpolate_method,
+        chunk_size=args.chunk_size,
+        vad_method=args.vad_method,
+        vad_onset=args.vad_onset,
+        vad_offset=args.vad_offset,
+        beam_size=args.beam_size,
+        align_model=(args.align_model or "").strip() or None,
+        diarize=args.diarize,
+        hf_token=args.hf_token,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
     )
 
-    report_progress(10, "loading audio")
-    dlog("loading audio…")
-    audio = whisperx.load_audio(args.input)
-    dlog(
-        "load_model… "
-        f"model={args.model!r} device={device!r} compute_type={compute_type!r} "
-        "(first run may download multi-GB weights into the Hugging Face cache)"
+    job = TranscribeJob(
+        input_path=args.input,
+        output_path=args.output,
+        mirror_json=args.mirror_json,
+        mirror_tsv=args.mirror_tsv,
+        mirror_plain=args.mirror_plain,
+        debug_log=args.debug_log,
+        progress_file=args.progress_file,
+        done_flag=args.done_flag,
     )
-    pulse_stop, pulse_th = start_progress_pulse(22, "loading ASR model")
-    try:
-        asr_model = whisperx.load_model(
-            args.model,
-            device,
-            language=args.language,
-            compute_type=compute_type,
-            vad_method=vad_method,
-            vad_options=vad_options if vad_options else None,
-            asr_options=asr_options,
-        )
-    finally:
-        stop_progress_pulse(pulse_stop, pulse_th)
 
-    pulse_stop, pulse_th = start_progress_pulse(32, "transcribing")
-    try:
-        report_progress(32, "transcribing")
-        transcribe_kw: dict[str, Any] = dict(batch_size=batch_size, language=args.language)
-        if args.chunk_size is not None:
-            transcribe_kw["chunk_size"] = max(4, min(int(args.chunk_size), 120))
-        result = asr_model.transcribe(audio, **transcribe_kw)
-    finally:
-        stop_progress_pulse(pulse_stop, pulse_th)
+    pipeline = WhisperXPipeline()
 
-    del asr_model
-    gc.collect()
-    try:
-        import torch
+    def load_report(pct: int, msg: str) -> None:
+        report_progress(pct, msg)
 
-        if device == "cuda":
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+    pipeline.load(cfg, report=load_report, dlog=dlog)
+    code = pipeline.transcribe(job, cfg, dlog=dlog)
+    pipeline.unload(dlog=dlog)
 
-    lang = (args.language or "").strip() or None
-    if not lang:
-        detected = result.get("language")
-        if isinstance(detected, str) and detected.strip():
-            lang = detected.strip()
-        else:
-            lang = "en"
-
-    report_progress(58, "loading align model")
-    pulse_stop, pulse_th = start_progress_pulse(58, "loading align model")
-    try:
-        align_kw: dict[str, Any] = {"language_code": lang, "device": device}
-        if args.align_model and str(args.align_model).strip():
-            align_kw["model_name"] = str(args.align_model).strip()
-        align_model, align_meta = whisperx.load_align_model(**align_kw)
-    finally:
-        stop_progress_pulse(pulse_stop, pulse_th)
-
-    pulse_stop, pulse_th = start_progress_pulse(68, "aligning words")
-    try:
-        report_progress(68, "aligning words")
-        result = whisperx.align(
-            result["segments"],
-            align_model,
-            align_meta,
-            audio,
-            device,
-            return_char_alignments=False,
-            interpolate_method=args.interpolate_method,
-        )
-    finally:
-        stop_progress_pulse(pulse_stop, pulse_th)
-
-    del align_model
-    gc.collect()
-    try:
-        import torch
-
-        if device == "cuda":
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-    if args.diarize:
-        if not args.hf_token:
-            print("ERROR: --diarize requires --hf_token (Hugging Face read token).", file=sys.stderr)
-            mark_exit(2)
-            return 2
-        from whisperx.diarize import DiarizationPipeline
-
-        report_progress(78, "diarizing")
-        diarize_model = DiarizationPipeline(token=args.hf_token, device=device)
-        try:
-            diarize_segments = diarize_model(
-                audio,
-                min_speakers=args.min_speakers,
-                max_speakers=args.max_speakers,
-            )
-        finally:
-            del diarize_model
-            gc.collect()
-
-        result = whisperx.assign_word_speakers(diarize_segments, result)
-
-    segments = result.get("segments") or []
-    serialized = [_serialize_segment(s) for s in segments if isinstance(s, dict)]
-    merged_drop = 0
-    for seg in serialized:
-        ws = seg.get("words")
-        if isinstance(ws, list) and len(ws) >= 2:
-            new_ws = _merge_latin_letter_runs_in_words(ws)
-            merged_drop += len(ws) - len(new_ws)
-            seg["words"] = new_ws
-    if merged_drop:
-        dlog(f"merged per-letter Latin tokens into words: net −{merged_drop} rows (fewer take markers)")
-
-    pipeline_opts: dict[str, Any] = {
-        "vad_method": vad_method,
-        "interpolate_method": args.interpolate_method,
-    }
-    if vad_options:
-        pipeline_opts["vad_options"] = dict(vad_options)
-    if args.chunk_size is not None:
-        pipeline_opts["chunk_size_seconds"] = max(4, min(int(args.chunk_size), 120))
-    if asr_options:
-        pipeline_opts["asr_options"] = dict(asr_options)
-    if args.align_model and str(args.align_model).strip():
-        pipeline_opts["align_model"] = str(args.align_model).strip()
-
-    payload: dict[str, Any] = {
-        "language": lang,
-        "model": args.model,
-        "source_file": args.input,
-        "segments": serialized,
-        "pipeline_options": pipeline_opts,
-    }
-
-    report_progress(86, "writing JSON and sidecars")
-    out_dir = os.path.dirname(os.path.abspath(args.output))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    words_tsv, plain_path = _sidecar_paths(args.output)
-    dlog(f"sidecars: words_tsv={words_tsv!r} plain={plain_path!r}")
-
-    plain_lines: list[str] = []
-    with open(words_tsv, "w", encoding="utf-8") as tsv:
-        for seg in payload["segments"]:
-            txt = (seg.get("text") or "").strip()
-            if txt:
-                plain_lines.append(txt)
-            for w in seg.get("words") or []:
-                if not isinstance(w, dict):
-                    continue
-                word = (w.get("word") or "").replace("\t", " ").replace("\n", " ").strip()
-                if not word:
-                    continue
-                try:
-                    ws = float(w.get("start", 0.0))
-                    we = float(w.get("end", 0.0))
-                except (TypeError, ValueError):
-                    continue
-                tsv.write(f"{ws:.9f}\t{we:.9f}\t{word}\n")
-
-    with open(plain_path, "w", encoding="utf-8") as pf:
-        pf.write("\n\n".join(plain_lines))
-        if plain_lines:
-            pf.write("\n")
-
-    abs_json = os.path.abspath(args.output)
-    print(f"Wrote JSON {abs_json} ({len(payload['segments'])} segments)", flush=True)
-    print(f"Wrote words TSV {os.path.abspath(words_tsv)}", flush=True)
-    print(f"Wrote plain transcript {os.path.abspath(plain_path)}", flush=True)
-
-    for src, dst in (
-        (args.output, args.mirror_json),
-        (words_tsv, args.mirror_tsv),
-        (plain_path, args.mirror_plain),
-    ):
-        if not dst:
-            continue
-        try:
-            md = os.path.dirname(os.path.abspath(dst))
-            if md:
-                os.makedirs(md, exist_ok=True)
-            shutil.copy2(src, dst)
-            print(f"Mirrored -> {os.path.abspath(dst)}", flush=True)
-        except OSError as exc:
-            print(f"Mirror failed ({dst}): {exc}", flush=True)
-            dlog(f"mirror failed {dst!r}: {exc!r}")
-
-    report_progress(100, "done")
-    dlog("done exit 0")
-    mark_exit(0)
-    return 0
+    mark_exit(code)
+    return code
 
 
 if __name__ == "__main__":
@@ -562,14 +201,11 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stdout, flush=True)
         raise SystemExit(130) from None
     except BaseException:
         import traceback
 
         tb = traceback.format_exc()
-        traceback.print_exc(file=sys.stdout)
-        sys.stdout.flush()
         try:
             ap2 = argparse.ArgumentParser(add_help=False)
             ap2.add_argument("--debug_log", default=None)
