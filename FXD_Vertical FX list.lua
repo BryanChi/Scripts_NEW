@@ -405,8 +405,9 @@ end
 -- ============================================================================
 local LICENSE_SECTION = 'FXD_Vertical_FX_List_License'
 -- Set to your deployed website domain (Vercel/Netlify/etc)
-local LICENSE_VERIFY_URL = 'https://coolreaperscripts.com/api/license/verify'
+local LICENSE_VERIFY_URL = 'https://www.coolreaperscripts.com/api/license/verify'
 local LICENSE_CHECK_INTERVAL = 24 * 60 * 60 -- seconds
+local LICENSE_BYPASS = true -- TEMP: set to false to re-enable real verification
 
 LicenseState = LicenseState or {
   status = nil,          -- active | trial | expired | inactive
@@ -514,6 +515,19 @@ local function SetLicenseResult(status, expiresAt, reason, licenseKey)
   SaveLicenseState()
 end
 
+local function ApplyBypassLicenseState(licenseKey)
+  LicenseState.status = 'active'
+  LicenseState.expiresAt = nil
+  LicenseState.reason = nil
+  if licenseKey ~= nil then
+    LicenseState.licenseKey = licenseKey
+  elseif not LicenseState.licenseKey or LicenseState.licenseKey == '' then
+    LicenseState.licenseKey = 'BYPASS'
+  end
+  LicenseState.lastCheck = os.time()
+  SaveLicenseState()
+end
+
 local function FormatExpiry(expiresAt)
   if not expiresAt then return 'No expiry' end
   -- API returns milliseconds; convert if value looks like ms
@@ -524,6 +538,21 @@ local function FormatExpiry(expiresAt)
   return os.date('%Y-%m-%d %H:%M:%S', value)
 end
 
+local function ShellQuote(str)
+  if not str then return "''" end
+  str = tostring(str):gsub("'", "'\\''")
+  return "'" .. str .. "'"
+end
+
+local function ReadTextFile(path)
+  if not path or path == '' then return nil end
+  local f = io.open(path, 'rb')
+  if not f then return nil end
+  local data = f:read('*a') or ''
+  f:close()
+  return data
+end
+
 local function BuildLicenseCurl(payload)
   if OS:match('Win') then
     return string.format(
@@ -531,18 +560,51 @@ local function BuildLicenseCurl(payload)
       payload:gsub('"', '\\"'),
       LICENSE_VERIFY_URL
     )
-  else
-    -- On macOS/Linux, use full path and proper escaping
-    return string.format(
-      "/usr/bin/curl -L -s -X POST -H 'Content-Type: application/json' -d %q %q",
-      payload,
-      LICENSE_VERIFY_URL
-    )
   end
+  return string.format(
+    "/usr/bin/curl -L -s -S -X POST -H 'Content-Type: application/json' -d %s %s",
+    ShellQuote(payload),
+    ShellQuote(LICENSE_VERIFY_URL)
+  )
+end
+
+local function RunLicenseCurl(cmd)
+  local response = nil
+  if not OS:match('Win') and io.popen then
+    local sh_cmd = '/bin/sh -c ' .. ShellQuote(cmd .. ' 2>&1')
+    local handle = io.popen(sh_cmd, 'r')
+    if handle then
+      response = handle:read('*a') or ''
+      handle:close()
+    end
+  end
+  -- Some REAPER/macOS setups can return empty output from popen/ExecProcess.
+  -- As a fallback, redirect curl output to a temp file and read it directly.
+  if (not response or response:match('^%s*$')) and not OS:match('Win') then
+    local tmp = os.tmpname()
+    if tmp and tmp ~= '' then
+      local capture_cmd = '/bin/sh -c ' .. ShellQuote(cmd .. ' > ' .. ShellQuote(tmp) .. ' 2>&1')
+      r.ExecProcess(capture_cmd, 10000)
+      response = ReadTextFile(tmp) or response
+      os.remove(tmp)
+    end
+  end
+  if not response or response:match('^%s*$') then
+    local exec_cmd = OS:match('Win') and cmd or ('/bin/sh -c ' .. ShellQuote(cmd .. ' 2>&1'))
+    response = r.ExecProcess(exec_cmd, 10000) or ''
+  end
+  if response and type(response) == 'string' then
+    response = response:match('^%s*(.-)%s*$') or response
+  end
+  return response
 end
 
 local function VerifyLicense(licenseKey)
   if LicenseState.checking then return false, 'Already checking' end
+  if LICENSE_BYPASS then
+    ApplyBypassLicenseState(licenseKey or LicenseState.licenseKey)
+    return true, 'active'
+  end
   
   -- Require license key
   local key = licenseKey or LicenseState.licenseKey
@@ -583,23 +645,7 @@ local function VerifyLicense(licenseKey)
   local cmd = BuildLicenseCurl(payload)
 
   LicenseState.checking = true
-  
-  -- Use io.popen with proper output capture
-  local response = nil
-  
-  local handle = io.popen(cmd, 'r')
-  if handle then
-    -- Read all output line by line to ensure we get everything
-    local lines = {}
-    for line in handle:lines() do
-      table.insert(lines, line)
-    end
-    response = table.concat(lines, '\n')
-    handle:close()
-  else
-    response = r.ExecProcess(cmd, 10000)
-  end
-  
+  local response = RunLicenseCurl(cmd)
   LicenseState.checking = false
 
   -- Check if response looks like an error code (single digit or negative number)
@@ -707,6 +753,7 @@ local function _0x1e2f()
 end
 
 function IsLicenseValid()
+  if LICENSE_BYPASS then return true end
   local _0x7f8a = _0x7a8b()
   local _0x9b0c = _0x1e2f()
   if not LicenseState or not LicenseState.status then return false end
@@ -716,6 +763,7 @@ function IsLicenseValid()
 end
 
 local function LicenseStatusText()
+  if LICENSE_BYPASS then return 'Verification bypass enabled (temporary)' end
   if not LicenseState.status then 
     return 'Unknown' 
   end
@@ -733,6 +781,7 @@ local function LicenseStatusText()
 end
 
 local function MaybeAutoVerifyLicense()
+  if LICENSE_BYPASS then return end
   if LicenseState.checking then return end
   if not LicenseState.licenseKey or LicenseState.licenseKey == '' then return end
   if (os.time() - (LicenseState.lastCheck or 0)) < LICENSE_CHECK_INTERVAL then return end
@@ -740,9 +789,12 @@ local function MaybeAutoVerifyLicense()
 end
 
 LoadLicenseState()
+if LICENSE_BYPASS then
+  ApplyBypassLicenseState(LicenseState.licenseKey)
+end
 
 -- Check license on startup if license key exists
-if LicenseState.licenseKey and LicenseState.licenseKey ~= '' then
+if (not LICENSE_BYPASS) and LicenseState.licenseKey and LicenseState.licenseKey ~= '' then
   if os.time() - LicenseState.lastCheck > 3600 then
     VerifyLicense(LicenseState.licenseKey)
   end
@@ -6775,6 +6827,11 @@ function loop()
  ]]  
   -- Ensure visibility toggles default to true
   if OPEN.ShowSends == nil then OPEN.ShowSends = true end
+  if LICENSE_BYPASS then
+    if LicenseState.status ~= 'active' or LicenseState.reason ~= nil then
+      ApplyBypassLicenseState(LicenseState.licenseKey)
+    end
+  end
   
   -- keep global TrackCount updated and detect project switches
   TrackCount = r.GetNumTracks()
