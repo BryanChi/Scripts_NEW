@@ -1,0 +1,55 @@
+desc:Sample Map MIDI
+author:bryan
+tags: MIDI drums sampler
+// Bridges incoming MIDI note-ons into gmem so Sample Map Browser can trigger drums.
+// Passes MIDI through unchanged. Mapping (which notes fire which pads) lives in the script.
+
+slider1:last_note=0<0,127,1>Last note
+slider2:last_vel=0<0,127,1>Last velocity
+slider3:evt_serial=0<0,1000000,1>Event serial
+
+in_pin:none
+out_pin:none
+
+options:gmem=SampleMapMIDI
+
+@init
+ext_noinit = 1;
+NOTE_ON  = $x90;
+NOTE_OFF = $x80;
+RING_CAP = 64;
+RING_BASE = 16; // gmem[16 + i*4] = note, vel, on, serial
+
+gmem[0] = 0; // serial
+gmem[5] = 0; // write index
+
+@block
+while (midirecv(offset, msg1, msg2, msg3)) (
+  status = msg1 & $xF0;
+  is_on  = (status == NOTE_ON && msg3 > 0);
+  is_off = (status == NOTE_OFF) || (status == NOTE_ON && msg3 == 0);
+
+  (is_on || is_off) ? (
+    serial = gmem[0] + 1;
+    gmem[0] = serial;
+    w = gmem[5] | 0;
+    w = w % RING_CAP;
+    base = RING_BASE + w * 4;
+    gmem[base]     = msg2;
+    gmem[base + 1] = msg3;
+    gmem[base + 2] = is_on ? 1 : 0;
+    gmem[base + 3] = serial;
+    gmem[5] = (w + 1) % RING_CAP;
+
+    gmem[1] = msg2;
+    gmem[2] = msg3;
+    gmem[3] = is_on ? 1 : 0;
+    gmem[4] = msg1 & $x0F;
+
+    last_note = msg2;
+    last_vel = msg3;
+    evt_serial = serial;
+  );
+
+  midisend(offset, msg1, msg2, msg3);
+);

@@ -9,3 +9,9 @@ fx_favorites.txt
 # OAuth configuration (contains sensitive credentials)
 oauth_config.lua
 oauth_callback_code.txt
+
+# Magenta Groove MIDI Dataset cache (downloaded by SampleMapGrooveMIDI.py)
+.groove_midi/
+
+# Fast Lua sample-index cache (regenerated from SampleMapData.json on save)
+SampleMapData.cache.lua
