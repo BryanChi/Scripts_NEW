@@ -1,8 +1,8 @@
 -- @description BRYAN Script Installer - Mini ReaPack Alternative
--- @version 1.0.0
+-- @version 1.1.0
 -- @author bryan
 -- @about Downloads and installs scripts, JSFX, and assets from GitHub repo. Automatically registers scripts in Action List.
--- @changelog Initial release
+-- @changelog Add Sample Map Browser repo (scripts, Python sidecars, JSFX, assets)
 
 local r = reaper
 
@@ -19,25 +19,18 @@ local REPOSITORIES = {
         repo = "Vertical-FX-List",         -- Repository name
         branch = "main"          -- Branch name (main, master, etc.)
     },
-    
-    -- Add more repositories as needed
-    -- scripts = {
-    --     user = "BryanChi",
-    --     repo = "MyScriptsRepo",
-    --     branch = "main"
-    -- },
-    -- effects = {
-    --     user = "BryanChi",
-    --     repo = "MyEffectsRepo",
-    --     branch = "main"
-    -- },
+    sample_map = {
+        user = "BryanChi",
+        repo = "Sample-Map",
+        branch = "main"
+    },
 }
 
 -- Selected commits per repository (commit hash or branch name)
 local SELECTED_COMMITS = {}
 
 -- Main script name (for user instructions)
-local MAIN_SCRIPT_NAME = "Vertical FX List"
+local MAIN_SCRIPT_NAME = "Vertical FX List' or 'Sample Map Browser"
 
 -- Extract version number from commit message
 -- Looks for patterns like ##Ver0.8## or ##Ver0.81## in the commit message
@@ -69,13 +62,92 @@ local function GetRepoRawBase(repo_key)
                          repo.user, repo.repo, ref)
 end
 
--- Helper function to create file entry
+-- Helper function to create file entry (Vertical FX List / main repo)
 local function CreateFileEntry(url_path, script_type)
     return {
         url_path = url_path,
         target_path = "Scripts/CoolReaperScripts/Vertical FX List/" .. url_path,
         script_type = script_type,
+        repo = "main",
     }
+end
+
+-- Sample Map files install next to the Lua (SCRIPT_DIR) except JSFX → Effects/
+local SAMPLE_MAP_INSTALL_DIR = "Scripts/CoolReaperScripts/Sample Map/"
+
+local function CreateSampleMapFileEntry(url_path, script_type)
+    local target_path = url_path
+    if not url_path:match("^Effects/") then
+        target_path = SAMPLE_MAP_INSTALL_DIR .. url_path
+    end
+    return {
+        url_path = url_path,
+        target_path = target_path,
+        script_type = script_type,
+        repo = "sample_map",
+    }
+end
+
+local function GetSampleMapFiles()
+    local files = {}
+
+    -- Scripts registered in the Action List
+    table.insert(files, CreateSampleMapFileEntry("Sample Map Browser.lua", "lua"))
+    table.insert(files, CreateSampleMapFileEntry("Sample Map - Quick swap for selected item.lua", "lua"))
+
+    -- Sidecars: copy only (do not register Python / tag palettes as actions)
+    table.insert(files, CreateSampleMapFileEntry("SampleMapAnalyzer.py", "asset"))
+    table.insert(files, CreateSampleMapFileEntry("SampleMapDrumAI.py", "asset"))
+    table.insert(files, CreateSampleMapFileEntry("SampleMapGrooveMIDI.py", "asset"))
+    table.insert(files, CreateSampleMapFileEntry("tag_presets.lua", "asset"))
+
+    -- JSFX (REAPER Effects folder)
+    table.insert(files, CreateSampleMapFileEntry("Effects/SampleMapMIDI.jsfx", "jsfx"))
+    table.insert(files, CreateSampleMapFileEntry("Effects/SampleMapPlayer.jsfx", "jsfx"))
+    table.insert(files, CreateSampleMapFileEntry("Effects/SampleMapPreview.jsfx", "jsfx"))
+
+    -- Icon attribution + mapping
+    table.insert(files, CreateSampleMapFileEntry("assets/behringer-icons/ATTRIBUTION.md", "asset"))
+    table.insert(files, CreateSampleMapFileEntry("assets/behringer-icons/LICENSE", "asset"))
+    table.insert(files, CreateSampleMapFileEntry("assets/behringer-icons/role_map.json", "asset"))
+
+    for i = 1, 74 do
+        table.insert(files, CreateSampleMapFileEntry("assets/behringer-icons/png/" .. i .. ".png", "asset"))
+    end
+    local named_behringer = {
+        "808", "bass", "clap", "crash", "default", "drum", "fx", "guitar", "hat",
+        "keys", "kick", "lead", "loop", "pad", "perc", "pluck", "ride", "rim",
+        "snap", "snare", "tom", "vocal",
+    }
+    for _, name in ipairs(named_behringer) do
+        table.insert(files, CreateSampleMapFileEntry("assets/behringer-icons/png/" .. name .. ".png", "asset"))
+    end
+
+    local seq_images = {
+        "seq-region-parent.png",
+        "seq-region-parent-dots.png",
+        "seq-region-parent-drum.png",
+        "seq-region-parent-led.png",
+        "seq-region-parent-notes.png",
+        "seq-region-parent-tape.png",
+        "seq-region-parent-tile.png",
+        "seq-region-parent-wave.png",
+    }
+    for _, filename in ipairs(seq_images) do
+        table.insert(files, CreateSampleMapFileEntry("assets/" .. filename, "asset"))
+    end
+
+    local vfx_icons = {
+        "camera.png", "copy.png", "folder.png", "folder_open.png", "graph.png",
+        "hide.png", "link.png", "receive.png", "search.png", "send.png",
+        "settings.png", "show.png", "snapshot.png", "star.png", "starHollow.png",
+        "trash.png", "undo.png", "update.png", "volume.png",
+    }
+    for _, filename in ipairs(vfx_icons) do
+        table.insert(files, CreateSampleMapFileEntry("assets/vertical-fx-icons/" .. filename, "asset"))
+    end
+
+    return files
 end
 
 -- Function to automatically generate Resources folder file list
@@ -179,6 +251,7 @@ local FILES_TO_INSTALL = {
         url_path = "FXD_Vertical FX list.lua",
         target_path = "Scripts/CoolReaperScripts/Vertical FX List/FXD_Vertical FX list.lua",
         script_type = "lua",
+        repo = "main",
     },
     
     -- Configuration files
@@ -186,12 +259,19 @@ local FILES_TO_INSTALL = {
         url_path = "style_presets_FACTORY.lua",
         target_path = "Scripts/CoolReaperScripts/Vertical FX List/style_presets_FACTORY.lua",
         script_type = "lua",
+        repo = "main",
     },
 }
 
 -- Automatically add all Resources folder files (excluding specified files)
 local resources_files = GetResourcesFiles()
 for _, file_entry in ipairs(resources_files) do
+    table.insert(FILES_TO_INSTALL, file_entry)
+end
+
+-- Sample Map Browser (BryanChi/Sample-Map)
+local sample_map_files = GetSampleMapFiles()
+for _, file_entry in ipairs(sample_map_files) do
     table.insert(FILES_TO_INSTALL, file_entry)
 end
 
