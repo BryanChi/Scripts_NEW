@@ -2,7 +2,7 @@
 -- @version 1.1.1
 -- @author bryan
 -- @about Downloads and installs scripts, JSFX, and assets from GitHub repo. Automatically registers scripts in Action List.
--- @changelog Add Split to Stems as an installable script; license chips on each licensed script
+-- @changelog Prefix installed action scripts with CRS_ so they stay distinct from local dev copies
 
 local r = reaper
 
@@ -402,6 +402,62 @@ local function DetectScriptType(filepath)
     end
 end
 
+-- Installed action scripts get a CRS_ filename so they sit next to (and don't
+-- overwrite) in-development copies. Companions loaded by hardcoded names stay
+-- unprefixed: Python sidecars, JSFX, tag_presets.lua, SampleMapUpdate.lua,
+-- Vertical FX List Resources, style_presets_FACTORY.lua.
+local CRS_SKIP_FILENAMES = {
+    ["style_presets_FACTORY.lua"] = true,
+}
+
+local function BasenameOf(path)
+    return (path and path:match("([^/\\]+)$")) or path or ""
+end
+
+local function ReplaceBasename(path, new_name)
+    local name = BasenameOf(path)
+    if name == "" or name == path then
+        return new_name
+    end
+    return path:sub(1, #path - #name) .. new_name
+end
+
+local function ShouldCRSPrefix(file_info)
+    local target = file_info.target_path or file_info.url_path or ""
+    local script_type = file_info.script_type or DetectScriptType(target)
+    if script_type ~= "lua" and script_type ~= "eel" and script_type ~= "py" then
+        return false
+    end
+    if target:match("Resources") or target:match("Functions") then
+        return false
+    end
+    local name = BasenameOf(target)
+    if CRS_SKIP_FILENAMES[name] or name:match("^CRS_") then
+        return false
+    end
+    return true
+end
+
+local function ResolveInstallTarget(file_info)
+    local target = file_info.target_path or file_info.url_path
+    if not ShouldCRSPrefix(file_info) then
+        return target
+    end
+    local name = BasenameOf(target)
+    local new_name
+    if name == "FXD_Vertical FX list.lua" then
+        new_name = "CRS_vertical fx list.lua"
+    else
+        new_name = "CRS_" .. name
+    end
+    return ReplaceBasename(target, new_name)
+end
+
+local function IsVerticalFXListMain(file_info)
+    local url = file_info.url_path or ""
+    return url:match("FXD_Vertical FX list%.lua$") ~= nil
+end
+
 -- ============================================================================
 -- DOWNLOAD FUNCTIONS
 -- ============================================================================
@@ -732,7 +788,9 @@ local function InstallFromRelease(extracted_folder, progress_callback, file_list
         
         -- Special handling for Vertical FX List script
         local filename = target_path:match("([^/\\]+)$") or url_path:match("([^/\\]+)$")
-        local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
+        local dest_target = ResolveInstallTarget(file_info)
+        dest_path = resource_path .. sep .. NormalizePath(dest_target)
+        local is_vertical_fx_list = IsVerticalFXListMain(file_info)
         
         if is_vertical_fx_list then
             -- Install directly to CoolReaperScripts/Vertical FX List folder with different name
@@ -947,12 +1005,13 @@ local function InstallFromRelease(extracted_folder, progress_callback, file_list
         end
         source_file:close()
         
-        -- Build final target path
-        local full_target = resource_path .. sep .. NormalizePath(target_path)
+        -- Build final target path (CRS_ prefix on action scripts)
+        local dest_target = ResolveInstallTarget(file_info)
+        local full_target = resource_path .. sep .. NormalizePath(dest_target)
         
         -- Get filename
-        local filename = target_path:match("([^/\\]+)$") or url_path:match("([^/\\]+)$")
-        local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
+        local filename = BasenameOf(dest_target)
+        local is_vertical_fx_list = IsVerticalFXListMain(file_info)
         
         -- Special handling for Vertical FX List script
         if is_vertical_fx_list then
@@ -972,7 +1031,7 @@ local function InstallFromRelease(extracted_folder, progress_callback, file_list
             if existing_file then
                 existing_file:close()
                 if progress_callback then
-                    progress_callback("Skipping (already exists): " .. target_path)
+                    progress_callback("Skipping (already exists): " .. dest_target)
                 end
                 table.insert(results.success, url_path)
                 goto continue
@@ -995,7 +1054,7 @@ local function InstallFromRelease(extracted_folder, progress_callback, file_list
                 if is_vertical_fx_list then
                     progress_callback("Registering CRS_vertical fx list.lua")
                 else
-                    progress_callback("Registering: " .. target_path)
+                    progress_callback("Registering: " .. dest_target)
                 end
             end
             
@@ -1017,7 +1076,7 @@ end
 
 local function InstallFile(file_info, progress_callback)
     local url_path = file_info.url_path
-    local target_path = file_info.target_path
+    local target_path = ResolveInstallTarget(file_info)
     local script_type = file_info.script_type
     local repo_key = file_info.repo
     
@@ -1037,10 +1096,10 @@ local function InstallFile(file_info, progress_callback)
     local sep = GetPathSeparator()
     
     -- Get filename
-    local filename = target_path:match("([^/\\]+)$") or url_path:match("([^/\\]+)$")
+    local filename = BasenameOf(target_path)
     
     -- Special handling for Vertical FX List script
-    local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
+    local is_vertical_fx_list = IsVerticalFXListMain(file_info)
     local download_path
     local final_download_path
     
@@ -1348,27 +1407,29 @@ local function ProcessNextFile()
             
             -- Add to install log
             if commit_gui_state.ctx then
+                local function log_name(url_path)
+                    for _, file_info in ipairs(FILES_TO_INSTALL) do
+                        if file_info.url_path == url_path then
+                            return BasenameOf(ResolveInstallTarget(file_info))
+                        end
+                    end
+                    local name = BasenameOf(url_path)
+                    if name == "FXD_Vertical FX list.lua" then
+                        return "CRS_vertical fx list.lua"
+                    end
+                    return name
+                end
                 for _, file_path in ipairs(results.success) do
-                    local file_name = file_path:match("([^/\\]+)$") or file_path
-                    -- Check if it's Vertical FX List (which gets renamed)
-                    local is_vertical_fx_list = (file_name == "FXD_Vertical FX list.lua")
-                    -- Use the final downloaded filename for log entries
-                    file_name = is_vertical_fx_list and "CRS_vertical fx list.lua" or file_name
                     table.insert(commit_gui_state.install_log, {
-                        file = file_name,
+                        file = log_name(file_path),
                         path = file_path,
                         status = "success",
                         message = "Installed successfully"
                     })
                 end
                 for _, failed in ipairs(results.failed) do
-                    local file_name = failed.path:match("([^/\\]+)$") or failed.path
-                    -- Check if it's Vertical FX List (which gets renamed)
-                    local is_vertical_fx_list = (file_name == "FXD_Vertical FX list.lua")
-                    -- Use the final downloaded filename for log entries
-                    file_name = is_vertical_fx_list and "CRS_vertical fx list.lua" or file_name
                     table.insert(commit_gui_state.install_log, {
-                        file = file_name,
+                        file = log_name(failed.path),
                         path = failed.path,
                         status = "failed",
                         message = failed.error or "Unknown error"
@@ -1407,11 +1468,9 @@ local function ProcessNextFile()
     -- Update GUI progress
     if commit_gui_state.ctx then
         commit_gui_state.install_progress = i / install_state.total
-        -- Get filename and check if it's Vertical FX List (which gets renamed)
-        local filename = file_info.url_path:match("([^/\\]+)$") or file_info.url_path
-        local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
-        -- Use the final downloaded filename for display
-        commit_gui_state.install_current_file = is_vertical_fx_list and "CRS_vertical fx list.lua" or filename
+        -- Get filename from the installed (possibly CRS_ prefixed) path
+        local dest_target = ResolveInstallTarget(file_info)
+        commit_gui_state.install_current_file = BasenameOf(dest_target)
         commit_gui_state.install_status = "Installing..."
         commit_gui_state.install_success_count = #results.success
         commit_gui_state.install_failed_count = #results.failed
@@ -1427,12 +1486,10 @@ local function ProcessNextFile()
         end
     end)
     
-    -- Get filename and check if it's Vertical FX List (which gets renamed)
-    local filename = file_info.url_path:match("([^/\\]+)$") or file_info.url_path
-    local is_vertical_fx_list = (filename == "FXD_Vertical FX list.lua")
-    -- Use the final downloaded filename for log entries
-    local file_name = is_vertical_fx_list and "CRS_vertical fx list.lua" or filename
-    local target_path = file_info.target_path or file_info.url_path
+    -- Get filename from the installed (possibly CRS_ prefixed) path
+    local dest_target = ResolveInstallTarget(file_info)
+    local file_name = BasenameOf(dest_target)
+    local target_path = dest_target
     
     if success then
         table.insert(results.success, file_info.url_path)
