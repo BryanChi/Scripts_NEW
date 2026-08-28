@@ -1,8 +1,8 @@
 -- @description BRYAN Script Installer - Mini ReaPack Alternative
--- @version 1.1.0
+-- @version 1.1.1
 -- @author bryan
 -- @about Downloads and installs scripts, JSFX, and assets from GitHub repo. Automatically registers scripts in Action List.
--- @changelog Add Sample Map Browser repo (scripts, Python sidecars, JSFX, assets)
+-- @changelog Add Split to Stems as an installable script; license chips on each licensed script
 
 local r = reaper
 
@@ -17,20 +17,32 @@ local REPOSITORIES = {
     main = {
         user = "BryanChi",      -- GitHub username
         repo = "Vertical-FX-List",         -- Repository name
-        branch = "main"          -- Branch name (main, master, etc.)
+        branch = "main",         -- Branch name (main, master, etc.)
+        display = "Vertical FX List",
+        action_names = { "Vertical FX List" },
+        license_section = "FXD_Vertical_FX_List_License",
     },
     sample_map = {
         user = "BryanChi",
         repo = "Sample-Map",
-        branch = "main"
+        branch = "main",
+        display = "Sample Map",
+        action_names = { "Sample Map Browser", "Sample Map - Quick swap for selected item" },
+        license_section = "Sample_Map_License",
+    },
+    stem_split = {
+        user = "BryanChi",
+        repo = "Stem-Split",
+        branch = "main",
+        display = "Split to Stems",
+        action_names = { "Split selected item to stems", "Tempo map from drum stem" },
     },
 }
 
+local LICENSE_VERIFY_URL = "https://www.coolreaperscripts.com/api/license/verify"
+
 -- Selected commits per repository (commit hash or branch name)
 local SELECTED_COMMITS = {}
-
--- Main script name (for user instructions)
-local MAIN_SCRIPT_NAME = "Vertical FX List' or 'Sample Map Browser"
 
 -- Extract version number from commit message
 -- Looks for patterns like ##Ver0.8## or ##Ver0.81## in the commit message
@@ -100,6 +112,7 @@ local function GetSampleMapFiles()
     table.insert(files, CreateSampleMapFileEntry("SampleMapDrumAI.py", "asset"))
     table.insert(files, CreateSampleMapFileEntry("SampleMapGrooveMIDI.py", "asset"))
     table.insert(files, CreateSampleMapFileEntry("tag_presets.lua", "asset"))
+    table.insert(files, CreateSampleMapFileEntry("SampleMapUpdate.lua", "asset"))
 
     -- JSFX (REAPER Effects folder)
     table.insert(files, CreateSampleMapFileEntry("Effects/SampleMapMIDI.jsfx", "jsfx"))
@@ -148,6 +161,27 @@ local function GetSampleMapFiles()
     end
 
     return files
+end
+
+-- Stem Split files (BryanChi/Stem-Split) — Lua + Python sidecar; venv is created after download
+local STEM_SPLIT_INSTALL_DIR = "Scripts/CoolReaperScripts/Stem Split/"
+
+local function CreateStemSplitFileEntry(url_path, script_type)
+    return {
+        url_path = url_path,
+        target_path = STEM_SPLIT_INSTALL_DIR .. url_path,
+        script_type = script_type,
+        repo = "stem_split",
+    }
+end
+
+local function GetStemSplitFiles()
+    return {
+        CreateStemSplitFileEntry("Split selected item to stems.lua", "lua"),
+        CreateStemSplitFileEntry("Tempo map from drum stem.lua", "lua"),
+        CreateStemSplitFileEntry("StemSplit.py", "asset"),
+        CreateStemSplitFileEntry("requirements.txt", "asset"),
+    }
 end
 
 -- Function to automatically generate Resources folder file list
@@ -275,6 +309,12 @@ for _, file_entry in ipairs(sample_map_files) do
     table.insert(FILES_TO_INSTALL, file_entry)
 end
 
+-- Split to Stems (BryanChi/Stem-Split)
+local stem_split_files = GetStemSplitFiles()
+for _, file_entry in ipairs(stem_split_files) do
+    table.insert(FILES_TO_INSTALL, file_entry)
+end
+
 -- Commit selection GUI state (define early so installers can update it)
 local commit_gui_state = {
     open = true,
@@ -288,6 +328,8 @@ local commit_gui_state = {
     error_msg = nil,
     current_repo_index = 1,
     repos_to_select = {},
+    selected_repos = {}, -- [repo_key] = true when ticked for install
+    repo_ui = {}, -- [repo_key] = { loading, error_msg, use_releases, releases, commits }
     title_font = nil, -- Bold font for title
     -- Installation progress
     installing = false,
@@ -299,11 +341,15 @@ local commit_gui_state = {
     install_total = 0,
     install_log = {}, -- List of {file = "filename", status = "success"/"failed", message = "status message"}
     install_log_expanded = false, -- Whether the installation log is expanded
+    -- Private standalone Python (python-build-standalone, no PATH / no admin)
+    python_path = "",
+    python_version = "",
     -- Modal popup
     show_modal = false,
     modal_title = "",
     modal_message = "",
-    modal_type = "success" -- "success" or "error"
+    modal_type = "success", -- "success" or "error"
+    license_ui = {}, -- [repo_key] = { label, bg, fg, tooltip, status }
 }
 
 -- ============================================================================
@@ -649,12 +695,15 @@ local function DownloadAndExtractZip(zip_url, progress_callback)
 end
 
 -- Install files from extracted release folder
-local function InstallFromRelease(extracted_folder, progress_callback)
+local function InstallFromRelease(extracted_folder, progress_callback, file_list)
     local resource_path = GetResourcePath()
     local sep = GetPathSeparator()
     local results = {success = {}, failed = {}}
+    if not file_list or #file_list == 0 then
+        file_list = FILES_TO_INSTALL
+    end
     
-    for _, file_info in ipairs(FILES_TO_INSTALL) do
+    for _, file_info in ipairs(file_list) do
         local url_path = file_info.url_path
         local target_path = file_info.target_path
         local script_type = file_info.script_type
@@ -871,12 +920,15 @@ local function DownloadAndExtractZip(zip_url, progress_callback)
 end
 
 -- Install files from extracted release archive
-local function InstallFromRelease(extracted_folder, progress_callback)
+local function InstallFromRelease(extracted_folder, progress_callback, file_list)
     local resource_path = GetResourcePath()
     local sep = GetPathSeparator()
     local results = {success = {}, failed = {}}
+    if not file_list or #file_list == 0 then
+        file_list = FILES_TO_INSTALL
+    end
     
-    for _, file_info in ipairs(FILES_TO_INSTALL) do
+    for _, file_info in ipairs(file_list) do
         local url_path = file_info.url_path
         local target_path = file_info.target_path
         local script_type = file_info.script_type
@@ -1091,8 +1143,72 @@ local install_state = {
     total = 0,
     started = false,
     use_release = false, -- Whether installing from release
-    release_zip_extracted = nil -- Path to extracted release folder
+    release_zip_extracted = nil, -- Path to extracted release folder
 }
+
+local FinishInstallation
+
+local function GetSelectedRepoKeys()
+    local keys = {}
+    for _, repo_key in ipairs(commit_gui_state.repos_to_select) do
+        if commit_gui_state.selected_repos[repo_key] ~= false then
+            keys[#keys + 1] = repo_key
+        end
+    end
+    return keys
+end
+
+local function BuildPostInstallMessage(success_count, failed_count, repo_keys)
+    local lines = {
+        "Installation complete!",
+        "",
+        string.format("Installed %d file(s).", success_count or 0),
+    }
+    if (failed_count or 0) > 0 then
+        lines[#lines + 1] = string.format("%d file(s) failed — see the log for details.", failed_count)
+    end
+
+    local names = {}
+    local actions = {}
+    for _, repo_key in ipairs(repo_keys or {}) do
+        local repo = REPOSITORIES[repo_key]
+        if repo then
+            names[#names + 1] = "  • " .. (repo.display or repo.repo)
+            for _, action in ipairs(repo.action_names or {}) do
+                actions[#actions + 1] = "  • " .. action
+            end
+        end
+    end
+    if #names > 0 then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "Scripts:"
+        for _, name in ipairs(names) do
+            lines[#lines + 1] = name
+        end
+    end
+    local installed_stem_split = false
+    if #actions > 0 then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "To start:"
+        lines[#lines + 1] = "1. Actions → Show Action List"
+        lines[#lines + 1] = "2. Search for:"
+        for _, action in ipairs(actions) do
+            lines[#lines + 1] = action
+        end
+        lines[#lines + 1] = "3. Run it from the list"
+    end
+    for _, repo_key in ipairs(repo_keys or {}) do
+        if repo_key == "stem_split" then
+            installed_stem_split = true
+            break
+        end
+    end
+    if installed_stem_split then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "Split to Stems is Apple Silicon only. First run downloads model weights."
+    end
+    return table.concat(lines, "\n")
+end
 
 local function ShowInstallSummary()
     local results = install_state.results
@@ -1105,26 +1221,13 @@ local function ShowInstallSummary()
         
         -- Show modal popup with installation summary
         if #results.success > 0 then
-            local message = string.format(
-                "Installation Complete!\n\n" ..
-                "Successfully installed: %d file(s)",
-                #results.success
-            )
-            
-            if #results.failed > 0 then
-                message = message .. string.format("\nFailed: %d file(s)", #results.failed)
-            end
-            
-            message = message .. string.format(
-                "\n\nTo start the script:\n" ..
-                "1. Open Actions → Show Action List\n" ..
-                "2. Search for '%s'\n" ..
-                "3. Run the script from the list",
-                MAIN_SCRIPT_NAME
-            )
-            
+            local repo_keys = install_state.installed_repos or GetSelectedRepoKeys()
             commit_gui_state.modal_title = "Installation Complete"
-            commit_gui_state.modal_message = message
+            commit_gui_state.modal_message = BuildPostInstallMessage(
+                #results.success,
+                #results.failed,
+                repo_keys
+            )
             commit_gui_state.modal_type = (#results.failed == 0) and "success" or "error"
             commit_gui_state.show_modal = true
         else
@@ -1156,9 +1259,14 @@ local function ProcessNextFile()
     if install_state.use_release then
         if not install_state.release_zip_extracted then
             -- Download and extract zip first
-            local repo_key = next(commit_gui_state.selected_releases) or next(REPOSITORIES)
+            -- Use the repo that is actually being installed, not an arbitrary selected_releases entry
+            local repo_key = install_state.installed_repos and install_state.installed_repos[1]
+            if not repo_key then
+                repo_key = next(REPOSITORIES)
+            end
             local release_tag = commit_gui_state.selected_releases[repo_key]
-            local releases = commit_gui_state.releases
+            local ui = commit_gui_state.repo_ui and commit_gui_state.repo_ui[repo_key]
+            local releases = (ui and ui.releases) or commit_gui_state.releases
             
             -- Find the release zip URL
             local zip_url = nil
@@ -1231,10 +1339,10 @@ local function ProcessNextFile()
                     commit_gui_state.install_status = msg
                     -- Update progress based on files processed (approximate)
                     file_count = file_count + 1
-                    local total = #FILES_TO_INSTALL
+                    local total = math.max(1, install_state.total or #FILES_TO_INSTALL)
                     commit_gui_state.install_progress = 0.3 + (file_count / total * 0.7) -- 30-100%
                 end
-            end)
+            end, install_state.files)
             
             install_state.results = results
             
@@ -1275,7 +1383,7 @@ local function ProcessNextFile()
                 commit_gui_state.install_progress = 1.0
                 commit_gui_state.install_status = "Installation complete!"
             end
-            ShowInstallSummary()
+            FinishInstallation()
             return
         end
     end
@@ -1287,7 +1395,7 @@ local function ProcessNextFile()
             commit_gui_state.install_progress = 1.0
             commit_gui_state.install_status = "Installation complete!"
         end
-        ShowInstallSummary()
+        FinishInstallation()
         return -- Done
     end
     
@@ -1368,21 +1476,63 @@ local function InstallAllFiles()
         return
     end
     
-    -- Check if using releases
+    -- Only install files for ticked products
+    local selected_keys = GetSelectedRepoKeys()
+    if #selected_keys == 0 then
+        if commit_gui_state.ctx then
+            commit_gui_state.installing = false
+            commit_gui_state.modal_title = "Nothing selected"
+            commit_gui_state.modal_message = "Tick at least one script to install."
+            commit_gui_state.modal_type = "error"
+            commit_gui_state.show_modal = true
+        end
+        return
+    end
+    local selected_set = {}
+    for _, key in ipairs(selected_keys) do
+        selected_set[key] = true
+    end
+    local files = {}
+    for _, file_info in ipairs(FILES_TO_INSTALL) do
+        local repo_key = file_info.repo or "main"
+        if selected_set[repo_key] then
+            files[#files + 1] = file_info
+        end
+    end
+    if #files == 0 then
+        if commit_gui_state.ctx then
+            commit_gui_state.installing = false
+        end
+        return
+    end
+
+    -- Zip install only works for a single-repo release.
     local use_release = false
-    local current_repo_key = commit_gui_state.repos_to_select[commit_gui_state.current_repo_index]
-    if current_repo_key and commit_gui_state.selected_releases[current_repo_key] then
-        use_release = true
+    if #selected_keys == 1 then
+        local current_repo_key = selected_keys[1]
+        local ui = commit_gui_state.repo_ui[current_repo_key]
+        if current_repo_key and commit_gui_state.selected_releases[current_repo_key]
+            and ui and ui.use_releases and ui.releases then
+            use_release = true
+            commit_gui_state.releases = ui.releases
+        end
+    end
+    for _, repo_key in ipairs(selected_keys) do
+        SELECTED_COMMITS[repo_key] = commit_gui_state.selected_commits[repo_key]
+            or commit_gui_state.selected_releases[repo_key]
+            or (REPOSITORIES[repo_key] and REPOSITORIES[repo_key].branch)
     end
     
     -- Initialize installation state
-    install_state.files = FILES_TO_INSTALL
+    install_state.files = files
     install_state.current_index = 0
     install_state.results = {success = {}, failed = {}}
-    install_state.total = #FILES_TO_INSTALL
+    install_state.total = #files
     install_state.started = true
     install_state.use_release = use_release
     install_state.release_zip_extracted = nil
+    install_state.installed_repos = selected_keys
+    install_state.stem_venv_done = false
     
     -- Initialize GUI progress state
     if commit_gui_state.ctx then
@@ -1411,6 +1561,553 @@ local function CheckReaImGui()
         return false
     end
     return true
+end
+
+-- ============================================================================
+-- PRIVATE STANDALONE PYTHON (python-build-standalone)
+-- Ships a CPython next to Cool Reaper Scripts. No admin, no PATH changes.
+-- ============================================================================
+
+local PYTHON_STANDALONE = {
+    latest_meta = "https://raw.githubusercontent.com/astral-sh/python-build-standalone/latest-release/latest-release.json",
+    asset_prefix = "https://github.com/astral-sh/python-build-standalone/releases/download/",
+    fallback_tag = "20260825",
+}
+
+local function TrimProcessOutput(s)
+    if not s then return "" end
+    s = tostring(s)
+    if s == "-999" then return "" end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function FileExistsPath(path)
+    if not path or path == "" then
+        return false
+    end
+    if r.file_exists and r.file_exists(path) then
+        return true
+    end
+    local fh = io.open(path, "rb")
+    if not fh then
+        return false
+    end
+    fh:close()
+    return true
+end
+
+local function CoolReaperScriptsDir()
+    return GetResourcePath() .. GetPathSeparator() .. "Scripts" .. GetPathSeparator() .. "CoolReaperScripts"
+end
+
+local function BundledPythonDir()
+    return CoolReaperScriptsDir() .. GetPathSeparator() .. "python"
+end
+
+local function GetBundledPythonBin()
+    local dir = BundledPythonDir()
+    local OS = r.GetOS()
+    local candidates
+    if OS:match("Win") then
+        candidates = {
+            dir .. "\\python.exe",
+            dir .. "/python.exe",
+        }
+    else
+        candidates = {
+            dir .. "/bin/python3",
+            dir .. "/bin/python3.13",
+            dir .. "/bin/python",
+        }
+    end
+    for _, path in ipairs(candidates) do
+        if FileExistsPath(path) then
+            return path
+        end
+    end
+    return nil
+end
+
+local function DetectStandalonePythonTriple()
+    local OS = r.GetOS() or ""
+    if OS == "macOS-arm64" then
+        return "aarch64-apple-darwin"
+    elseif OS:match("OSX") then
+        return "x86_64-apple-darwin"
+    elseif OS:match("Win") then
+        local arch = TrimProcessOutput(r.ExecProcess('cmd /c echo %PROCESSOR_ARCHITECTURE%', 3000)):upper()
+        if arch:match("ARM64") then
+            return "aarch64-pc-windows-msvc"
+        end
+        if OS == "Win32" and not arch:match("AMD64") and not arch:match("X64") then
+            return nil, "64-bit REAPER is required to install the private Python."
+        end
+        return "x86_64-pc-windows-msvc"
+    end
+
+    -- Linux / Other
+    local machine = TrimProcessOutput(r.ExecProcess("/usr/bin/uname -m", 3000)):lower()
+    if machine == "aarch64" or machine == "arm64" then
+        return "aarch64-unknown-linux-gnu"
+    elseif machine == "x86_64" or machine == "amd64" then
+        return "x86_64-unknown-linux-gnu"
+    end
+    return nil, "This OS/architecture is not supported for the private Python install (" .. OS .. ")."
+end
+
+local function RunCmd(cmd, timeout_ms)
+    local result = r.ExecProcess(cmd, timeout_ms or 30000)
+    if result == "-999" then
+        return nil, "Command timed out"
+    end
+    return result, nil
+end
+
+local function RemoveDir(path)
+    if not path or path == "" then
+        return
+    end
+    local OS = r.GetOS()
+    if OS:match("Win") then
+        RunCmd(string.format('cmd /c if exist "%s" rmdir /s /q "%s"', path, path), 60000)
+    else
+        RunCmd(string.format('/bin/rm -rf "%s"', path), 60000)
+    end
+end
+
+local function DirHasContents(path)
+    if not path or path == "" then
+        return false
+    end
+    if r.EnumerateFiles(path, 0) then
+        return true
+    end
+    if r.EnumerateSubdirectories(path, 0) then
+        return true
+    end
+    return false
+end
+
+local function MoveDir(src, dest)
+    local OS = r.GetOS()
+    local cmd
+    if OS:match("Win") then
+        cmd = string.format('cmd /c move /Y "%s" "%s"', src, dest)
+    else
+        cmd = string.format('/bin/mv "%s" "%s"', src, dest)
+    end
+    local result, err = RunCmd(cmd, 60000)
+    if err then
+        return false, err
+    end
+    if not DirHasContents(dest) then
+        return false, "Failed to move Python folder" .. (result and (": " .. result) or "")
+    end
+    return true
+end
+
+local function DownloadUrlToFile(url, output_path, timeout_ms)
+    local OS = r.GetOS()
+    EnsureDirectoryExists(GetDirectoryFromPath(output_path))
+    local escaped_path = output_path:gsub('"', '\\"')
+    local cmd
+    if OS:match("Win") then
+        cmd = string.format('curl -L -f -s -S -A "CoolReaperScriptInstaller" -H "Accept: application/vnd.github.v3+json" -o "%s" "%s" 2>&1', escaped_path, url)
+    else
+        cmd = string.format('/usr/bin/curl -L -f -s -S -A "CoolReaperScriptInstaller" -H "Accept: application/vnd.github.v3+json" -o "%s" "%s" 2>&1', escaped_path, url)
+    end
+    local result, err = RunCmd(cmd, timeout_ms or 180000)
+    if err then
+        return false, err
+    end
+    local file = io.open(output_path, "rb")
+    if not file then
+        return false, "Download failed" .. (result and (": " .. result) or "")
+    end
+    local size = file:seek("end")
+    file:close()
+    if not size or size == 0 then
+        return false, "Downloaded file is empty" .. (result and (": " .. result) or "")
+    end
+    return true, size
+end
+
+local function ReadFileContents(path)
+    local file = io.open(path, "rb")
+    if not file then
+        return nil
+    end
+    local content = file:read("*all")
+    file:close()
+    return content
+end
+
+local function FindStandaloneAssetName(api_json, tag, triple)
+    local function match_series(series)
+        local esc_tag = tag:gsub("(%W)", "%%%1")
+        local esc_triple = triple:gsub("(%W)", "%%%1")
+        local esc_series = series:gsub("%.", "%%.")
+        local pat = '"name"%s*:%s*"(cpython%-' .. esc_series .. '%.%d+%+' .. esc_tag .. '%-' .. esc_triple .. '%-install_only_stripped%.tar%.gz)"'
+        return api_json:match(pat)
+    end
+    return match_series("3.13") or match_series("3.14") or match_series("3.12")
+end
+
+local function ClearMacQuarantine(path)
+    local OS = r.GetOS()
+    if not (OS:match("OSX") or OS:match("macOS")) then
+        return
+    end
+    RunCmd(string.format('/usr/bin/xattr -dr com.apple.quarantine "%s"', path), 30000)
+    RunCmd(string.format('/bin/chmod -R u+rx "%s/bin"', path), 15000)
+end
+
+local function RefreshBundledPythonStatus()
+    local bin = GetBundledPythonBin()
+    commit_gui_state.python_path = bin or ""
+    commit_gui_state.python_version = ""
+    if not bin then
+        return
+    end
+    local cmd = string.format('"%s" -c "import sys; print(sys.version.split()[0])"', bin)
+    local out = TrimProcessOutput(r.ExecProcess(cmd, 5000))
+    if out ~= "" and not out:match("[Cc]an't") and not out:match("Error") then
+        commit_gui_state.python_version = out:match("([%d%.]+)") or out
+    end
+end
+
+local function InstallBundledPython(progress_callback)
+    local function progress(msg, frac)
+        if progress_callback then
+            progress_callback(msg, frac)
+        end
+    end
+
+    local triple, plat_err = DetectStandalonePythonTriple()
+    if not triple then
+        return false, plat_err
+    end
+
+    local sep = GetPathSeparator()
+    local scripts_dir = CoolReaperScriptsDir()
+    local dest_dir = BundledPythonDir()
+    local temp_dir = scripts_dir .. sep .. "TEMP"
+    EnsureDirectoryExists(scripts_dir)
+    EnsureDirectoryExists(temp_dir)
+
+    progress("Resolving latest Python 3 build...", 0.05)
+    local meta_path = temp_dir .. sep .. "python-latest-release.json"
+    local tag = PYTHON_STANDALONE.fallback_tag
+    local meta_ok = DownloadUrlToFile(PYTHON_STANDALONE.latest_meta, meta_path, 20000)
+    if meta_ok then
+        local meta = ReadFileContents(meta_path)
+        local parsed = meta and meta:match('"tag"%s*:%s*"([^"]+)"')
+        if parsed and parsed ~= "" then
+            tag = parsed
+        end
+    end
+
+    progress("Finding matching Python download (" .. triple .. ")...", 0.12)
+    local api_path = temp_dir .. sep .. "python-release.json"
+    local api_url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/" .. tag
+    local api_ok, api_err = DownloadUrlToFile(api_url, api_path, 30000)
+    if not api_ok then
+        return false, "Could not look up Python builds: " .. (api_err or "unknown error")
+    end
+    local api_json = ReadFileContents(api_path)
+    if not api_json then
+        return false, "Could not read Python release metadata"
+    end
+    local asset_name = FindStandaloneAssetName(api_json, tag, triple)
+    if not asset_name then
+        return false, "No standalone Python 3 build found for " .. triple
+    end
+
+    local encoded_name = asset_name:gsub("%+", "%%2B")
+    local tarball_url = PYTHON_STANDALONE.asset_prefix .. tag .. "/" .. encoded_name
+    local tarball_path = temp_dir .. sep .. "python-standalone.tar.gz"
+
+    progress("Downloading " .. asset_name .. " (~25 MB)...", 0.22)
+    local dl_ok, dl_err = DownloadUrlToFile(tarball_url, tarball_path, 300000)
+    if not dl_ok then
+        return false, "Python download failed: " .. (dl_err or "unknown error")
+    end
+
+    progress("Extracting Python...", 0.70)
+    local extract_dir = temp_dir .. sep .. "python-extract"
+    RemoveDir(extract_dir)
+    EnsureDirectoryExists(extract_dir)
+
+    local OS = r.GetOS()
+    local extract_cmd
+    if OS:match("Win") then
+        extract_cmd = string.format('tar -xzf "%s" -C "%s"', tarball_path, extract_dir)
+    else
+        extract_cmd = string.format('/usr/bin/tar -xzf "%s" -C "%s"', tarball_path, extract_dir)
+    end
+    local extract_out, extract_err = RunCmd(extract_cmd, 120000)
+    if extract_err then
+        return false, "Python extract failed: " .. extract_err
+    end
+
+    local extracted_python = extract_dir .. sep .. "python"
+    local extracted_bin
+    if OS:match("Win") then
+        extracted_bin = extracted_python .. sep .. "python.exe"
+    else
+        extracted_bin = extracted_python .. sep .. "bin" .. sep .. "python3"
+        if not FileExistsPath(extracted_bin) then
+            extracted_bin = extracted_python .. sep .. "bin" .. sep .. "python"
+        end
+    end
+    if not FileExistsPath(extracted_bin) then
+        return false, "Extracted Python binary not found" .. (extract_out and (": " .. extract_out) or "")
+    end
+
+    progress("Installing into Cool Reaper Scripts...", 0.85)
+    RemoveDir(dest_dir)
+    local moved, move_err = MoveDir(extracted_python, dest_dir)
+    if not moved then
+        return false, move_err
+    end
+
+    progress("Clearing macOS quarantine...", 0.93)
+    ClearMacQuarantine(dest_dir)
+
+    local bin = GetBundledPythonBin()
+    if not bin then
+        return false, "Python was extracted but the interpreter was not found at " .. dest_dir
+    end
+
+    local verify = TrimProcessOutput(r.ExecProcess(string.format('"%s" -c "import sys; print(sys.version.split()[0])"', bin), 8000))
+    if verify == "" then
+        return false, "Installed Python did not run. On macOS, Gatekeeper may still be blocking it."
+    end
+
+    pcall(os.remove, tarball_path)
+    pcall(os.remove, meta_path)
+    pcall(os.remove, api_path)
+    RemoveDir(extract_dir)
+
+    RefreshBundledPythonStatus()
+    return true, verify
+end
+
+local function StartPythonInstall()
+    if commit_gui_state.installing then
+        return
+    end
+    commit_gui_state.installing = true
+    commit_gui_state.install_progress = 0.0
+    commit_gui_state.install_current_file = "Python 3"
+    commit_gui_state.install_status = "Starting private Python install..."
+    commit_gui_state.install_success_count = 0
+    commit_gui_state.install_failed_count = 0
+    commit_gui_state.install_total = 1
+    commit_gui_state.install_log = {}
+    commit_gui_state.install_log_expanded = true
+
+    r.defer(function()
+        local ok, detail = InstallBundledPython(function(msg, frac)
+            commit_gui_state.install_status = msg or ""
+            commit_gui_state.install_current_file = "Python 3"
+            if frac then
+                commit_gui_state.install_progress = frac
+            end
+        end)
+
+        if ok then
+            table.insert(commit_gui_state.install_log, {
+                file = "Python 3",
+                path = commit_gui_state.python_path,
+                status = "success",
+                message = "Installed Python " .. (detail or "")
+            })
+            commit_gui_state.install_success_count = 1
+            commit_gui_state.install_progress = 1.0
+            commit_gui_state.install_status = "Python " .. (detail or "") .. " installed"
+            commit_gui_state.modal_title = "Python Installed"
+            commit_gui_state.modal_message = string.format(
+                "Private Python %s is ready.\n\n%s\n\nOnly Cool Reaper scripts use this copy. It is not added to PATH and does not need admin rights.\n\nWAV files work as-is. Other audio formats still need ffmpeg on your system PATH.",
+                detail or "3",
+                commit_gui_state.python_path
+            )
+            commit_gui_state.modal_type = "success"
+            commit_gui_state.show_modal = true
+        else
+            table.insert(commit_gui_state.install_log, {
+                file = "Python 3",
+                path = "Python 3",
+                status = "failed",
+                message = detail or "unknown error"
+            })
+            commit_gui_state.install_failed_count = 1
+            commit_gui_state.install_status = "Failed: " .. (detail or "unknown error")
+            commit_gui_state.modal_title = "Python Install Failed"
+            commit_gui_state.modal_message = tostring(detail or "Unknown error")
+            commit_gui_state.modal_type = "error"
+            commit_gui_state.show_modal = true
+        end
+
+        commit_gui_state.installing = false
+    end)
+end
+
+local function ShellQuote(s)
+    return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function StemSplitInstallAbsDir()
+    local sep = GetPathSeparator()
+    local dir = GetResourcePath() .. sep .. NormalizePath(STEM_SPLIT_INSTALL_DIR)
+    if dir:sub(-1) == sep then
+        dir = dir:sub(1, -2)
+    end
+    return dir
+end
+
+local function FindPythonForStemVenv()
+    local bundled = GetBundledPythonBin()
+    if bundled then
+        return bundled
+    end
+    local candidates = {
+        "/opt/homebrew/bin/python3.13",
+        "/usr/local/bin/python3.13",
+        "/opt/homebrew/bin/python3",
+        "/usr/bin/python3",
+    }
+    for _, path in ipairs(candidates) do
+        if FileExistsPath(path) then
+            return path
+        end
+    end
+    return nil
+end
+
+local function VenvHasStemPackages(venv_py)
+    if not FileExistsPath(venv_py) then
+        return false
+    end
+    local cmd = string.format(
+        "%s -c %s",
+        ShellQuote(venv_py),
+        ShellQuote("import demucs_mlx, mdxnet_infer, soundfile")
+    )
+    local out = TrimProcessOutput(r.ExecProcess(cmd, 20000))
+    if not out or out == "" then
+        return true
+    end
+    if out:match("[Ee]rror") or out:match("Traceback") or out:match("ModuleNotFound") or out:match("No module") then
+        return false
+    end
+    return true
+end
+
+local function InstallStemSplitVenv(progress_callback)
+    local function progress(msg, frac)
+        if progress_callback then
+            progress_callback(msg, frac)
+        end
+    end
+
+    local OS = r.GetOS() or ""
+    if OS ~= "macOS-arm64" then
+        return true, "Skipped Python env (Apple Silicon only). Scripts are installed."
+    end
+
+    local dest = StemSplitInstallAbsDir()
+    local req = dest .. "/requirements.txt"
+    if not FileExistsPath(req) then
+        return false, "requirements.txt not found in " .. dest
+    end
+
+    local py = FindPythonForStemVenv()
+    if not py then
+        return false, "No Python found. Click Install Python 3 in this window, then install Split to Stems again."
+    end
+
+    local venv = dest .. "/.venv-stems"
+    local venv_py = venv .. "/bin/python"
+    local pip = venv .. "/bin/pip"
+
+    if VenvHasStemPackages(venv_py) then
+        return true, "Python environment already ready"
+    end
+
+    progress("Creating Stem Split virtualenv...", 0.15)
+    EnsureDirectoryExists(dest)
+    local venv_out, venv_err = RunCmd(string.format("%s -m venv %s", ShellQuote(py), ShellQuote(venv)), 120000)
+    if venv_err then
+        return false, "Failed to create .venv-stems: " .. venv_err
+    end
+    if not FileExistsPath(venv_py) then
+        return false, "venv created but python was not found at " .. venv_py .. (venv_out and (": " .. venv_out) or "")
+    end
+    ClearMacQuarantine(venv)
+
+    progress("Upgrading pip...", 0.28)
+    RunCmd(string.format("%s install --upgrade pip", ShellQuote(pip)), 180000)
+
+    progress("Installing Demucs-MLX (several minutes on first install)...", 0.40)
+    local pip_out, pip_err = RunCmd(string.format("%s install -r %s", ShellQuote(pip), ShellQuote(req)), 900000)
+    if pip_err then
+        return false, "pip install failed: " .. pip_err
+    end
+    if not VenvHasStemPackages(venv_py) then
+        local tail = ""
+        if pip_out and pip_out ~= "" then
+            tail = "\n" .. pip_out:sub(math.max(1, #pip_out - 800))
+        end
+        return false, "Packages did not import after pip install." .. tail
+    end
+    return true, "Demucs-MLX environment ready"
+end
+
+local function InstalledStemSplit()
+    for _, key in ipairs(install_state.installed_repos or {}) do
+        if key == "stem_split" then
+            return true
+        end
+    end
+    return false
+end
+
+FinishInstallation = function()
+    if InstalledStemSplit() and not install_state.stem_venv_done then
+        install_state.stem_venv_done = true
+        if commit_gui_state.ctx then
+            commit_gui_state.install_status = "Setting up Stem Split Python environment..."
+            commit_gui_state.install_current_file = "Stem Split environment"
+            commit_gui_state.install_progress = 0.92
+        end
+        r.defer(function()
+            local ok, detail = InstallStemSplitVenv(function(msg, frac)
+                if commit_gui_state.ctx then
+                    commit_gui_state.install_status = msg or ""
+                    if frac then
+                        commit_gui_state.install_progress = 0.85 + (frac * 0.14)
+                    end
+                end
+            end)
+            if commit_gui_state.ctx then
+                table.insert(commit_gui_state.install_log, {
+                    file = "Stem Split Python env",
+                    path = StemSplitInstallAbsDir() .. "/.venv-stems",
+                    status = ok and "success" or "failed",
+                    message = detail or "",
+                })
+            end
+            if ok then
+                table.insert(install_state.results.success, ".venv-stems")
+            else
+                table.insert(install_state.results.failed, {path = ".venv-stems", error = detail})
+            end
+            ShowInstallSummary()
+        end)
+        return
+    end
+    ShowInstallSummary()
 end
 
 -- Fetch releases from GitHub API (list all releases, no filtering)
@@ -2015,6 +2712,233 @@ local function PopCustomTheme(ctx)
     r.ImGui_PopStyleVar(ctx, 19)
 end
 
+local function LicenseExpiryUnix(expiresAt)
+    local value = tonumber(expiresAt)
+    if not value or value <= 0 then return nil end
+    if value > 1e11 then
+        value = math.floor(value / 1000)
+    end
+    return value
+end
+
+local function FormatLicenseDate(expiresAt)
+    local value = LicenseExpiryUnix(expiresAt)
+    if not value then return nil end
+    return os.date("%Y-%m-%d", value)
+end
+
+local function TrialDaysLeft(expiresAt)
+    local value = LicenseExpiryUnix(expiresAt)
+    if not value then return nil end
+    return math.floor((value - os.time()) / 86400)
+end
+
+local function BuildLicenseChip(status, expiresAt, licenseKey, reason)
+    local key = licenseKey or ""
+    status = status or ""
+
+    if key == "BYPASS" then
+        return {
+            label = "Bypass",
+            bg = 0x2A3A4AFF,
+            fg = 0x8EC8FFFF,
+            tooltip = "License verification is bypassed on this machine.",
+            status = "bypass",
+        }
+    end
+
+    if status == "active" then
+        local expiry = LicenseExpiryUnix(expiresAt)
+        if not expiry then
+            return {
+                label = "Lifetime",
+                bg = 0x2D4F47FF,
+                fg = 0xE8F6EFFF,
+                tooltip = "You own a lifetime license for this script.",
+                status = "active",
+            }
+        end
+        local date_str = FormatLicenseDate(expiresAt) or ""
+        return {
+            label = "Licensed",
+            bg = 0x2D4F47FF,
+            fg = 0xE8F6EFFF,
+            tooltip = "Licensed until " .. date_str,
+            status = "active",
+        }
+    end
+
+    if status == "trial" then
+        local days = TrialDaysLeft(expiresAt)
+        local date_str = FormatLicenseDate(expiresAt)
+        if days and days < 0 then
+            return {
+                label = "Trial ended",
+                bg = 0x4A2A2AFF,
+                fg = 0xFF8A8AFF,
+                tooltip = date_str and ("Trial ended on " .. date_str) or "Trial has expired.",
+                status = "expired",
+            }
+        end
+        local label
+        if days == nil then
+            label = "Trial"
+        elseif days <= 0 then
+            label = "Last day"
+        elseif days == 1 then
+            label = "1 day left"
+        else
+            label = tostring(days) .. " days left"
+        end
+        return {
+            label = label,
+            bg = 0x5C4A1FFF,
+            fg = 0xFFD978FF,
+            tooltip = date_str and ("Trial ends on " .. date_str) or "Trial license",
+            status = "trial",
+        }
+    end
+
+    if status == "expired" then
+        local date_str = FormatLicenseDate(expiresAt)
+        return {
+            label = "Trial ended",
+            bg = 0x4A2A2AFF,
+            fg = 0xFF8A8AFF,
+            tooltip = date_str and ("Trial ended on " .. date_str) or "Trial has expired.",
+            status = "expired",
+        }
+    end
+
+    return {
+        label = "No license",
+        bg = 0x2A2A2AFF,
+        fg = 0x9A9A9AFF,
+        tooltip = reason and reason ~= "" and reason or "Not activated on this machine.",
+        status = "inactive",
+    }
+end
+
+local function LoadLicenseFromExtState(section)
+    if not section or section == "" then
+        return nil
+    end
+    local status = r.GetExtState(section, "status") or ""
+    local expiresAt = r.GetExtState(section, "expiresAt") or ""
+    local licenseKey = r.GetExtState(section, "licenseKey") or ""
+    local reason = r.GetExtState(section, "reason") or ""
+    local deviceId = r.GetExtState(section, "deviceId") or ""
+    return {
+        status = status,
+        expiresAt = expiresAt,
+        licenseKey = licenseKey,
+        reason = reason,
+        deviceId = deviceId,
+    }
+end
+
+local function VerifyLicenseWithServer(licenseKey, deviceId)
+    if not licenseKey or licenseKey == "" or licenseKey == "BYPASS" then
+        return nil
+    end
+    local function escape_json(str)
+        if not str then return "" end
+        return tostring(str):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r")
+    end
+    local payload = string.format('{"licenseKey":"%s","deviceId":"%s"}',
+        escape_json(licenseKey), escape_json(deviceId or ""))
+    local OS = r.GetOS()
+    local cmd
+    if OS:match("Win") then
+        cmd = string.format(
+            'curl -L -s -X POST -H "Content-Type: application/json" -d "%s" "%s"',
+            payload:gsub('"', '\\"'),
+            LICENSE_VERIFY_URL
+        )
+    else
+        local quoted_payload = "'" .. payload:gsub("'", "'\\''") .. "'"
+        local quoted_url = "'" .. LICENSE_VERIFY_URL .. "'"
+        cmd = string.format(
+            "/usr/bin/curl -L -s -S -X POST -H 'Content-Type: application/json' -d %s %s",
+            quoted_payload,
+            quoted_url
+        )
+    end
+    local response = r.ExecProcess(cmd, 8000)
+    if (not response or response == "") and io.popen then
+        local handle = io.popen(cmd, "r")
+        if handle then
+            response = handle:read("*a") or ""
+            handle:close()
+        end
+    end
+    if not response or response == "" then
+        return nil
+    end
+    response = response:match("^%s*(.-)%s*$") or response
+    local ok = response:match('"ok"%s*:%s*true') or response:match('"success"%s*:%s*true')
+    local status = response:match('"status"%s*:%s*"([^"]+)"')
+    local expiresAt = nil
+    local expiresAtStr = response:match('"expiresAt"%s*:%s*([^,}]+)')
+    if expiresAtStr then
+        expiresAtStr = expiresAtStr:match("^%s*(.-)%s*$")
+        if expiresAtStr ~= "null" and expiresAtStr ~= "nil" then
+            expiresAt = tonumber(expiresAtStr)
+        end
+    end
+    local reason = response:match('"reason"%s*:%s*"([^"]+)"')
+        or response:match('"message"%s*:%s*"([^"]+)"')
+    if not status or status == "" then
+        if ok then
+            status = "active"
+        else
+            return nil
+        end
+    end
+    return {
+        status = status,
+        expiresAt = expiresAt,
+        reason = reason,
+        licenseKey = licenseKey,
+    }
+end
+
+local function RefreshRepoLicenseChip(repo_key)
+    local repo = REPOSITORIES[repo_key]
+    if not repo or not repo.license_section then return end
+    local stored = LoadLicenseFromExtState(repo.license_section)
+    local status = stored and stored.status or ""
+    local expiresAt = stored and stored.expiresAt or ""
+    local licenseKey = stored and stored.licenseKey or ""
+    local reason = stored and stored.reason or ""
+    if stored and stored.licenseKey and stored.licenseKey ~= "" and stored.licenseKey ~= "BYPASS" then
+        local live = VerifyLicenseWithServer(stored.licenseKey, stored.deviceId)
+        if live then
+            status = live.status or status
+            expiresAt = live.expiresAt or expiresAt
+            reason = live.reason or reason
+            licenseKey = live.licenseKey or licenseKey
+        end
+    end
+    commit_gui_state.license_ui[repo_key] = BuildLicenseChip(status, expiresAt, licenseKey, reason)
+end
+
+local function DrawLicenseChip(ctx, id, chip)
+    if not chip then return end
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FrameRounding(), 11)
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FramePadding(), 8.0, 3.0)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), chip.bg)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), chip.bg)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), chip.bg)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), chip.fg)
+    r.ImGui_Button(ctx, chip.label .. "##licchip_" .. id)
+    if chip.tooltip and r.ImGui_IsItemHovered(ctx) and r.ImGui_SetTooltip then
+        r.ImGui_SetTooltip(ctx, chip.tooltip)
+    end
+    r.ImGui_PopStyleColor(ctx, 4)
+    r.ImGui_PopStyleVar(ctx, 2)
+end
+
 -- Initialize commit selection GUI
 local function InitCommitGUI()
     if not CheckReaImGui() then
@@ -2037,9 +2961,31 @@ local function InitCommitGUI()
             table.insert(commit_gui_state.repos_to_select, repo_key)
         end
     end
+    commit_gui_state.selected_repos = commit_gui_state.selected_repos or {}
+    commit_gui_state.license_ui = commit_gui_state.license_ui or {}
+    for _, repo_key in ipairs(commit_gui_state.repos_to_select) do
+        if commit_gui_state.selected_repos[repo_key] == nil then
+            commit_gui_state.selected_repos[repo_key] = true
+        end
+        local key = repo_key
+        local repo = REPOSITORIES[key]
+        if repo and repo.license_section then
+            local stored = LoadLicenseFromExtState(repo.license_section)
+            commit_gui_state.license_ui[key] = BuildLicenseChip(
+                stored and stored.status or "",
+                stored and stored.expiresAt or "",
+                stored and stored.licenseKey or "",
+                stored and stored.reason or ""
+            )
+            r.defer(function()
+                RefreshRepoLicenseChip(key)
+            end)
+        end
+    end
     
     -- Create ImGui context
     commit_gui_state.ctx = r.ImGui_CreateContext("Cool Reaper Script Installer - Commit Selection")
+    RefreshBundledPythonStatus()
     
     -- Create bold font for title (size 28)
     -- Use a bold font name since ImGui_CreateFont only accepts 2 arguments
@@ -2057,52 +3003,52 @@ local function InitCommitGUI()
         r.ImGui_Attach(commit_gui_state.ctx, commit_gui_state.title_font)
     end
     
-    -- Auto-load releases or commits for the first repository
-    if #commit_gui_state.repos_to_select > 0 then
-        local current_repo_key = commit_gui_state.repos_to_select[commit_gui_state.current_repo_index]
-        local repo = REPOSITORIES[current_repo_key]
+    -- Load releases/commits for every repo (Sample Map has no GitHub releases yet)
+    commit_gui_state.repo_ui = {}
+    for _, repo_key in ipairs(commit_gui_state.repos_to_select) do
+        local key = repo_key
+        local repo = REPOSITORIES[key]
         if repo then
-            commit_gui_state.loading = true
-            commit_gui_state.error_msg = nil
-            commit_gui_state.commits = {}
-            commit_gui_state.releases = {}
-            
-            -- Try to fetch releases first (non-blocking)
+            commit_gui_state.repo_ui[key] = {
+                loading = true,
+                error_msg = nil,
+                use_releases = false,
+                releases = {},
+                commits = {},
+            }
             r.defer(function()
-                local releases, release_error = FetchReleases(repo.user, repo.repo)
+                local ui = commit_gui_state.repo_ui[key]
+                if not ui then return end
+                local releases = FetchReleases(repo.user, repo.repo)
                 if releases and #releases > 0 then
-                    -- Use releases
-                    commit_gui_state.releases = releases
-                    commit_gui_state.use_releases = true
-                    commit_gui_state.loading = false
-                    -- Default to latest release
-                    commit_gui_state.selected_releases[current_repo_key] = releases[1].tag
+                    ui.releases = releases
+                    ui.use_releases = true
+                    ui.loading = false
+                    commit_gui_state.selected_releases[key] = releases[1].tag
                 else
-                    -- Fall back to commits
-                    commit_gui_state.use_releases = false
+                    ui.use_releases = false
                     local commits, error_msg = FetchCommits(repo.user, repo.repo, repo.branch)
-                    commit_gui_state.loading = false
+                    local versioned_commits = {}
                     if commits then
-                        -- Extract versions from commit messages (pattern: ##VerX.X##)
-                        local versioned_commits = {}
-                        
-                        for i, commit in ipairs(commits) do
-                            -- Extract version from commit message (pattern: ##VerX.X##)
+                        for _, commit in ipairs(commits) do
                             local version = ExtractVersionFromMessage(commit.message)
                             if version then
-                                commit.version = version  -- Add version to commit object
+                                commit.version = version
                                 table.insert(versioned_commits, commit)
                             end
                         end
-                        
-                        commit_gui_state.commits = versioned_commits
-                        -- Default to latest versioned commit
-                        if #versioned_commits > 0 then
-                            commit_gui_state.selected_commits[current_repo_key] = versioned_commits[1].sha
-                        end
-                    else
-                        commit_gui_state.error_msg = error_msg or "Failed to load commits"
                     end
+                    if #versioned_commits == 0 then
+                        versioned_commits[1] = {
+                            sha = repo.branch,
+                            version = repo.branch,
+                            message = "Latest (" .. repo.branch .. ")",
+                        }
+                    end
+                    ui.commits = versioned_commits
+                    ui.loading = false
+                    ui.error_msg = (not commits and error_msg) or nil
+                    commit_gui_state.selected_commits[key] = versioned_commits[1].sha
                 end
             end)
         end
@@ -2124,7 +3070,10 @@ local function RenderCommitGUI()
     
     -- Set fixed window size (not resizable, not collapsible)
     -- Adjust height based on whether installation details are expanded
-    local window_height = 200 -- Default height
+    local window_height = 356
+    if #commit_gui_state.repos_to_select > 1 then
+        window_height = 356 + (#commit_gui_state.repos_to_select - 1) * 78
+    end
     if commit_gui_state.installing then
         window_height = 600 -- Expanded during installation
     elseif commit_gui_state.install_log_expanded and #commit_gui_state.install_log > 0 then
@@ -2144,149 +3093,145 @@ local function RenderCommitGUI()
         return open
     end
     
-    local current_repo_key = commit_gui_state.repos_to_select[commit_gui_state.current_repo_index]
-    if not current_repo_key then
+    if #commit_gui_state.repos_to_select == 0 then
         r.ImGui_Text(ctx, "No repositories to configure.")
         r.ImGui_End(ctx)
         PopCustomTheme(ctx)
         return open
     end
     
-    local repo = REPOSITORIES[current_repo_key]
-    
-    -- Top row: Title on left, Version dropdown on right (vertically aligned)
-    -- Store starting Y position
-    local start_y = r.ImGui_GetCursorPosY(ctx)
-    
-    -- Calculate frame height for alignment (dropdown uses frame padding)
     local frame_padding_x, frame_padding_y = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_FramePadding())
     local default_line_height = r.ImGui_GetTextLineHeight(ctx)
-    local frame_height = frame_padding_y * 2 + default_line_height -- Approximate dropdown height
-    
-    -- Draw title on left with bold font
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0x2D4F47FF) -- Accent color
-    
-    if commit_gui_state.title_font then
-        r.ImGui_PushFont(ctx, commit_gui_state.title_font, 28) -- Use created bold font with explicit size
-    else
-        r.ImGui_PushFont(ctx, nil, 28) -- Fallback: use size without bold
-    end
-    
-    local title_line_height = r.ImGui_GetTextLineHeight(ctx)
-    -- Align both title and dropdown to the same center
-    local max_height = math.max(frame_height, title_line_height)
-    local title_y = start_y + (max_height - title_line_height) / 2
-    local dropdown_y = start_y + (max_height - frame_height) / 2
-    
-    r.ImGui_SetCursorPosY(ctx, title_y)
-    r.ImGui_Text(ctx, "Vertical FX List")
-    r.ImGui_PopFont(ctx)
-    r.ImGui_PopStyleColor(ctx)
-    
-    r.ImGui_SameLine(ctx)
-    -- Push cursor to right side
+    local frame_height = frame_padding_y * 2 + default_line_height
     local window_width = r.ImGui_GetWindowWidth(ctx)
-    local window_padding = 24 -- Account for window padding (12px on each side)
+    local window_padding = 24
     local dropdown_width = 200
     local cursor_x = window_width - dropdown_width - window_padding
-    r.ImGui_SetCursorPosX(ctx, cursor_x)
-    r.ImGui_SetCursorPosY(ctx, dropdown_y)
     
-    -- Version dropdown on the right
-    local current_selected = nil
-    local current_selected_index = 0
-    local preview_text = "Select Version..."
-    local items_to_show = {}
-    
-    if commit_gui_state.use_releases then
-        -- Show releases
-        items_to_show = commit_gui_state.releases
-        current_selected = commit_gui_state.selected_releases[current_repo_key]
+    for _, repo_key in ipairs(commit_gui_state.repos_to_select) do
+        local repo = REPOSITORIES[repo_key]
+        local ui = commit_gui_state.repo_ui[repo_key] or {
+            loading = true, error_msg = nil, use_releases = false, releases = {}, commits = {},
+        }
+        local display_name = (repo and repo.display) or (repo and repo.repo) or repo_key
+        local selected = commit_gui_state.selected_repos[repo_key] ~= false
+        local start_y = r.ImGui_GetCursorPosY(ctx)
         
-        if current_selected and #commit_gui_state.releases > 0 then
-            for i, release in ipairs(commit_gui_state.releases) do
-                if release.tag == current_selected then
-                    current_selected_index = i - 1
-                    preview_text = release.version or release.tag
-                    break
-                end
-            end
-        elseif commit_gui_state.loading then
-            preview_text = "Loading..."
-        elseif commit_gui_state.error_msg then
-            preview_text = "Error loading"
+        r.ImGui_SetCursorPosY(ctx, start_y + 8)
+        local checked_clicked, checked = r.ImGui_Checkbox(ctx, "##install_" .. repo_key, selected)
+        if checked_clicked then
+            commit_gui_state.selected_repos[repo_key] = checked and true or false
+            selected = checked and true or false
         end
-    else
-        -- Show commits
-        items_to_show = commit_gui_state.commits
-        current_selected = commit_gui_state.selected_commits[current_repo_key]
         
-        if current_selected and #commit_gui_state.commits > 0 then
-            for i, commit in ipairs(commit_gui_state.commits) do
-                if commit.sha == current_selected then
-                    current_selected_index = i - 1
-                    preview_text = commit.version or "Unknown"
-                    break
-                end
-            end
-        elseif commit_gui_state.loading then
-            preview_text = "Loading..."
-        elseif commit_gui_state.error_msg then
-            preview_text = "Error loading"
+        r.ImGui_SameLine(ctx, 0, 10)
+        local title_x = r.ImGui_GetCursorPosX(ctx)
+        local title_color = selected and 0x2D4F47FF or 0x6A7A76FF
+        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), title_color)
+        if commit_gui_state.title_font then
+            r.ImGui_PushFont(ctx, commit_gui_state.title_font, 28)
+        else
+            r.ImGui_PushFont(ctx, nil, 28)
         end
-    end
-    
-    -- Dropdown combo
-    r.ImGui_PushItemWidth(ctx, 200)
-    
-    -- Set transparent hover colors for dropdown items
-    -- Note: FrameBgHovered and FrameBgActive are in theme, but we override them here temporarily
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgHovered(), 0x55555533) -- Transparent hover
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgActive(), 0x55555533) -- Transparent active
-    
-
-    if r.ImGui_BeginCombo(ctx, "##VersionCombo", preview_text, r.ImGui_ComboFlags_None()) then
-        -- Set selectable hover/active colors
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), 0x55555533) -- Transparent hover for selectables
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderHovered(), 0x55555533) -- Transparent hover for selectables
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderActive(), 0x55555533) -- Transparent active for selectables
+        local title_line_height = r.ImGui_GetTextLineHeight(ctx)
+        local max_height = math.max(frame_height, title_line_height)
+        local title_y = start_y + (max_height - title_line_height) / 2
+        local dropdown_y = start_y + (max_height - frame_height) / 2
+        r.ImGui_SetCursorPosY(ctx, title_y)
+        r.ImGui_Text(ctx, display_name)
+        r.ImGui_PopFont(ctx)
+        r.ImGui_PopStyleColor(ctx)
         
-        if commit_gui_state.use_releases then
-            -- Show all releases
-            for i, release in ipairs(commit_gui_state.releases) do
-                local is_selected = (current_selected_index == i - 1)
-                local version_display = release.version or release.tag
-
-                if r.ImGui_Selectable(ctx, version_display, is_selected) then
-                    commit_gui_state.selected_releases[current_repo_key] = release.tag
+        r.ImGui_SameLine(ctx)
+        r.ImGui_SetCursorPosX(ctx, cursor_x)
+        r.ImGui_SetCursorPosY(ctx, dropdown_y)
+        if not selected and r.ImGui_BeginDisabled then
+            r.ImGui_BeginDisabled(ctx)
+        end
+        
+        local current_selected = nil
+        local current_selected_index = 0
+        local preview_text = "Select Version..."
+        
+        if ui.use_releases then
+            current_selected = commit_gui_state.selected_releases[repo_key]
+            if current_selected and #ui.releases > 0 then
+                for i, release in ipairs(ui.releases) do
+                    if release.tag == current_selected then
+                        current_selected_index = i - 1
+                        preview_text = release.version or release.tag
+                        break
+                    end
                 end
-                if is_selected then
-                    r.ImGui_SetItemDefaultFocus(ctx)
-                end
+            elseif ui.loading then
+                preview_text = "Loading..."
+            elseif ui.error_msg then
+                preview_text = "Error loading"
             end
         else
-            -- Show versioned commits
-            for i, commit in ipairs(commit_gui_state.commits) do
-                local is_selected = (current_selected_index == i - 1)
-                local version_display = commit.version or "Unknown"
-
-                if r.ImGui_Selectable(ctx, version_display, is_selected) then
-                    commit_gui_state.selected_commits[current_repo_key] = commit.sha
+            current_selected = commit_gui_state.selected_commits[repo_key]
+            if current_selected and #ui.commits > 0 then
+                for i, commit in ipairs(ui.commits) do
+                    if commit.sha == current_selected then
+                        current_selected_index = i - 1
+                        preview_text = commit.version or "Unknown"
+                        break
+                    end
                 end
-                if is_selected then
-                    r.ImGui_SetItemDefaultFocus(ctx)
-                end
+            elseif ui.loading then
+                preview_text = "Loading..."
+            elseif ui.error_msg then
+                preview_text = "Error loading"
             end
         end
         
-        -- Pop selectable colors
-        r.ImGui_PopStyleColor(ctx, 3)
-        r.ImGui_EndCombo(ctx)
+        r.ImGui_PushItemWidth(ctx, 200)
+        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgHovered(), 0x55555533)
+        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgActive(), 0x55555533)
+        
+        if r.ImGui_BeginCombo(ctx, "##VersionCombo" .. repo_key, preview_text, r.ImGui_ComboFlags_None()) then
+            r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), 0x55555533)
+            r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderHovered(), 0x55555533)
+            r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderActive(), 0x55555533)
+            
+            if ui.use_releases then
+                for i, release in ipairs(ui.releases) do
+                    local is_selected = (current_selected_index == i - 1)
+                    local version_display = release.version or release.tag
+                    if r.ImGui_Selectable(ctx, version_display, is_selected) then
+                        commit_gui_state.selected_releases[repo_key] = release.tag
+                    end
+                    if is_selected then
+                        r.ImGui_SetItemDefaultFocus(ctx)
+                    end
+                end
+            else
+                for i, commit in ipairs(ui.commits) do
+                    local is_selected = (current_selected_index == i - 1)
+                    local version_display = commit.version or "Unknown"
+                    if r.ImGui_Selectable(ctx, version_display, is_selected) then
+                        commit_gui_state.selected_commits[repo_key] = commit.sha
+                    end
+                    if is_selected then
+                        r.ImGui_SetItemDefaultFocus(ctx)
+                    end
+                end
+            end
+            
+            r.ImGui_PopStyleColor(ctx, 3)
+            r.ImGui_EndCombo(ctx)
+        end
+        
+        r.ImGui_PopStyleColor(ctx, 2)
+        r.ImGui_PopItemWidth(ctx)
+        if not selected and r.ImGui_EndDisabled then
+            r.ImGui_EndDisabled(ctx)
+        end
+        r.ImGui_SetCursorPosY(ctx, start_y + max_height + 4)
+        r.ImGui_SetCursorPosX(ctx, title_x)
+        DrawLicenseChip(ctx, repo_key, commit_gui_state.license_ui[repo_key])
+        r.ImGui_Dummy(ctx, 0, 8)
     end
-    
-    -- Pop hover colors (only FrameBgHovered and FrameBgActive - ButtonActive is in theme)
-    r.ImGui_PopStyleColor(ctx, 2)
-    r.ImGui_PopItemWidth(ctx)
     
     r.ImGui_Spacing(ctx)
     r.ImGui_Spacing(ctx)
@@ -2443,11 +3388,23 @@ local function RenderCommitGUI()
         end
     else
         -- Install button (centered, full width)
-        local can_finish = false
-        if commit_gui_state.use_releases then
-            can_finish = (commit_gui_state.selected_releases[current_repo_key] ~= nil)
-        else
-            can_finish = (commit_gui_state.selected_commits[current_repo_key] ~= nil)
+        local selected_keys = GetSelectedRepoKeys()
+        local can_finish = #selected_keys > 0
+        for _, repo_key in ipairs(selected_keys) do
+            local ui = commit_gui_state.repo_ui[repo_key]
+            if not ui or ui.loading then
+                can_finish = false
+                break
+            end
+            if ui.use_releases then
+                if not commit_gui_state.selected_releases[repo_key] then
+                    can_finish = false
+                    break
+                end
+            elseif not commit_gui_state.selected_commits[repo_key] then
+                can_finish = false
+                break
+            end
         end
         
         if can_finish then
@@ -2464,27 +3421,44 @@ local function RenderCommitGUI()
             r.ImGui_SetCursorPosX(ctx, r.ImGui_GetCursorPosX(ctx) + button_x)
             
             if r.ImGui_Button(ctx, "Install", button_width, 0) then
-                -- Apply selected commits/releases
-                if commit_gui_state.use_releases then
-                    -- Releases are handled directly in InstallAllFiles
-                else
-                    for repo_key, commit_ref in pairs(commit_gui_state.selected_commits) do
-                        SELECTED_COMMITS[repo_key] = commit_ref
-                    end
-                end
-                -- Don't close window, keep it open to show progress
                 commit_gui_state.installing = true
-                -- Start installation
                 InstallAllFiles()
             end
             
             r.ImGui_PopStyleColor(ctx, 4)
             r.ImGui_PopStyleVar(ctx)
+        elseif #GetSelectedRepoKeys() == 0 then
+            r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0xB0B0B0FF)
+            r.ImGui_Text(ctx, "Tick at least one script to install.")
+            r.ImGui_PopStyleColor(ctx)
         else
             r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0xB0B0B0FF) -- Secondary text color
             r.ImGui_Text(ctx, "Please select a version.")
             r.ImGui_PopStyleColor(ctx)
         end
+
+        r.ImGui_Spacing(ctx)
+        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FramePadding(), 10.0, 8.0)
+        local py_button_width = 200
+        local py_content_width = r.ImGui_GetContentRegionAvail(ctx)
+        local py_button_x = (py_content_width - py_button_width) / 2
+        r.ImGui_SetCursorPosX(ctx, r.ImGui_GetCursorPosX(ctx) + py_button_x)
+        local py_label = (commit_gui_state.python_path ~= "" and "Reinstall Python 3" or "Install Python 3")
+        if r.ImGui_Button(ctx, py_label, py_button_width, 0) then
+            StartPythonInstall()
+        end
+        r.ImGui_PopStyleVar(ctx)
+
+        r.ImGui_Spacing(ctx)
+        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0xB0B0B0FF)
+        if commit_gui_state.python_path ~= "" then
+            local ver = commit_gui_state.python_version ~= "" and (" " .. commit_gui_state.python_version) or ""
+            r.ImGui_TextWrapped(ctx, "Private Python" .. ver .. " is installed next to Cool Reaper Scripts.")
+        else
+            r.ImGui_TextWrapped(ctx, "Optional: install a private Python 3 (~25 MB) for Split to Stems. No admin, not added to PATH.")
+        end
+        r.ImGui_TextWrapped(ctx, "WAV files work without ffmpeg. Other formats still need ffmpeg on PATH.")
+        r.ImGui_PopStyleColor(ctx)
         
         -- Show installation log after installation completes (keep it visible)
         if not commit_gui_state.installing and #commit_gui_state.install_log > 0 then
@@ -2562,7 +3536,7 @@ local function RenderCommitGUI()
         -- Calculate modal size: 20% smaller width than installer window (600 * 0.8 = 480)
         local installer_width = 600
         local modal_width = installer_width * 0.8
-        local modal_height = 300 -- Bigger height
+        local modal_height = 360
         
         -- Get installer window position and size to center modal
         local installer_pos_x, installer_pos_y = r.ImGui_GetWindowPos(ctx)
@@ -2580,9 +3554,14 @@ local function RenderCommitGUI()
         if r.ImGui_BeginPopupModal(ctx, commit_gui_state.modal_title, nil, modal_flags) then
             r.ImGui_Spacing(ctx)
             
-            -- Message text
+            -- Message text (scrollable so the OK button stays visible)
+            local _, avail_y = r.ImGui_GetContentRegionAvail(ctx)
+            local child_height = math.max(80, avail_y - 56)
             r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0xE0E0E0FF) -- Light text
-            r.ImGui_TextWrapped(ctx, commit_gui_state.modal_message)
+            if r.ImGui_BeginChild(ctx, "ModalMessage", -1, child_height, 0, r.ImGui_WindowFlags_None()) then
+                r.ImGui_TextWrapped(ctx, commit_gui_state.modal_message)
+                r.ImGui_EndChild(ctx)
+            end
             r.ImGui_PopStyleColor(ctx)
             
             r.ImGui_Spacing(ctx)
