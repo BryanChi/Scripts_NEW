@@ -123,6 +123,8 @@ ctx = im.CreateContext('My script')
 -- Create Impact font at size 24
 Font_Impact_24 = im.CreateFont('impact', 24)
 im.Attach(ctx, Font_Impact_24)
+Font_Note_Vel = im.CreateFont('sans-serif', 13)
+im.Attach(ctx, Font_Note_Vel)
 
 init_X = 200
 init_Y = 200
@@ -144,6 +146,118 @@ _, MouseInitPosY = im.PointConvertNative(ctx, nil, MouseInitPosY, true)
 end ]]
 
 Disp.InitMsX, Disp.InitMsY = r.GetMousePosition()
+
+
+-- Velocity of every note visible in the MIDI editor, drawn over the notes
+local MidiView      = r.JS_Window_FindChildByID(FocusedMidiEditor, 1001)
+local View          = { NextRead = 0 }
+local NoteCache     = {}
+local RULER_H       = 64
+local VEL_BAR_W     = 5
+local VEL_BAR_H     = 40
+local CLR_BAR_BG    = 0x00000066
+local CLR_BAR_SEL   = 0x58d68dee
+local CLR_BAR       = 0xc8c8c8aa
+local CLR_TEXT      = 0xffffffff
+local CLR_TEXT_BACK = 0x000000cc
+
+-- Zoom and scroll live in the take's chunk, which is slow to fetch, so it's only read a few times per second
+local function Read_View()
+    local now = r.time_precise()
+    if now < View.NextRead then return end
+    View.NextRead = now + 0.2
+
+    local ok, L, T, R, B = r.JS_Window_GetClientRect(MidiView)
+    View.X, View.Y = im.PointConvertNative(ctx, L, T, true)
+    View.W, View.H = R - L, math.abs(B - T)
+
+    local item = r.GetMediaItemTake_Item(take)
+    local _, chunk = r.GetItemStateChunk(item, '', false)
+    local start = 1
+    for i = 1, r.GetMediaItemTakeInfo_Value(take, 'IP_TAKENUMBER') do
+        start = chunk:find('\nTAKE[ \r\n]', start + 1) or start
+    end
+    local stop = chunk:find('\nTAKE[ \r\n]', start + 1) or #chunk
+    chunk = chunk:sub(start, stop)
+
+    local left, zoom, top, px_per_pitch = chunk:match('\nCFGEDITVIEW (%S+) (%S+) (%S+) (%S+)')
+    local timebase = 0
+    local field = 0
+    for word in (chunk:match('\nCFGEDIT ([^\n]+)') or ''):gmatch('%S+') do
+        field = field + 1
+        if field == 19 then timebase = tonumber(word) end
+    end
+    View.OK = left ~= nil and r.MIDIEditor_GetMode(FocusedMidiEditor) == 0
+    if not View.OK then return end
+
+    -- Timebases 0 and 4 are beats (zoom = pixels per tick), the others are time (zoom = pixels per second)
+    View.IsBeats    = timebase == 0 or timebase == 4
+    View.Left       = tonumber(left)
+    if not View.IsBeats then View.Left = r.MIDI_GetProjTimeFromPPQPos(take, View.Left) end
+    View.Zoom       = tonumber(zoom)
+    View.TopPitch   = 127 - tonumber(top)
+    View.PxPerPitch = tonumber(px_per_pitch)
+    View.NotesH     = View.H
+    for height in chunk:gmatch('\nVELLANE %S+ (%S+)') do
+        View.NotesH = View.NotesH - tonumber(height)
+    end
+end
+
+local function Get_Notes(Tk)
+    local _, hash = r.MIDI_GetHash(Tk, true, '')
+    local Cache = NoteCache[Tk]
+    if Cache and Cache.Hash == hash and Cache.IsBeats == View.IsBeats then return Cache end
+
+    Cache = { Hash = hash, IsBeats = View.IsBeats }
+    local _, Count = r.MIDI_CountEvts(Tk)
+    -- Everything goes through project time so that notes of other takes in the editor line up with the active take
+    local function Pos(ppq)
+        local time = r.MIDI_GetProjTimeFromPPQPos(Tk, ppq)
+        return View.IsBeats and r.MIDI_GetPPQPosFromProjTime(take, time) or time
+    end
+    for i = 0, Count - 1 do
+        local _, sel, _, start, stop, _, pitch, vel = r.MIDI_GetNote(Tk, i)
+        Cache[i + 1] = { Sel = sel, Start = Pos(start), Stop = Pos(stop), Pitch = pitch, Vel = vel }
+    end
+    NoteCache[Tk] = Cache
+    return Cache
+end
+
+local function Draw_Note_Vels(DL)
+    if not View.OK then return end
+    local TopY, BotY = View.Y + RULER_H, View.Y + View.NotesH
+    local PxPerPitch = View.PxPerPitch
+    im.DrawList_PushClipRect(DL, View.X, TopY, View.X + View.W, BotY)
+    im.PushFont(ctx, Font_Note_Vel)
+
+    local TextH = im.GetTextLineHeight(ctx)
+    local i = 0
+    local Tk = r.MIDIEditor_EnumTakes(FocusedMidiEditor, i, false)
+    while Tk do
+        for _, N in ipairs(Get_Notes(Tk)) do
+            local NoteL = (N.Start - View.Left) * View.Zoom
+            local NoteR = (N.Stop - View.Left) * View.Zoom
+            local RowT  = TopY + (View.TopPitch - N.Pitch) * PxPerPitch
+            local RowB  = RowT + PxPerPitch
+
+            if NoteR >= 0 and NoteL <= View.W and RowB >= TopY and RowT <= BotY then
+                local X  = View.X + math.max(NoteL, 0)
+                local X2 = X + VEL_BAR_W
+                im.DrawList_AddRectFilled(DL, X, RowB - VEL_BAR_H, X2, RowB, CLR_BAR_BG)
+                im.DrawList_AddRectFilled(DL, X, RowB - N.Vel / 127 * VEL_BAR_H, X2, RowB, N.Sel and CLR_BAR_SEL or CLR_BAR)
+
+                local TextY = RowT + (PxPerPitch - TextH) / 2
+                im.DrawList_AddText(DL, X2 + 4, TextY + 1, CLR_TEXT_BACK, N.Vel)
+                im.DrawList_AddText(DL, X2 + 3, TextY, CLR_TEXT, N.Vel)
+            end
+        end
+        i = i + 1
+        Tk = r.MIDIEditor_EnumTakes(FocusedMidiEditor, i, false)
+    end
+
+    im.PopFont(ctx)
+    im.DrawList_PopClipRect(DL)
+end
 
 
 function loop()
@@ -183,8 +297,14 @@ function loop()
             im.WindowFlags_NoBackground
 
         im.SetNextWindowBgAlpha(ctx, 0.01)
-        im.SetNextWindowPos(ctx, Disp.InitMsX - GUI_Win_Sz_W / 2, MouseInitPosY - GUI_Win_Sz_H / 2, nil)
-        im.SetNextWindowSize(ctx, GUI_Win_Sz_W, GUI_Win_Sz_H)
+        Read_View()
+        -- The window has to reach every visible note, not only the area around the mouse
+        local WinL = math.min(Disp.InitMsX - GUI_Win_Sz_W / 2, View.X)
+        local WinT = math.min(MouseInitPosY - GUI_Win_Sz_H / 2, View.Y)
+        local WinR = math.max(Disp.InitMsX + GUI_Win_Sz_W / 2, View.X + View.W)
+        local WinB = math.max(MouseInitPosY + GUI_Win_Sz_H / 2, View.Y + View.H)
+        im.SetNextWindowPos(ctx, WinL, WinT, nil)
+        im.SetNextWindowSize(ctx, WinR - WinL, WinB - WinT)
         function SetMinMax(value, min, max)
             if value < min then
                 return min
@@ -324,6 +444,8 @@ function loop()
 
 
             r.MIDI_Sort(take)
+
+            Draw_Note_Vels(drawlist)
 
             im.PopFont(ctx)
             im.End(ctx)
