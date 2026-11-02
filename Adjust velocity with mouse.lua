@@ -161,7 +161,6 @@ local NoteCache          = {}
 local OrigVels           = {}
 local LastDrawn
 local RULER_H            = 64
-local Overlay_Color_Background = 0xB8000000
 local Overlay_Color_Grid       = 0xFF505050
 local Overlay_Color_Bar        = 0xFFB4B4B4 -- Unchanged velocity
 local Overlay_Color_BarUp      = 0xFF3CDC64 -- Raised velocity
@@ -265,7 +264,6 @@ local function Draw_Velocity_Overlay()
     local HasNotes = false
     for _, Notes in ipairs(Lists) do HasNotes = HasNotes or Notes[1] ~= nil end
     if HasNotes then
-        r.JS_LICE_FillRect(bitmap, 0, top, width, bottom - top + 1, Overlay_Color_Background, 1, 'COPY')
         r.JS_LICE_Line(bitmap, 0, top, width - 1, top, Overlay_Color_Grid, 1, 'COPY', false)
         r.JS_LICE_Line(bitmap, 0, VelToY(64), width - 1, VelToY(64), Overlay_Color_Grid, 1, 'COPY', false)
         r.JS_LICE_Line(bitmap, 0, bottom, width - 1, bottom, Overlay_Color_Grid, 1, 'COPY', false)
