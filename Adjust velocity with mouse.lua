@@ -153,7 +153,7 @@ end ]]
 Disp.InitMsX, Disp.InitMsY = r.GetMousePosition()
 
 
--- Velocity of the selected notes, drawn as a lane on top of the notes area
+-- Velocity of the notes on screen, drawn as a lane on top of the notes area
 -- (same look as the piano roll overlay in js_Mouse editing - Arch and Tilt.lua)
 MidiView                 = r.JS_Window_FindChildByID(FocusedMidiEditor, 1001)
 local View               = { NextRead = 0 }
@@ -162,7 +162,8 @@ local OrigVels           = {}
 local LastDrawn
 local RULER_H            = 64
 local Overlay_Color_Grid       = 0xFF505050
-local Overlay_Color_Bar        = 0xFFB4B4B4 -- Unchanged velocity
+local Overlay_Color_Bar        = 0xFFB4B4B4 -- Unchanged velocity of a selected note
+local Overlay_Color_BarUnsel   = 0xFF6E6E6E -- Unselected note
 local Overlay_Color_BarUp      = 0xFF3CDC64 -- Raised velocity
 local Overlay_Color_BarDown    = 0xFFFF6A4D -- Lowered velocity
 local Overlay_Color_Original   = 0xFFFFFFFF -- Marker at original velocity
@@ -217,12 +218,10 @@ local function Get_Notes(Tk)
     local _, Count = r.MIDI_CountEvts(Tk)
     for i = 0, Count - 1 do
         local _, sel, _, start, _, _, _, vel = r.MIDI_GetNote(Tk, i)
-        if sel then
-            -- Goes through project time so that notes of other takes in the editor line up with the active take
-            local time = r.MIDI_GetProjTimeFromPPQPos(Tk, start)
-            Orig[i] = Orig[i] or vel
-            Cache[#Cache + 1] = { Pos = View.IsBeats and r.MIDI_GetPPQPosFromProjTime(take, time) or time, Vel = vel, Orig = Orig[i] }
-        end
+        -- Goes through project time so that notes of other takes in the editor line up with the active take
+        local time = r.MIDI_GetProjTimeFromPPQPos(Tk, start)
+        Orig[i] = Orig[i] or vel
+        Cache[#Cache + 1] = { Sel = sel, Pos = View.IsBeats and r.MIDI_GetPPQPosFromProjTime(take, time) or time, Vel = vel, Orig = Orig[i] }
     end
     NoteCache[Tk] = Cache
     return Cache
@@ -274,7 +273,7 @@ local function Draw_Velocity_Overlay()
             local x = math.floor((N.Pos - View.Left) * View.Zoom + 0.5)
             if -2 <= x and x <= width + 1 then
                 local newY = VelToY(N.Vel)
-                local color = (N.Vel > N.Orig and Overlay_Color_BarUp) or (N.Vel < N.Orig and Overlay_Color_BarDown) or Overlay_Color_Bar
+                local color = (N.Vel > N.Orig and Overlay_Color_BarUp) or (N.Vel < N.Orig and Overlay_Color_BarDown) or (N.Sel and Overlay_Color_Bar or Overlay_Color_BarUnsel)
                 r.JS_LICE_FillRect(bitmap, x - 1, newY, 3, bottom - newY, color, 1, 'COPY')
                 r.JS_LICE_FillRect(bitmap, x - 3, newY - 1, 7, 3, color, 1, 'COPY')
                 if N.Vel ~= N.Orig then
