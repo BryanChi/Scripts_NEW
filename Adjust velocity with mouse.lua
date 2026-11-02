@@ -72,6 +72,13 @@ function Release()
         end
         KEY = nil  -- Prevent multiple releases
     end
+    if Overlay_Bitmap then
+        pcall(function()
+            r.JS_LICE_DestroyBitmap(Overlay_Bitmap) -- The extension will automatically un-composite the bitmap
+            r.JS_Window_InvalidateRect(MidiView, 0, 0, Overlay_W, Overlay_H, false)
+        end)
+        Overlay_Bitmap = nil
+    end
     if PreviouslyFocusedWindow then
         pcall(function() r.JS_Window_SetFocus(PreviouslyFocusedWindow) end)
     end
@@ -92,7 +99,7 @@ function msg(value)
     r.ShowConsoleMsg(tostring(value))
 end
 
-first_Sel_Note                                   = r.MIDI_EnumSelNotes(take, 0)
+first_Sel_Note                                   = math.max(r.MIDI_EnumSelNotes(take, -1), 0)
 retval, NoteCount, CC_EventCount, TextEventCount = r.MIDI_CountEvts(take)
 
 First_Sel_CC = r.MIDI_EnumSelEvts(take, 0)
@@ -123,8 +130,6 @@ ctx = im.CreateContext('My script')
 -- Create Impact font at size 24
 Font_Impact_24 = im.CreateFont('impact', 24)
 im.Attach(ctx, Font_Impact_24)
-Font_Note_Vel = im.CreateFont('sans-serif', 13)
-im.Attach(ctx, Font_Note_Vel)
 
 init_X = 200
 init_Y = 200
@@ -148,18 +153,20 @@ end ]]
 Disp.InitMsX, Disp.InitMsY = r.GetMousePosition()
 
 
--- Velocity of every note visible in the MIDI editor, drawn over the notes
-local MidiView      = r.JS_Window_FindChildByID(FocusedMidiEditor, 1001)
-local View          = { NextRead = 0 }
-local NoteCache     = {}
-local RULER_H       = 64
-local VEL_BAR_W     = 5
-local VEL_BAR_H     = 40
-local CLR_BAR_BG    = 0x00000066
-local CLR_BAR_SEL   = 0x58d68dee
-local CLR_BAR       = 0xc8c8c8aa
-local CLR_TEXT      = 0xffffffff
-local CLR_TEXT_BACK = 0x000000cc
+-- Velocity of the selected notes, drawn as a lane on top of the notes area
+-- (same look as the piano roll overlay in js_Mouse editing - Arch and Tilt.lua)
+MidiView                 = r.JS_Window_FindChildByID(FocusedMidiEditor, 1001)
+local View               = { NextRead = 0 }
+local NoteCache          = {}
+local OrigVels           = {}
+local LastDrawn
+local RULER_H            = 64
+local Overlay_Color_Background = 0xB8000000
+local Overlay_Color_Grid       = 0xFF505050
+local Overlay_Color_Bar        = 0xFFB4B4B4 -- Unchanged velocity
+local Overlay_Color_BarUp      = 0xFF3CDC64 -- Raised velocity
+local Overlay_Color_BarDown    = 0xFFFF6A4D -- Lowered velocity
+local Overlay_Color_Original   = 0xFFFFFFFF -- Marker at original velocity
 
 -- Zoom and scroll live in the take's chunk, which is slow to fetch, so it's only read a few times per second
 local function Read_View()
@@ -168,7 +175,6 @@ local function Read_View()
     View.NextRead = now + 0.2
 
     local ok, L, T, R, B = r.JS_Window_GetClientRect(MidiView)
-    View.X, View.Y = im.PointConvertNative(ctx, L, T, true)
     View.W, View.H = R - L, math.abs(B - T)
 
     local item = r.GetMediaItemTake_Item(take)
@@ -180,7 +186,7 @@ local function Read_View()
     local stop = chunk:find('\nTAKE[ \r\n]', start + 1) or #chunk
     chunk = chunk:sub(start, stop)
 
-    local left, zoom, top, px_per_pitch = chunk:match('\nCFGEDITVIEW (%S+) (%S+) (%S+) (%S+)')
+    local left, zoom = chunk:match('\nCFGEDITVIEW (%S+) (%S+)')
     local timebase = 0
     local field = 0
     for word in (chunk:match('\nCFGEDIT ([^\n]+)') or ''):gmatch('%S+') do
@@ -191,13 +197,11 @@ local function Read_View()
     if not View.OK then return end
 
     -- Timebases 0 and 4 are beats (zoom = pixels per tick), the others are time (zoom = pixels per second)
-    View.IsBeats    = timebase == 0 or timebase == 4
-    View.Left       = tonumber(left)
+    View.IsBeats = timebase == 0 or timebase == 4
+    View.Left    = tonumber(left)
     if not View.IsBeats then View.Left = r.MIDI_GetProjTimeFromPPQPos(take, View.Left) end
-    View.Zoom       = tonumber(zoom)
-    View.TopPitch   = 127 - tonumber(top)
-    View.PxPerPitch = tonumber(px_per_pitch)
-    View.NotesH     = View.H
+    View.Zoom    = tonumber(zoom)
+    View.NotesH  = View.H
     for height in chunk:gmatch('\nVELLANE %S+ (%S+)') do
         View.NotesH = View.NotesH - tonumber(height)
     end
@@ -209,54 +213,81 @@ local function Get_Notes(Tk)
     if Cache and Cache.Hash == hash and Cache.IsBeats == View.IsBeats then return Cache end
 
     Cache = { Hash = hash, IsBeats = View.IsBeats }
+    OrigVels[Tk] = OrigVels[Tk] or {}
+    local Orig = OrigVels[Tk]
     local _, Count = r.MIDI_CountEvts(Tk)
-    -- Everything goes through project time so that notes of other takes in the editor line up with the active take
-    local function Pos(ppq)
-        local time = r.MIDI_GetProjTimeFromPPQPos(Tk, ppq)
-        return View.IsBeats and r.MIDI_GetPPQPosFromProjTime(take, time) or time
-    end
     for i = 0, Count - 1 do
-        local _, sel, _, start, stop, _, pitch, vel = r.MIDI_GetNote(Tk, i)
-        Cache[i + 1] = { Sel = sel, Start = Pos(start), Stop = Pos(stop), Pitch = pitch, Vel = vel }
+        local _, sel, _, start, _, _, _, vel = r.MIDI_GetNote(Tk, i)
+        if sel then
+            -- Goes through project time so that notes of other takes in the editor line up with the active take
+            local time = r.MIDI_GetProjTimeFromPPQPos(Tk, start)
+            Orig[i] = Orig[i] or vel
+            Cache[#Cache + 1] = { Pos = View.IsBeats and r.MIDI_GetPPQPosFromProjTime(take, time) or time, Vel = vel, Orig = Orig[i] }
+        end
     end
     NoteCache[Tk] = Cache
     return Cache
 end
 
-local function Draw_Note_Vels(DL)
-    if not View.OK then return end
-    local TopY, BotY = View.Y + RULER_H, View.Y + View.NotesH
-    local PxPerPitch = View.PxPerPitch
-    im.DrawList_PushClipRect(DL, View.X, TopY, View.X + View.W, BotY)
-    im.PushFont(ctx, Font_Note_Vel)
+local function Prepare_Bitmap()
+    if Overlay_Bitmap and Overlay_W == View.W and Overlay_H == View.H then return true end
+    if Overlay_Bitmap then r.JS_LICE_DestroyBitmap(Overlay_Bitmap) end
+    Overlay_W, Overlay_H = View.W, View.H
+    Overlay_Bitmap = r.JS_LICE_CreateBitmap(true, View.W, View.H)
+    if not Overlay_Bitmap then return false end
+    return r.JS_Composite(MidiView, 0, 0, View.W, View.H, Overlay_Bitmap, 0, 0, View.W, View.H) == 1
+end
 
-    local TextH = im.GetTextLineHeight(ctx)
+local function Draw_Velocity_Overlay()
+    if not View.OK or not Prepare_Bitmap() then return end
+
+    local Lists, Key = {}, { View.Left, View.Zoom, View.W, View.NotesH }
     local i = 0
     local Tk = r.MIDIEditor_EnumTakes(FocusedMidiEditor, i, false)
     while Tk do
-        for _, N in ipairs(Get_Notes(Tk)) do
-            local NoteL = (N.Start - View.Left) * View.Zoom
-            local NoteR = (N.Stop - View.Left) * View.Zoom
-            local RowT  = TopY + (View.TopPitch - N.Pitch) * PxPerPitch
-            local RowB  = RowT + PxPerPitch
-
-            if NoteR >= 0 and NoteL <= View.W and RowB >= TopY and RowT <= BotY then
-                local X  = View.X + math.max(NoteL, 0)
-                local X2 = X + VEL_BAR_W
-                im.DrawList_AddRectFilled(DL, X, RowB - VEL_BAR_H, X2, RowB, CLR_BAR_BG)
-                im.DrawList_AddRectFilled(DL, X, RowB - N.Vel / 127 * VEL_BAR_H, X2, RowB, N.Sel and CLR_BAR_SEL or CLR_BAR)
-
-                local TextY = RowT + (PxPerPitch - TextH) / 2
-                im.DrawList_AddText(DL, X2 + 4, TextY + 1, CLR_TEXT_BACK, N.Vel)
-                im.DrawList_AddText(DL, X2 + 3, TextY, CLR_TEXT, N.Vel)
-            end
-        end
+        local Notes = Get_Notes(Tk)
+        Lists[#Lists + 1] = Notes
+        Key[#Key + 1] = Notes.Hash
         i = i + 1
         Tk = r.MIDIEditor_EnumTakes(FocusedMidiEditor, i, false)
     end
+    Key = table.concat(Key, ' ')
+    if Key == LastDrawn then return end
+    LastDrawn = Key
 
-    im.PopFont(ctx)
-    im.DrawList_PopClipRect(DL)
+    local bitmap, width = Overlay_Bitmap, View.W
+    local top, bottom = RULER_H, View.NotesH - 1
+    local function VelToY(vel)
+        return math.floor(bottom - (vel - 1) / 126 * (bottom - top) + 0.5)
+    end
+
+    r.JS_LICE_Clear(bitmap, 0)
+    local HasNotes = false
+    for _, Notes in ipairs(Lists) do HasNotes = HasNotes or Notes[1] ~= nil end
+    if HasNotes then
+        r.JS_LICE_FillRect(bitmap, 0, top, width, bottom - top + 1, Overlay_Color_Background, 1, 'COPY')
+        r.JS_LICE_Line(bitmap, 0, top, width - 1, top, Overlay_Color_Grid, 1, 'COPY', false)
+        r.JS_LICE_Line(bitmap, 0, VelToY(64), width - 1, VelToY(64), Overlay_Color_Grid, 1, 'COPY', false)
+        r.JS_LICE_Line(bitmap, 0, bottom, width - 1, bottom, Overlay_Color_Grid, 1, 'COPY', false)
+    end
+
+    for _, Notes in ipairs(Lists) do
+        for _, N in ipairs(Notes) do
+            local x = math.floor((N.Pos - View.Left) * View.Zoom + 0.5)
+            if -2 <= x and x <= width + 1 then
+                local newY = VelToY(N.Vel)
+                local color = (N.Vel > N.Orig and Overlay_Color_BarUp) or (N.Vel < N.Orig and Overlay_Color_BarDown) or Overlay_Color_Bar
+                r.JS_LICE_FillRect(bitmap, x - 1, newY, 3, bottom - newY, color, 1, 'COPY')
+                r.JS_LICE_FillRect(bitmap, x - 3, newY - 1, 7, 3, color, 1, 'COPY')
+                if N.Vel ~= N.Orig then
+                    local origY = VelToY(N.Orig)
+                    r.JS_LICE_Line(bitmap, x - 4, origY, x + 4, origY, Overlay_Color_Original, 1, 'COPY', false)
+                end
+            end
+        end
+    end
+
+    r.JS_Window_InvalidateRect(MidiView, 0, 0, width, View.H, false)
 end
 
 
@@ -297,14 +328,8 @@ function loop()
             im.WindowFlags_NoBackground
 
         im.SetNextWindowBgAlpha(ctx, 0.01)
-        Read_View()
-        -- The window has to reach every visible note, not only the area around the mouse
-        local WinL = math.min(Disp.InitMsX - GUI_Win_Sz_W / 2, View.X)
-        local WinT = math.min(MouseInitPosY - GUI_Win_Sz_H / 2, View.Y)
-        local WinR = math.max(Disp.InitMsX + GUI_Win_Sz_W / 2, View.X + View.W)
-        local WinB = math.max(MouseInitPosY + GUI_Win_Sz_H / 2, View.Y + View.H)
-        im.SetNextWindowPos(ctx, WinL, WinT, nil)
-        im.SetNextWindowSize(ctx, WinR - WinL, WinB - WinT)
+        im.SetNextWindowPos(ctx, Disp.InitMsX - GUI_Win_Sz_W / 2, MouseInitPosY - GUI_Win_Sz_H / 2, nil)
+        im.SetNextWindowSize(ctx, GUI_Win_Sz_W, GUI_Win_Sz_H)
         function SetMinMax(value, min, max)
             if value < min then
                 return min
@@ -327,7 +352,7 @@ function loop()
 
                 
                 for i, v in ipairs(SelItm) do
-                    for RptTimes = first_Sel_Note - 1, NoteCount - 1, 1 do
+                    for RptTimes = first_Sel_Note, NoteCount - 1, 1 do
                         retval, selected, muted, _, endppqpos, chan, pitch, vel = r.MIDI_GetNote( SelItm[i], RptTimes)
 
 
@@ -445,7 +470,8 @@ function loop()
 
             r.MIDI_Sort(take)
 
-            Draw_Note_Vels(drawlist)
+            Read_View()
+            Draw_Velocity_Overlay()
 
             im.PopFont(ctx)
             im.End(ctx)
